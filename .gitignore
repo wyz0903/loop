@@ -1,0 +1,35 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.egg-info/
+dist/
+build/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Workbuddy session
+.workbuddy/
+
+# Agents/Skills (installed by `npx skills add`)
+.agents/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Results (large binary files)
+results/*.npz
+results/*.zip
+results/*.png
+
+# CasADi compiled solver (large binary)
+nmpc_solver.casadi
+
+#detaset
+dataset_win/
+dataset/
