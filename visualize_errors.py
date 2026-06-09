@@ -14,15 +14,17 @@ import sys
 import argparse
 import numpy as np
 from collections import defaultdict
-
 import torch
 import torch.nn as nn
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 
-# 中文字体配置
-plt.rcParams['font.sans-serif'] = ['Microsoft YaHei', 'SimHei', 'DejaVu Sans']
+# IEEE 论文标准字体
+plt.rcParams['font.family'] = 'serif'
+plt.rcParams['font.serif'] = ['Times New Roman']
+plt.rcParams['mathtext.fontset'] = 'stix'
+plt.rcParams['font.size'] = 10
 plt.rcParams['axes.unicode_minus'] = False
 from matplotlib.gridspec import GridSpec
 
@@ -34,21 +36,22 @@ os.makedirs(RESULT_DIR, exist_ok=True)
 
 ALL_ATTACK_TYPES = ['A0', 'A1', 'A2', 'A3', 'A4', 'A5', 'A6', 'A7', 'A8']
 ATTACK_NAMES_CN = {
-    'A0': '正常', 'A1': '恒定偏置', 'A2': '正弦振荡',
-    'A3': '斜坡漂移', 'A4': '阶跃', 'A5': '重放攻击',
-    'A6': '脉冲串', 'A7': '扫频', 'A8': '多频叠加',
+    'A0': 'Normal', 'A1': 'Constant Bias', 'A2': 'Sinusoidal',
+    'A3': 'Drift', 'A4': 'Step', 'A5': 'Replay Attack',
+    'A6': 'Dropout', 'A7': 'Scaling', 'A8': 'Freeze',
 }
 
 DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
 # 通道名称
 CHANNEL_NAMES = ['ekf_innov_x', 'ekf_innov_y', 'ekf_innov_θ', 'u_cmd_v', 'u_cmd_ω']
-CHANNEL_LABELS = ['新息 x [m]', '新息 y [m]', '新息 θ [rad]', '控制 v [m/s]', '控制 ω [rad/s]']
+CHANNEL_LABELS = ['Inn. x [m]', 'Inn. y [m]', 'Inn. θ [rad]', 'Cmd v [m/s]', 'Cmd ω [rad/s]']
 
 
 def load_model(model_path: str):
     """加载训练好的模型"""
-    from train_classifier import AttackClassifier, ENC_CHANNELS, LATENT_DIM
+    from detector.attack_classifier import AttackClassifier
+    from detector.config import ENC_CHANNELS, LATENT_DIM
 
     config_path = os.path.join(os.path.dirname(model_path), 'cls_config.npz')
     if os.path.exists(config_path):
@@ -69,8 +72,8 @@ def load_model(model_path: str):
 
     model.load_state_dict(torch.load(model_path, map_location=DEVICE, weights_only=True))
     model.eval()
-    print(f"模型加载: {model_path}")
-    print(f"  参数: in={in_channels}, win={window_size}, latent={latent_dim}, enc={enc_channels}")
+    print(f"Model loaded: {model_path}")
+    print(f"  Params: in={in_channels}, win={window_size}, latent={latent_dim}, enc={enc_channels}")
     return model, window_size
 
 
@@ -106,7 +109,7 @@ def find_misclassified(model, X, cls_true, batch_size=1024):
     for idx, t, p in zip(error_indices, error_true, error_pred):
         error_groups[(t, p)].append(idx)
 
-    print(f"总样本: {n:,}  错误: {len(error_indices):,}  ({len(error_indices)/n*100:.2f}%)")
+    print(f"Total: {n:,}  Errors: {len(error_indices):,}  ({len(error_indices)/n*100:.2f}%)")
     return error_indices, error_true, error_pred, error_groups
 
 
@@ -129,14 +132,14 @@ def plot_confusion_summary(error_groups: dict, save_path: str):
     ax.set_xticks(range(9)); ax.set_yticks(range(9))
     ax.set_xticklabels([f'{a}\n{ATTACK_NAMES_CN[a]}' for a in ALL_ATTACK_TYPES], fontsize=8)
     ax.set_yticklabels([f'{a}\n{ATTACK_NAMES_CN[a]}' for a in ALL_ATTACK_TYPES], fontsize=8)
-    ax.set_xlabel('预测类别', fontsize=12)
-    ax.set_ylabel('真实类别', fontsize=12)
-    ax.set_title('分类错误混淆矩阵', fontsize=14, fontweight='bold')
-    plt.colorbar(im, ax=ax, shrink=0.8, label='错误样本数')
+    ax.set_xlabel('Predicted Class', fontsize=12)
+    ax.set_ylabel('True Class', fontsize=12)
+    ax.set_title('Classification Error Confusion Matrix', fontsize=14, fontweight='bold')
+    plt.colorbar(im, ax=ax, shrink=0.8, label='Error Count')
     plt.tight_layout()
     plt.savefig(save_path, dpi=150, bbox_inches='tight')
     plt.close()
-    print(f"  [图] 混淆摘要: {save_path}")
+    print(f"  [Fig] Confusion summary: {save_path}")
 
 
 def plot_error_samples(X, cls_true, error_groups, save_path: str,
@@ -169,34 +172,33 @@ def plot_error_samples(X, cls_true, error_groups, save_path: str,
                 for ch in range(5):
                     ax.plot(window[:, ch], linewidth=0.7, color=colors[ch],
                            alpha=0.85)
-                ax.set_xlabel('时间步', fontsize=7)
-                ax.set_ylabel('信号值', fontsize=7)
+                ax.set_xlabel('Time Step', fontsize=7)
+                ax.set_ylabel('Signal Value', fontsize=7)
             else:
-                ax.text(0.5, 0.5, '(样本不足)', transform=ax.transAxes,
+                ax.text(0.5, 0.5, '(insufficient samples)', transform=ax.transAxes,
                        ha='center', va='center', fontsize=9, color='gray')
                 ax.set_xticks([]); ax.set_yticks([])
 
             ax.tick_params(labelsize=6)
 
             if col_idx == 0:
-                ax.set_title(f'真实: {true_name}\n→ 预测: {pred_name}',
+                ax.set_title(f'True: {true_name}\n-> Pred: {pred_name}',
                             fontsize=8, fontweight='bold', color='#d62728')
             else:
-                ax.set_title(f'样本 {col_idx+1}', fontsize=8)
+                ax.set_title(f'Sample {col_idx+1}', fontsize=8)
 
-    # 图例放在图内右上角
     handles = [plt.Line2D([0], [0], color=colors[i], linewidth=2,
                          label=f'{CHANNEL_NAMES[i]} ({CHANNEL_LABELS[i]})')
                for i in range(5)]
     fig.legend(handles=handles, loc='upper right', ncol=1, fontsize=7,
               bbox_to_anchor=(0.98, 0.97), framealpha=0.9)
 
-    fig.suptitle('模型分类错误样本 (按错误量降序)', fontsize=14, fontweight='bold')
+    fig.suptitle('Classification Error Samples (sorted by error count)', fontsize=14, fontweight='bold')
     plt.tight_layout(rect=[0, 0, 0.88, 0.97])
     plt.savefig(save_path, dpi=150, bbox_inches='tight',
                facecolor='white', edgecolor='none')
     plt.close()
-    print(f"  [图] 错误样本: {save_path}")
+    print(f"  [Fig] Error samples: {save_path}")
 
 
 def plot_per_class_mistakes(X, cls_true, error_indices, error_true, error_pred, save_path: str):
@@ -221,7 +223,7 @@ def plot_per_class_mistakes(X, cls_true, error_indices, error_true, error_pred, 
         if len(cls_err_indices) == 0:
             for col in range(samples_per_class):
                 ax = axes[cls_idx, col]
-                ax.text(0.5, 0.5, f'{cls_name}\n({ATTACK_NAMES_CN[cls_name]})\n✔ 无错误',
+                ax.text(0.5, 0.5, f'{cls_name}\n({ATTACK_NAMES_CN[cls_name]})\nNo errors',
                        transform=ax.transAxes, ha='center', va='center',
                        fontsize=9, color='#2ca02c')
                 ax.set_xticks([]); ax.set_yticks([])
@@ -245,18 +247,18 @@ def plot_per_class_mistakes(X, cls_true, error_indices, error_true, error_pred, 
             for ch in range(5):
                 ax.plot(window[:, ch], linewidth=0.7, color=colors[ch], alpha=0.85)
 
-            ax.set_title(f'真: {cls_name} {ATTACK_NAMES_CN[cls_name]}\n'
-                        f'→ 误判: {ALL_ATTACK_TYPES[pred_cls]} '
+            ax.set_title(f'True: {cls_name} {ATTACK_NAMES_CN[cls_name]}\n'
+                        f'-> Miscls: {ALL_ATTACK_TYPES[pred_cls]} '
                         f'{ATTACK_NAMES_CN[ALL_ATTACK_TYPES[pred_cls]]}',
                         fontsize=7, color='#d62728')
-            ax.set_xlabel('时间步', fontsize=6)
-            ax.set_ylabel('信号值', fontsize=6)
+            ax.set_xlabel('Time Step', fontsize=6)
+            ax.set_ylabel('Signal Value', fontsize=6)
             ax.tick_params(labelsize=5)
 
         # 填充不足的列
         for col in range(len(top_preds), samples_per_class):
             ax = axes[cls_idx, col]
-            ax.text(0.5, 0.5, '(仅此一类错误)', transform=ax.transAxes,
+            ax.text(0.5, 0.5, '(only this error type)', transform=ax.transAxes,
                    ha='center', va='center', fontsize=8, color='gray')
             ax.set_xticks([]); ax.set_yticks([])
 
@@ -267,18 +269,18 @@ def plot_per_class_mistakes(X, cls_true, error_indices, error_true, error_pred, 
     fig.legend(handles=handles, loc='upper right', ncol=1, fontsize=6,
               bbox_to_anchor=(0.99, 0.99), framealpha=0.9)
 
-    fig.suptitle('各类别典型错误 (按误判频率排序)', fontsize=14, fontweight='bold')
+    fig.suptitle('Typical Errors per Class (sorted by misclassification frequency)', fontsize=14, fontweight='bold')
     plt.tight_layout(rect=[0, 0, 0.88, 0.97])
     plt.savefig(save_path, dpi=150, bbox_inches='tight',
                facecolor='white', edgecolor='none')
     plt.close()
-    print(f"  [图] 各类错误: {save_path}")
+    print(f"  [Fig] Per-class errors: {save_path}")
 
 
 def print_error_stats(error_groups: dict):
     """打印错误统计"""
     print(f"\n{'='*60}")
-    print("错误统计 (真实 → 预测)")
+    print("Error Statistics (True -> Predicted)")
     print(f"{'='*60}")
     sorted_groups = sorted(error_groups.items(), key=lambda x: -len(x[1]))
     for (t, p), indices in sorted_groups[:20]:
@@ -298,7 +300,7 @@ def main():
     args = parser.parse_args()
 
     print("=" * 60)
-    print("分类错误样本可视化")
+    print("Classification Error Visualization")
     print("=" * 60)
 
     # 加载模型
@@ -307,14 +309,14 @@ def main():
     # 加载验证数据
     X_val = np.load(os.path.join(args.data_dir, 'X_val.npy')).astype(np.float32)
     y_val = np.load(os.path.join(args.data_dir, 'Y_val_cls.npy')).astype(np.int64)
-    print(f"验证集: {len(X_val):,} 样本, shape={X_val.shape}")
+    print(f"Validation set: {len(X_val):,} samples, shape={X_val.shape}")
 
     # 找错误
     error_indices, error_true, error_pred, error_groups = find_misclassified(
         model, X_val, y_val)
 
     if len(error_indices) == 0:
-        print("\n🎉 没有分类错误！")
+        print("\nNo classification errors!")
         return
 
     # 打印统计
@@ -334,10 +336,10 @@ def main():
     plot_per_class_mistakes(X_val, y_val, error_indices, error_true, error_pred,
                            f'{prefix}_per_class.png')
 
-    print(f"\n完成！图片保存在: {RESULT_DIR}/")
-    print(f"  {prefix}_confusion.png  — 错误混淆矩阵")
-    print(f"  {prefix}_samples.png   — 高频错误样本")
-    print(f"  {prefix}_per_class.png — 各类别典型错误")
+    print(f"\nDone! Output saved to: {RESULT_DIR}/")
+    print(f"  {prefix}_confusion.png  -- Error confusion matrix")
+    print(f"  {prefix}_samples.png   -- High-frequency error samples")
+    print(f"  {prefix}_per_class.png -- Per-class typical errors")
 
 
 if __name__ == "__main__":

@@ -1,6 +1,6 @@
 """
-detector.py — 传感器攻击检测与信号恢复模块
-============================================================================
+detector/backend.py — 传感器攻击检测与信号恢复模块
+=====================================================
 即插即用的攻击检测器，不改动 EKF 或 NMPC。
 
 架构位置：
@@ -31,7 +31,6 @@ from typing import Dict, Tuple, Optional
 from collections import deque
 
 import torch
-import torch.nn.functional as F
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
@@ -116,10 +115,13 @@ class NNDetector:
     RECOVERY_BLEND_ALPHA = 0.5          # 全量恢复时的混合比例
     RECOVERY_BLEND_PARTIAL = 0.25       # 中等置信度时的部分混合比例
 
-    # FM 不确定性参数
-    FM_N_SAMPLES = 3                  # FM 多采样次数 (不确定性估计)
-    FM_UNCERTAINTY_THRESH = 0.3       # 不确定性阈值 (超过 → 加倍保守)
-    FM_K_STEPS = 4                    # FM ODE 积分步数 (默认值, 从 config 覆盖)
+    # 攻击估计值裁剪范围
+    MAX_ATTACK_ESTIMATE = 0.5           # 攻击估计值 ± 上限 (与 AttackConfig 参数范围匹配)
+
+    # 创新息持久偏移检测 (A0 兜底)
+    INNOV_OFFSET_THRESH = 0.02         # 创新息EMA范数阈值 [m]
+    INNOV_OFFSET_COMPENSATION = 0.2    # 弱补偿增益
+    MAX_OFFSET_COMPENSATION = 0.3      # 弱补偿最大值
 
     # 内部状态重校准: 周期性用 EKF 估计重置内部运动学状态 (控制漂移)
     RECALIB_INTERVAL = 200         # 重校准间隔 [步] (10s @ 50ms)
@@ -135,9 +137,9 @@ class NNDetector:
             device:      推理设备 ('cuda' / 'cpu')
         """
         if model_path is None:
-            model_path = os.path.join(SCRIPT_DIR, 'models', 'cls_best.pt')
+            model_path = os.path.join(SCRIPT_DIR, '..', 'models', 'cls_best.pt')
         if norm_path is None:
-            norm_path = os.path.join(SCRIPT_DIR, 'dataset_win', 'config', 'normalizer.npz')
+            norm_path = os.path.join(SCRIPT_DIR, '..', 'dataset_win', 'config', 'normalizer.npz')
 
         self.window_size = window_size
 
@@ -151,9 +153,6 @@ class NNDetector:
         self._model, self._in_channels, self._is_fm_model = self._load_model(model_path)
         self._model.to(self._device)
         self._model.eval()
-
-        # ---- FM 推理配置 ----
-        self._fm_k_steps = self.FM_K_STEPS
 
         # ---- 加载归一化参数 ----
         self._load_normalizer(norm_path)
@@ -180,7 +179,7 @@ class NNDetector:
         self._class_ema = np.zeros(len(self.ALL_ATTACK_TYPES))  # 各类别的 EMA 概率
 
         # ---- 内部状态重校准 ----
-        self._last_recalib_step = 0
+        self._last_recalib_step = -self.RECALIB_INTERVAL  # 首次即校准，与训练数据一致
         self._ekf_state_external = None  # 外部 EKF 估计 (由 set_ekf_state 设置)
 
         # ---- 解码器尾部缓冲区: 加权平均用 ----
@@ -189,12 +188,11 @@ class NNDetector:
         # ---- 创新息持久偏移检测: NN 分类 A0 时的兜底补偿 ----
         self._innov_ema = np.zeros(3)          # 创新息长期 EMA
         self._innov_ema_alpha = 0.01           # EMA 衰减因子 (100步时间常数)
-        self._innov_offset_thresh = 0.02       # 持久偏移阈值 [m] (约 2× 传感器噪声)
+        self._innov_offset_thresh = self.INNOV_OFFSET_THRESH
 
         print(f"[NNDetector] 模型已加载: {model_path}")
-        fm_info = f", FM(K={self._fm_k_steps}, N={self.FM_N_SAMPLES})" if self._is_fm_model else ""
         print(f"  设备: {self._device}, 窗口: {window_size}, "
-              f"Dwell={self.DWELL_STEPS}步, TailAvg={self.TAIL_AVG_STEPS}步{fm_info}")
+              f"Dwell={self.DWELL_STEPS}步, TailAvg={self.TAIL_AVG_STEPS}步")
 
     # ------------------------------------------------------------------
     # 公共接口
@@ -247,10 +245,10 @@ class NNDetector:
                          'readiness': self._window_readiness()}
             )
 
-        # 6. NN 推理 — 每步完整执行, 返回全窗口解码 + FM 不确定性
+        # 6. NN 推理 — 每步完整执行, 返回全窗口解码
         innov_window = np.array(list(self._innov_buffer))
         ucmd_window = np.array(list(self._ucmd_buffer))
-        attack_class_raw, confidence_raw, nn_attack_est, attack_seq_full, fm_uncertainty = (
+        attack_class_raw, confidence_raw, nn_attack_est, attack_seq_full = (
             self._nn_infer(innov_window, ucmd_window))
 
         # 7. EMA 软分类: 快速响应
@@ -288,11 +286,10 @@ class NNDetector:
         # 9. 加权尾部平均恢复
         nn_attack_est_tail = self._tail_weighted_average(attack_seq_full)
 
-        # 10. 统一恢复 (含 FM 不确定性门控)
+        # 10. 统一恢复
         y_recovered, attack_estimate = self._recover(
             y_meas, attack_class, nn_attack_est_tail, X_pred,
-            attack_class_raw=attack_class_raw,
-            fm_uncertainty=fm_uncertainty)
+            attack_class_raw=attack_class_raw)
 
         return DetectionResult(
             attack_class=attack_class,
@@ -302,8 +299,7 @@ class NNDetector:
             features={'step': self._step_count,
                      'dead_reckon': self._dead_reckon_active,
                      'ema_class': ema_class,
-                     'ema_conf': ema_conf,
-                     'fm_uncertainty': fm_uncertainty}
+                     'ema_conf': ema_conf}
         )
 
     def set_control(self, u_cmd: np.ndarray) -> None:
@@ -375,7 +371,7 @@ class NNDetector:
         self._class_ema = np.zeros(len(self.ALL_ATTACK_TYPES))
         self._a5_consecutive_count = 0
         self._non_a5_consecutive_count = 0
-        self._last_recalib_step = 0
+        self._last_recalib_step = -self.RECALIB_INTERVAL  # 首次即校准，与训练数据一致
         self._ekf_state_external = None
         self._decoder_tail_buffer.clear()
 
@@ -434,9 +430,9 @@ class NNDetector:
           - 新版(v3): freq_channels / FREQ_CHANNELS
           - FM 模型: use_fm, fm_latent_dim, fm_k_steps
         """
-        from train_classifier import (AttackClassifier, FreqAwareClassifier,
-                                       ENC_CHANNELS, LATENT_DIM,
-                                       FREQ_CHANNELS, FM_LATENT_DIM)
+        from detector.attack_classifier import AttackClassifier
+        from detector.freq_aware_classifier import FreqAwareClassifier
+        from detector.config import ENC_CHANNELS, LATENT_DIM, FREQ_CHANNELS
 
         config_path = os.path.join(os.path.dirname(model_path), 'cls_config.npz')
         if os.path.exists(config_path):
@@ -449,7 +445,7 @@ class NNDetector:
             model_type = str(cfg.get('model_type', 'baseline'))
             # FM 配置 (默认 False — 兼容旧模型)
             use_fm = bool(cfg.get('use_fm', False))
-            fm_latent_dim = int(cfg.get('fm_latent_dim', FM_LATENT_DIM))
+            fm_latent_dim = int(cfg.get('fm_latent_dim', 128))
             # 兼容新旧频率通道配置键名
             if 'freq_channels' in cfg:
                 freq_channels = cfg['freq_channels'].tolist()
@@ -466,7 +462,7 @@ class NNDetector:
             freq_channels = FREQ_CHANNELS
             model_type = 'baseline'
             use_fm = False
-            fm_latent_dim = FM_LATENT_DIM
+            fm_latent_dim = 128
 
         # Fallback: 从权重文件推断 dec_channels (兼容旧模型)
         if model_type == 'baseline' and dec_channels is None:
@@ -494,8 +490,11 @@ class NNDetector:
                 enc_channels=enc_channels,
                 dec_channels_override=dec_channels
             )
-        model.load_state_dict(torch.load(model_path, map_location=self._device,
-                                         weights_only=True))
+        state_dict = torch.load(model_path, map_location=self._device,
+                                 weights_only=True)
+        missing, unexpected = model.load_state_dict(state_dict, strict=False)
+        if missing:
+            print(f"  [INFO] 缺少的权重键 (将使用随机初始化): {len(missing)} 个")
         return model, in_channels, use_fm
 
     def _load_normalizer(self, norm_path: str):
@@ -522,17 +521,13 @@ class NNDetector:
     # ------------------------------------------------------------------
 
     def _nn_infer(self, innov_window: np.ndarray, ucmd_window: np.ndarray):
-        """单次 NN 前向 — 返回全窗口解码输出 + FM 不确定性
-
-        确定性模型: teacher forcing 直出
-        FM 模型: teacher forcing 分类 + FM 多采样集成重建 + 不确定性估计
+        """单次 NN 前向 — 返回全窗口解码输出
 
         Returns:
             attack_class:     分类标签
             confidence:       置信度
             attack_est_last:  (3,) 最后一步攻击估计
-            attack_seq_full:  (W, 3) 全窗口解码输出 (确定性=直接, FM=集成均值)
-            fm_uncertainty:   float, FM 不确定性 (非 FM 模型 = 0.0)
+            attack_seq_full:  (W, 3) 全窗口解码输出
         """
         x_norm = self._normalize(innov_window, ucmd_window)
         x_tensor = torch.from_numpy(x_norm.astype(np.float32)).unsqueeze(0).to(self._device)
@@ -548,38 +543,11 @@ class NNDetector:
         pred_cls = int(probs.argmax())
         confidence = float(probs[pred_cls])
         attack_class = self.ALL_ATTACK_TYPES[pred_cls]
-        fm_uncertainty = 0.0
 
-        if self._is_fm_model:
-            # FM 多采样: 生成 N 个 decoder latent → 批量 decoder → 集成均值 + 标准差
-            cls_probs = F.softmax(logits.float(), dim=1)
-            class_embed_t = cls_probs @ self._model.class_embedding
-
-            z_samples = self._model.fm_integrate_multi(
-                class_embed_t, k_steps=self._fm_k_steps,
-                n_samples=self.FM_N_SAMPLES
-            )  # (N, 1, fm_latent_dim)
-
-            # 批量 decoder forward: repeat input N 次
-            z_batch = z_samples.squeeze(1)  # (N, fm_latent_dim)
-            x_batch = x_tensor.repeat(self.FM_N_SAMPLES, 1, 1)  # (N, 100, 5)
-            with torch.no_grad():
-                if self._device.type == 'cuda':
-                    with torch.amp.autocast('cuda'):
-                        _, atk_batch, _ = self._model(x_batch, z_dec_override=z_batch)
-                else:
-                    _, atk_batch, _ = self._model(x_batch, z_dec_override=z_batch)
-
-            atk_samples = atk_batch.detach().cpu().numpy()  # (N, 100, 3)
-            attack_seq_full = atk_samples.mean(axis=0)  # (W, 3) 集成均值
-            attack_seq_std = atk_samples.std(axis=0)     # (W, 3) 逐步标准差
-            fm_uncertainty = float(attack_seq_std.mean())  # 标量不确定性
-        else:
-            attack_seq_full = attack_seq.cpu().numpy()[0]  # (W, 3)
-
+        attack_seq_full = attack_seq.cpu().numpy()[0]  # (W, 3)
         attack_est_last = attack_seq_full[-1, :]  # (3,)
 
-        return attack_class, confidence, attack_est_last, attack_seq_full, fm_uncertainty
+        return attack_class, confidence, attack_est_last, attack_seq_full
 
     # ------------------------------------------------------------------
     # 统一恢复
@@ -588,18 +556,20 @@ class NNDetector:
     def _recover(self, y_meas: np.ndarray, attack_class: str,
                  nn_attack_est: np.ndarray,
                  X_pred: np.ndarray = None,
-                 attack_class_raw: str = None,
-                 fm_uncertainty: float = 0.0) -> Tuple[np.ndarray, np.ndarray]:
-        """统一恢复策略 (含 FM 不确定性门控)
+                 attack_class_raw: str = None) -> Tuple[np.ndarray, np.ndarray]:
+        """统一恢复策略
 
-        加性攻击 (A0-A4, A6-A8): y_rec = y_meas - â(k)
+        加性攻击 (A0-A4, A6-A8): y_rec = y_meas - blend_alpha * â(k)
 
         非加性攻击 (A5 重放): y_rec = X_pred（运动学死推算）
           - A5 死推算需连续 A5_CONSECUTIVE_REQUIRED 步原始 NN 输出为 A5 才激活
           - 需连续 A5_DEACTIVATE_CONSECUTIVE 步非 A5 才退出
           - 防止 A0→A5 误分类导致的错误死推算
 
-        FM 不确定性门控: 当多采样标准差 > 阈值时，对重建信号施加更保守的混合比例。
+        置信度门控: 根据 EMA 置信度选择恢复强度
+          - 低置信度 (<0.6) → 直通
+          - 中等置信度 (0.6-0.85) → 部分恢复 (25%)
+          - 高置信度 (>0.85) → 全量恢复 (50%)
         """
         # A5 死推算决策: 连续确认 + 立即退出
         if attack_class_raw is not None:
@@ -620,24 +590,22 @@ class NNDetector:
                 self._dead_reckon_active = False
 
         if self._dead_reckon_active:
-            if X_pred is not None:
-                return X_pred.copy(), np.zeros(3)
-            X_pred = self._kinematic_step(self._internal_state, self._u_cmd)
-            return X_pred.copy(), np.zeros(3)
+            return X_pred.copy(), np.zeros(3)  # X_pred 已由 detect() 传入
         else:
             # 渐进式置信度门控: 根据 EMA 置信度选择恢复强度
             # 中等置信度(0.6-0.85) → 部分恢复(25%); 高置信度(>0.85) → 全量恢复(50%)
             # 低置信度(<0.6)或 A0 → 直通
             ema_conf = float(np.max(self._class_ema))
-            a_est = np.clip(nn_attack_est, -0.5, 0.5)
+            a_est = np.clip(nn_attack_est, -self.MAX_ATTACK_ESTIMATE, self.MAX_ATTACK_ESTIMATE)
 
             # 创新息持久偏移检测: NN 判定 A0 但测量中存在持续非零偏移
-            # 此时可能为未检测到的恒定偏置攻击 (A1), 应用弱恢复作为兜底
+            # 此时可能为未检测到的恒定偏移攻击 (A1), 应用弱恢复作为兜底
             innov_offset = np.linalg.norm(self._innov_ema)
             if attack_class == 'A0' and ema_conf < self.RECOVERY_CONFIDENCE_THRESH:
                 if innov_offset > self._innov_offset_thresh:
                     # 持久偏移 → 弱补偿: y_rec = y_meas - 0.2 * innov_ema
-                    weak_a = np.clip(0.2 * self._innov_ema, -0.3, 0.3)
+                    weak_a = np.clip(self.INNOV_OFFSET_COMPENSATION * self._innov_ema,
+                                    -self.MAX_OFFSET_COMPENSATION, self.MAX_OFFSET_COMPENSATION)
                     return y_meas - weak_a, weak_a
                 return y_meas.copy(), np.zeros(3)
             elif attack_class == 'A0' or ema_conf < self.RECOVERY_CONFIDENCE_THRESH:
@@ -647,9 +615,6 @@ class NNDetector:
             else:
                 blend_alpha = self.RECOVERY_BLEND_PARTIAL  # 0.25
 
-            # FM 不确定性门控: 模型内部分歧大 → 加倍保守
-            if fm_uncertainty > self.FM_UNCERTAINTY_THRESH:
-                blend_alpha *= 0.5
             y_rec = y_meas - blend_alpha * a_est
             return y_rec, blend_alpha * a_est
 
@@ -733,90 +698,3 @@ def create_detector(tier: str, attack_type: str = 'A0', seed: int = 42,
     else:
         raise ValueError(f"Unknown detector tier: {tier}. "
                          f"Choose from: none, nn, oracle")
-
-
-# ============================================================================
-# 模块自测
-# ============================================================================
-
-if __name__ == "__main__":
-    print("=" * 60)
-    print("detector.py — 攻击检测器模块自测")
-    print("=" * 60)
-
-    # ---- 测试 OracleDetector ----
-    print("\n[1] OracleDetector 测试")
-    oracle = OracleDetector(attack_type='A4', seed=42)
-    a_true = np.array([0.25, -0.15, 0.18])
-    result = oracle.detect(y_meas=np.array([1.0, 0.5, 0.3]), a_true=a_true)
-    assert result.attack_class == 'A4', f"分类错误: {result.attack_class}"
-    assert result.confidence == 1.0, f"置信度错误: {result.confidence}"
-    assert np.allclose(result.y_recovered, np.array([0.75, 0.65, 0.12])), \
-        f"恢复错误: {result.y_recovered}"
-    print(f"  [OK] OracleDetector: {result}")
-
-    # ---- 测试 NNDetector (无 GPU 时用 CPU) ----
-    print("\n[2] NNDetector 测试")
-    model_path = os.path.join(SCRIPT_DIR, 'models', 'cls_best.pt')
-    norm_path = os.path.join(SCRIPT_DIR, 'dataset_win', 'config', 'normalizer.npz')
-
-    if not os.path.exists(model_path):
-        print(f"  [SKIP] 模型文件不存在: {model_path}")
-        print(f"  请先运行 train_classifier.py 训练模型")
-    elif not os.path.exists(norm_path):
-        print(f"  [SKIP] 归一化参数不存在: {norm_path}")
-        print(f"  请先运行 preprocess_data.py 预处理数据")
-    else:
-        detector = NNDetector(model_path=model_path, norm_path=norm_path)
-
-        # 窗口填充期测试 — 前 99 步应返回 A0
-        print("  测试窗口填充期...")
-        for i in range(50):
-            y = np.array([0.5, -0.3, 0.1]) + 0.02 * np.random.randn(3)
-            detector.set_control(np.array([0.25, 0.1]))
-            r = detector.detect(y)
-            if i < detector.window_size - 1:
-                assert r.confidence == 0.0, f"step {i}: 窗口未就绪应 conf=0"
-        print(f"  [OK] 窗口填充期: {detector._window_readiness()} 步后就绪")
-
-        # 继续填充并测试推理
-        print("  测试 NN 推理...")
-        for i in range(50):
-            y = np.array([0.5, -0.3, 0.1]) + 0.15 * np.sin(2 * np.pi * 0.8 * i * TS)
-            y += 0.02 * np.random.randn(3)
-            detector.set_control(np.array([0.25, 0.1]))
-            r = detector.detect(y)
-        print(f"  分类: {r.attack_class}, 置信度: {r.confidence:.3f}")
-        print(f"  |a_est|: {np.linalg.norm(r.attack_estimate):.4f}")
-        print(f"  冻结状态: {r.features.get('frozen', False)}")
-        print("  [OK] NN 推理测试通过")
-
-        # 测试 reset
-        detector.reset()
-        assert detector._step_count == 0
-        assert not detector._dead_reckon_active
-        print("  [OK] Reset 测试通过")
-
-    # ---- 测试工厂函数 ----
-    print("\n[3] create_detector 工厂测试")
-    assert create_detector('none') is None, "none tier 应返回 None"
-    print("  [OK] none → None")
-
-    if os.path.exists(model_path) and os.path.exists(norm_path):
-        det = create_detector('nn', model_path=model_path, norm_path=norm_path)
-        assert isinstance(det, NNDetector), f"nn tier 应返回 NNDetector, 实际: {type(det)}"
-        print("  [OK] nn → NNDetector")
-
-    det = create_detector('oracle', attack_type='A2')
-    assert isinstance(det, OracleDetector), f"oracle tier 应返回 OracleDetector, 实际: {type(det)}"
-    print("  [OK] oracle → OracleDetector")
-
-    try:
-        create_detector('ewma')
-        assert False, "ewma tier 应抛出异常"
-    except ValueError:
-        print("  [OK] 'ewma' → ValueError (已废弃)")
-
-    print("\n" + "=" * 60)
-    print("detector.py self-test PASSED")
-    print("=" * 60)

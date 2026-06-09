@@ -21,12 +21,19 @@ matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 from collections import defaultdict
 
+# IEEE 论文标准字体
+plt.rcParams['font.family'] = 'serif'
+plt.rcParams['font.serif'] = ['Times New Roman']
+plt.rcParams['mathtext.fontset'] = 'stix'
+plt.rcParams['font.size'] = 10
+plt.rcParams['axes.unicode_minus'] = False
+
 RESULT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'results')
 ATTACK_TYPES = ['A0', 'A1', 'A2', 'A3', 'A4', 'A5', 'A6', 'A7', 'A8']
 ATTACK_NAMES = {
     'A0': 'Normal', 'A1': 'Constant Bias', 'A2': 'Sinusoidal',
-    'A3': 'Ramp Drift', 'A4': 'Step Attack', 'A5': 'Replay Attack',
-    'A6': 'Pulse Train', 'A7': 'Chirp Sweep', 'A8': 'Multi-Tone Injection',
+    'A3': 'Drift', 'A4': 'Step', 'A5': 'Replay Attack',
+    'A6': 'Intermittent Dropout', 'A7': 'Scaling', 'A8': 'Sensor Freeze',
 }
 
 TIER_COLORS = {'none': '#d62728', 'nn': '#2ca02c', 'oracle': '#1f77b4'}
@@ -361,11 +368,11 @@ def generate_report(df: pd.DataFrame):
     oracle_data = df[df['Tier'] == 'oracle']
 
     lines = []
-    lines.append("# NNDetector 性能分析报告")
+    lines.append("# NNDetector Performance Analysis Report")
     lines.append("")
-    lines.append("> 生成时间: " + pd.Timestamp.now().strftime('%Y-%m-%d %H:%M'))
-    lines.append("> 检测器: NNDetector — 内部运动学新息 + AttackClassifier + 统一恢复 (y_rec = y_meas − â)")
-    lines.append("> 恢复策略: 加性攻击统一减法恢复，A5 重放攻击 → 内部运动学死推算")
+    lines.append("> Generated: " + pd.Timestamp.now().strftime('%Y-%m-%d %H:%M'))
+    lines.append("> Detector: NNDetector — internal kinematics innovation + AttackClassifier + unified recovery (y_rec = y_meas - a)")
+    lines.append("> Strategy: additive attacks via subtraction recovery, A5 replay -> internal kinematics dead reckoning")
     lines.append("")
 
     # 总体统计
@@ -375,18 +382,18 @@ def generate_report(df: pd.DataFrame):
         max_imp_row = nn_data.loc[nn_data['Improvement_%'].idxmax()]
         positive = (nn_data['Improvement_%'] > 0).sum()
 
-        lines.append("## 1. 总体摘要")
+        lines.append("## 1. Overall Summary")
         lines.append("")
-        lines.append(f"- **平均跟踪精度改善**: {mean_imp:+.1f}%")
-        lines.append(f"- **最大改善**: {max_imp:+.1f}% ({max_imp_row['Attack']})")
-        lines.append(f"- **正向改善**: {positive}/{len(nn_data)} 种攻击")
+        lines.append(f"- **Mean tracking improvement**: {mean_imp:+.1f}%")
+        lines.append(f"- **Max improvement**: {max_imp:+.1f}% ({max_imp_row['Attack']})")
+        lines.append(f"- **Positive improvement**: {positive}/{len(nn_data)} attacks")
         if 'Detection_Acc_%' in nn_data.columns:
             mean_acc = nn_data['Detection_Acc_%'].mean()
-            lines.append(f"- **平均检测准确率**: {mean_acc:.1f}%")
+            lines.append(f"- **Mean detection accuracy**: {mean_acc:.1f}%")
         lines.append("")
 
     # 指标表
-    lines.append("## 2. 定量指标表")
+    lines.append("## 2. Quantitative Metrics")
     lines.append("")
     header = "| Attack | Name | None RMSE | NN RMSE | Oracle RMSE | NN Improv. | Det. Acc. | Latency |"
     sep = "|--------|------|-----------|---------|-------------|------------|-----------|---------|"
@@ -406,27 +413,27 @@ def generate_report(df: pd.DataFrame):
     lines.append("")
 
     # 分析
-    lines.append("## 3. 分析讨论")
+    lines.append("## 3. Analysis and Discussion")
     lines.append("")
-    lines.append("### 3.1 分布对齐修复")
+    lines.append("### 3.1 Distribution Alignment")
     lines.append("")
-    lines.append("本次训练使用**内部运动学新息**（与 NNDetector 部署时计算方式完全一致），")
-    lines.append("消除了此前 EKF 新息（训练）与内部运动学新息（部署）之间的分布偏移。")
-    lines.append("训练时的验证准确率应能直接反映部署时的检测性能。")
+    lines.append("Training uses **internal kinematics innovation** (identical to deployment computation),")
+    lines.append("eliminating the distribution shift between EKF innovation (training) and internal kinematics innovation (deployment).")
+    lines.append("Validation accuracy during training should directly reflect deployment detection performance.")
     lines.append("")
-    lines.append("### 3.2 统一恢复策略")
+    lines.append("### 3.2 Unified Recovery Strategy")
     lines.append("")
-    lines.append("加性攻击 (A0-A4, A6-A8) 采用统一的 `y_rec = y_meas − â(k)` 恢复：")
-    lines.append("- NN 解码器从 latent 表示重建攻击波形 â(k)")
-    lines.append("- 恢复质量取决于解码器的重建精度，不依赖分类标签")
-    lines.append("- A0 正常时 â ≈ 0，自动退化为直通")
+    lines.append("Additive attacks (A0-A4, A6-A8) use unified `y_rec = y_meas - a(k)` recovery:")
+    lines.append("- NN decoder reconstructs attack waveform a(k) from latent representation")
+    lines.append("- Recovery quality depends on decoder reconstruction accuracy, not classification labels")
+    lines.append("- A0 normal case: a ~ 0, automatically degenerates to pass-through")
     lines.append("")
-    lines.append("A5 重放攻击为例外：非加性攻击，减法无意义，切换为内部运动学死推算。")
+    lines.append("A5 replay attack is the exception: non-additive attack, subtraction is meaningless; switches to internal kinematics dead reckoning.")
     lines.append("")
 
     # NN 与 Oracle 差距分析
     if len(nn_data) > 0 and len(oracle_data) > 0:
-        lines.append("### 3.3 NN vs Oracle 差距")
+        lines.append("### 3.3 NN vs Oracle Gap")
         lines.append("")
         for atk in ATTACK_TYPES:
             r_nn = nn_data[nn_data['Attack'] == atk]
@@ -440,11 +447,11 @@ def generate_report(df: pd.DataFrame):
                            f"Gap={gap:.4f}m")
         lines.append("")
 
-    lines.append("### 3.4 改进方向")
+    lines.append("### 3.4 Improvement Directions")
     lines.append("")
-    lines.append("1. **解码器精度提升**: 缩小 NN 与 Oracle 之间的 RMSE 差距")
-    lines.append("2. **A5 死推算优化**: 考虑周期性用 EKF 估计重置内部运动学状态，控制漂移")
-    lines.append("3. **多窗口投票**: 利用连续多窗口的分类结果投票，减少单窗口误分类")
+    lines.append("1. **Decoder accuracy**: reduce the RMSE gap between NN and Oracle")
+    lines.append("2. **A5 dead reckoning optimization**: periodically reset internal kinematics state with EKF estimate to control drift")
+    lines.append("3. **Multi-window voting**: leverage classification results from consecutive windows to reduce single-window misclassification")
     lines.append("")
 
     report_text = "\n".join(lines)

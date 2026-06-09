@@ -9,7 +9,7 @@ simulate_detector.py — 多级检测器对比仿真
   Tier 2 (oracle): OracleDetector — 已知 ground truth a(k)，理论上界
 
 轨迹类型 (5族，与训练数据一致):
-  lissajous / circular / variable / random_waypoint / aggressive
+  lissajous / circular / spiral / random_waypoint / square
 
 攻击起始时间: 随机 [5, 30]s (匹配训练数据分布)
 
@@ -31,8 +31,15 @@ matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 from collections import defaultdict
 
+# IEEE 论文标准字体
+plt.rcParams['font.family'] = 'serif'
+plt.rcParams['font.serif'] = ['Times New Roman']
+plt.rcParams['mathtext.fontset'] = 'stix'
+plt.rcParams['font.size'] = 10
+plt.rcParams['axes.unicode_minus'] = False
+
 from model import (WMRParams, WMRKinematics, EKFEstimator, SensorSimulator,
-                   LissajousTrajectory, CircularTrajectory)
+                   LissajousTrajectory, CircularTrajectory, SIM_STEPS)
 from controller import NMPCController, NMPCParams
 from attack import SensorAttack, AttackConfig
 from detector import (NNDetector, OracleDetector,
@@ -82,7 +89,7 @@ def run_simulation(attack_type: str = 'A4',
     Args:
         attack_type:     攻击类型 'A0'~'A8'
         detector_tier:   检测器级别 'none'/'nn'/'oracle'
-        trajectory_type: 轨迹类型 (5族: lissajous/circular/variable/random_waypoint/aggressive)
+        trajectory_type: 轨迹类型 (5族: lissajous/circular/spiral/random_waypoint/square)
         seed:            随机种子
         attack_onset:    攻击开始时间 [s] (None=默认15s, A0=永不攻击)
 
@@ -92,7 +99,7 @@ def run_simulation(attack_type: str = 'A4',
     # ---- 初始化 ----
     wmr_params = WMRParams()
     Ts = wmr_params.Ts
-    n_steps = int(SIM_TIME / Ts)  # 700
+    n_steps = SIM_STEPS  # 700
 
     # 轨迹: 支持 5 种类型
     traj = _create_trajectory(trajectory_type, Ts, seed)
@@ -233,7 +240,7 @@ def _create_trajectory(traj_type: str, Ts: float, seed: int):
         return LissajousTrajectory(Ts=Ts)
     elif traj_type in ('circular',):
         return CircularTrajectory(Ts=Ts)
-    elif traj_type in ('variable', 'random_waypoint', 'aggressive'):
+    elif traj_type in ('spiral', 'random_waypoint', 'square'):
         # 使用 RandomizedTrajectory 的特定族
         traj = RandomizedTrajectory(Ts=Ts, seed=seed)
         # 强制选择指定族 (通过反复创建直到匹配)
@@ -689,8 +696,8 @@ def main():
     parser.add_argument('--tiers', type=str, default='none,nn,oracle',
                         help='Detector tiers, comma-separated (default: none,nn,oracle)')
     parser.add_argument('--trajectory', type=str, default='lissajous',
-                        choices=['lissajous', 'circular', 'variable',
-                                'random_waypoint', 'aggressive'],
+                        choices=['lissajous', 'circular', 'spiral',
+                                'random_waypoint', 'square'],
                         help='Reference trajectory type (default: lissajous)')
     parser.add_argument('--no-plot', action='store_true',
                         help='Skip plotting')

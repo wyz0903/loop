@@ -18,18 +18,28 @@ build/
 # Agents/Skills (installed by `npx skills add`)
 .agents/
 
+# Claude Code local session
+.claude/
+
 # OS
 .DS_Store
 Thumbs.db
 
 # Results (large binary files)
-results/*.npz
-results/*.zip
-results/*.png
+results/
 
 # CasADi compiled solver (large binary)
-nmpc_solver.casadi
+**/*.casadi
 
-#detaset
+# Models (large binary)
+models/
+
+# Generated figures
+fig_*.png
+
+# Dataset
 dataset_win/
 dataset/
+
+# Review outputs
+review/

@@ -1,34 +1,28 @@
 """
-attack.py — 传感器通道加性攻击注入器
+attack.py — 传感器攻击注入器 (IEEE TIE 论文)
 ==========================================================================
-8种攻击类型 + Normal基准，全部作用于传感器测量值。
+8种攻击类型 + Normal基准，每种攻击具有严格的物理含义。
 
-统一形式:
-  y_meas(k) = X_true(k) + n(k) + a(k)
-
-其中 n(k) 为正常传感器噪声，a(k) 为攻击注入信号。
-
-攻击索引:
-  A0 — Normal   (无攻击，基准)
-  A1 — 恒定偏置 (Constant Bias)
-  A2 — 正弦注入 (Sinusoidal Injection)
-  A3 — 斜坡漂移 (Ramp Drift)
-  A4 — 阶跃突变 (Step Attack)
-  A5 — 重放攻击 (Replay Attack)
-  A6 — 脉冲序列 (Pulse Train)
-  A7 — 扫频攻击 (Chirp / Frequency Sweep)
-  A8 — 多频叠加 (Multi-Tone Injection)
+攻击分类:
+  A0 — 正常 (Normal)                    — 无攻击，基准对照
+  A1 — 恒定偏移 (Constant Bias)         — 加性：传感器校准误差 / 零漂
+  A2 — 正弦注入 (Sinusoidal)             — 加性：工频 / PWM 电磁干扰
+  A3 — 斜坡漂移 (Drift)                 — 加性：MEMS 温度漂移，线性累积
+  A4 — 阶跃 (Step)                      — 加性：物理撞击 / 传感器突变损坏
+  A5 — 重放攻击 (Replay Attack)         — 非加性：录制后回放历史测量值
+  A6 — 信号丢失 (Intermittent Dropout)  — 非加性：接线松动，传感器间歇开路
+  A7 — 缩放攻击 (Scaling)               — 乘性：传感器增益被篡改
+  A8 — 传感器冻结 (Sensor Freeze)       — 非加性：固件死锁 / ADC锁存
 
 用法:
   attacker = SensorAttack(attack_type='A5', onset_time=5.0, seed=42)
   for t in simulation:
-      a_k = attacker.step(t)
-      y_meas = true_state + sensor_noise + a_k
+      y_meas = attacker.inject(t, y_clean)   # 统一接口
 """
 
 import numpy as np
-from dataclasses import dataclass, field
-from typing import Dict, Tuple
+from dataclasses import dataclass
+from typing import Tuple
 
 
 # ============================================================================
@@ -38,82 +32,84 @@ from typing import Dict, Tuple
 @dataclass
 class AttackConfig:
     """单种攻击的参数配置"""
-    # —— A1 恒定偏置 ——
-    bias_xy: Tuple[float, float] = (0.15, -0.12)  # x,y 偏置 [m] (↑1.9x)
-    bias_theta: float = 0.10                        # 角度偏置 [rad] (↑2x)
 
-    # —— A2 正弦注入 ——
-    sin_amp: float = 0.12                           # 幅值 [m] (↑1.5x)
-    sin_freq: float = 0.8                           # 频率 [Hz]
-    sin_phase: float = 0.0                          # 初始相位 [rad]
+    # —— A1 恒定偏移 (Constant Bias) ——
+    # 来源: 传感器出厂校准后的残余零漂
+    bias_xy: Tuple[float, float] = (0.15, -0.12)   # x,y 偏置 [m]
+    bias_theta: float = 0.10                         # 角度偏置 [rad]
 
-    # —— A3 斜坡漂移 ——
-    ramp_rate_xy: float = 0.008                     # 位置漂移率 [m/s] (↑2x)
-    ramp_rate_theta: float = 0.004                  # 角度漂移率 [rad/s] (↑2x)
+    # —— A2 正弦注入 (Sinusoidal) ——
+    # 来源: 50Hz 工频或 PWM 开关噪声电磁耦合
+    sin_amp: float = 0.12                            # 幅值 [m]
+    sin_freq: float = 0.8                            # 干扰频率 [Hz]
+    sin_phase: float = 0.0                            # 初始相位 [rad]
 
-    # —— A4 阶跃突变 ——
-    step_amp_xy: float = 0.25                       # 位置阶跃 [m] (↑1.7x)
-    step_amp_theta: float = 0.18                    # 角度阶跃 [rad] (↑1.8x)
+    # —— A3 斜坡漂移 (Drift) ——
+    # 来源: MEMS 传感器温升导致信号基线缓慢漂移
+    ramp_rate_xy: float = 0.020                       # 位置漂移率 [m/s]
+    ramp_rate_theta: float = 0.010                    # 角度漂移率 [rad/s]
 
-    # —— A5 重放攻击 ——
-    replay_record_duration: float = 10.0             # 录制时长 [s] (攻击前)
-    replay_loop: bool = True                         # 是否循环回放
+    # —— A4 阶跃 (Step) ——
+    # 来源: 机械撞击导致传感器输出瞬间跳变
+    step_amp_xy: float = 0.25                         # 位置阶跃幅值 [m]
+    step_amp_theta: float = 0.18                      # 角度阶跃幅值 [rad]
 
-    # —— A6 脉冲序列 ——
-    pulse_amp: float = 0.20                         # 脉冲幅值 [m] (↑1.7x)
-    pulse_period: float = 1.0                       # 脉冲周期 [s]
-    pulse_duty: float = 0.3                         # 占空比
+    # —— A5 重放攻击 (Replay Attack) ——
+    # 来源: 攻击者录制历史测量值后回放
+    replay_record_duration: float = 10.0              # 录制时长 [s] (攻击前)
+    replay_loop: bool = True                           # 是否循环回放
+    replay_record_gap: float = 0.0                     # 录制截止距攻击开始的间隔 [s]
 
-    # —— A7 扫频攻击 ——
-    chirp_amp: float = 0.10                         # 幅值 [m] (↑1.7x)
-    chirp_f_start: float = 0.1                      # 起始频率 [Hz]
-    chirp_f_end: float = 4.0                        # 终止频率 [Hz]
-    chirp_duration: float = 8.0                     # 扫频周期 [s]
+    # —— A6 信号丢失 (Intermittent Dropout) ——
+    # 来源: 接线松动、连接器氧化，传感器间歇性开路 → 输出为零
+    # Gilbert-Elliott 双状态 Markov 模型
+    dropout_p_gf: float = 0.008                       # P(good→fault) 每步转移概率
+    dropout_p_fg: float = 0.12                        # P(fault→good) 每步转移概率
+    dropout_zero_output: bool = True                   # True=输出归零, False=保持末值
 
-    # —— A8 多频叠加 ——
-    multitone_freqs: Tuple[float, ...] = (0.5, 1.7, 3.3)  # 非谐波频率 [Hz]
-    multitone_amps:  Tuple[float, ...] = (0.08, 0.06, 0.04)  # 各频率幅值 [m]
+    # —— A7 缩放攻击 (Scaling) ——
+    # 来源: 传感器信号调理电路被篡改，增益偏移或ADC参考电压被修改
+    # 唯一乘性攻击: y_att = diag(s) @ y_clean
+    scale_x: float = 1.4                               # x通道缩放因子 (>1=放大)
+    scale_y: float = 0.6                               # y通道缩放因子 (<1=缩小)
+    scale_theta: float = -0.5                          # θ通道缩放因子 (<0=反向)
+
+    # —— A8 传感器冻结 (Sensor Freeze) ——
+    # 来源: 固件死锁、ADC锁存、I²C总线卡死导致传感器不再更新
+    # y_att(t) = y_clean(t_freeze), t ≥ onset
+    # 无需额外参数，冻结时刻 = onset_time
 
     # —— 攻击持续时间 (None = 永不结束) ——
-    attack_duration: float = None  # 攻击持续时间 [s]，None 表示持续到仿真结束
+    attack_duration: float = None
 
 
 # ============================================================================
-# 攻击生成器基类
+# 攻击注入器
 # ============================================================================
 
 class SensorAttack:
-    """传感器加性攻击注入器
-    
-    统一接口，根据 attack_type 选择对应的攻击生成策略。
-    攻击仅在 onset_time 之后生效，之前输出零向量。
+    """传感器攻击注入器
+
+    统一 inject() 接口。每种攻击有明确的物理含义。
     """
 
-    # 攻击类型注册表
     ATTACK_TYPES = ['A0', 'A1', 'A2', 'A3', 'A4', 'A5', 'A6', 'A7', 'A8']
     ATTACK_NAMES = {
         'A0': 'Normal',
         'A1': 'Constant Bias',
-        'A2': 'Sinusoidal Injection',
-        'A3': 'Ramp Drift',
-        'A4': 'Step Attack',
+        'A2': 'Sinusoidal',
+        'A3': 'Drift',
+        'A4': 'Step',
         'A5': 'Replay Attack',
-        'A6': 'Pulse Train',
-        'A7': 'Chirp Sweep',
-        'A8': 'Multi-Tone Injection',
+        'A6': 'Intermittent Dropout',
+        'A7': 'Scaling',
+        'A8': 'Sensor Freeze',
     }
 
     def __init__(self, attack_type: str = 'A0',
                  onset_time: float = 5.0,
                  config: AttackConfig = None,
                  seed: int = 42):
-        """
-        Args:
-            attack_type: 攻击类型 'A0'~'A8'
-            onset_time:  攻击开始时间 [s]，Normal下无效
-            config:      攻击参数配置
-            seed:        随机种子 (保证可复现)
-        """
         if attack_type not in self.ATTACK_TYPES:
             raise ValueError(f"Unknown attack type: {attack_type}. "
                              f"Choose from {self.ATTACK_TYPES}")
@@ -123,47 +119,40 @@ class SensorAttack:
         self.cfg = config if config is not None else AttackConfig()
         self.rng = np.random.RandomState(seed)
 
-        # 攻击结束时间
         if self.cfg.attack_duration is not None and self.cfg.attack_duration > 0:
             self.offset_time = onset_time + self.cfg.attack_duration
         else:
-            self.offset_time = float('inf')  # 永不结束
+            self.offset_time = float('inf')
 
-        # 攻击状态 (类型特定)
-        self._replay_buffer = []             # A5 录制缓冲
-        self._replay_idx = 0                 # A5 回放指针
-        self._phase_acc = 0.0               # A7 扫频相位累加器
+        # ---- 攻击类型特定状态 ----
+        self._replay_buffer = []           # A5 录制缓冲
+        self._replay_idx = 0               # A5 回放指针
+        self._dropout_state = 0            # A6 Markov状态: 0=good, 1=fault
+        self._last_good_value = None       # A6 故障前最后有效值 (用于保持末值模式)
+        self._frozen_value = None          # A8 冻结值
+        self._scaling_diag = None          # A7 缩放对角矩阵 (缓存)
 
     def reset(self):
-        """重置攻击状态"""
+        """重置攻击状态 (每次新仿真前调用)"""
         self._replay_buffer = []
         self._replay_idx = 0
-        self._phase_acc = 0.0
+        self._dropout_state = 0
+        self._last_good_value = None
+        self._frozen_value = None
+        self._scaling_diag = None
 
-    def step(self, t: float) -> np.ndarray:
-        """生成当前时刻的攻击注入向量（仅适用于加性攻击 A1-A4,A6-A8）
+    def _is_active(self, t: float) -> bool:
+        """检查攻击是否在生效期内"""
+        if self.attack_type == 'A0':
+            return False
+        return self.onset_time <= t < self.offset_time
 
-        Args:
-            t: 当前仿真时间 [s]
-
-        Returns:
-            a_k: 攻击注入向量 (3,) — [a_x, a_y, a_theta]
-        """
-        if self.attack_type == 'A0' or t < self.onset_time or t >= self.offset_time:
-            return np.zeros(3)
-
-        if self.attack_type == 'A5':
-            raise RuntimeError(
-                "A5 重放攻击不使用 step() 接口，请在仿真回路中调用 inject(t, y_clean)")
-
-        method = getattr(self, f'_attack_{self.attack_type}')
-        return method(t)
+    # ==================================================================
+    # 统一注入接口
+    # ==================================================================
 
     def inject(self, t: float, y_clean: np.ndarray) -> np.ndarray:
-        """将攻击施加于干净测量值，返回受攻击的测量值
-
-        这是仿真回路的统一入口。加性攻击返回 y_clean + a(k)，
-        重放攻击返回录制的历史测量值。
+        """将攻击施加于干净测量值
 
         Args:
             t:       当前仿真时间 [s]
@@ -172,55 +161,57 @@ class SensorAttack:
         Returns:
             y_attacked: 受攻击后的测量值 (3,)
         """
-        # —— 重放攻击：独立处理（录制与回放跨越攻击边界） ——
-        if self.attack_type == 'A5':
-            record_end = self.onset_time - 0.5  # 录制截止：攻击前 0.5s
-            if t < record_end:
+        # ---- A0 无攻击 或 攻击窗口外 ----
+        if not self._is_active(t):
+            # A5 特殊处理: 攻击前需要录制
+            if self.attack_type == 'A5' and t < self.onset_time - self.cfg.replay_record_gap:
                 self._replay_buffer.append(y_clean.copy())
-                return y_clean.copy()
-            elif t >= self.onset_time and self._replay_buffer:
-                if self._replay_idx >= len(self._replay_buffer):
-                    self._replay_idx = 0
-                y_replay = self._replay_buffer[self._replay_idx].copy()
-                self._replay_idx += 1
-                return y_replay
-            else:
-                # 过渡期 (record_end <= t < onset_time): 返回干净值
-                return y_clean.copy()
-
-        # —— 其余攻击 ——
-        if self.attack_type == 'A0' or t < self.onset_time or t >= self.offset_time:
             return y_clean.copy()
 
-        a_k = self.step(t)
-        return y_clean + a_k
+        # ---- 按攻击类型分发 ----
+        if self.attack_type == 'A5':
+            return self._inject_A5(t, y_clean)
+        elif self.attack_type == 'A6':
+            return self._inject_A6(t, y_clean)
+        elif self.attack_type == 'A7':
+            return self._inject_A7(t, y_clean)
+        elif self.attack_type == 'A8':
+            return self._inject_A8(t, y_clean)
+        else:
+            # 加性攻击: A1-A4
+            a_k = self.step(t)
+            return y_clean + a_k
 
-    # ------------------------------------------------------------------
-    # A1: 恒定偏置
-    # ------------------------------------------------------------------
+    def step(self, t: float) -> np.ndarray:
+        """生成加性攻击向量 a(k) — 仅 A1-A4 使用"""
+        if not self._is_active(t):
+            return np.zeros(3)
+        method = getattr(self, f'_attack_{self.attack_type}')
+        return method(t)
+
+    # ==================================================================
+    # A1: 恒定偏移 — 传感器校准后残余零漂
+    # ==================================================================
     def _attack_A1(self, t: float) -> np.ndarray:
-        """a = [b_x, b_y, b_theta]，恒定不变"""
         return np.array([
             self.cfg.bias_xy[0],
             self.cfg.bias_xy[1],
             self.cfg.bias_theta
         ])
 
-    # ------------------------------------------------------------------
-    # A2: 正弦注入
-    # ------------------------------------------------------------------
+    # ==================================================================
+    # A2: 正弦注入 — 工频或PWM开关噪声电磁耦合
+    # ==================================================================
     def _attack_A2(self, t: float) -> np.ndarray:
-        """a = A · sin(2π·f·t + φ)，单频振荡"""
         val = self.cfg.sin_amp * np.sin(
             2 * np.pi * self.cfg.sin_freq * t + self.cfg.sin_phase
         )
-        return np.array([val, val * 0.7, val * 0.3])  # 各通道比例缩放
+        return np.array([val, val * 0.7, val * 0.3])
 
-    # ------------------------------------------------------------------
-    # A3: 斜坡漂移
-    # ------------------------------------------------------------------
+    # ==================================================================
+    # A3: 斜坡漂移 — MEMS温升导致信号基线缓慢线性漂移
+    # ==================================================================
     def _attack_A3(self, t: float) -> np.ndarray:
-        """a = rate · (t - t_onset)，线性增长"""
         dt = t - self.onset_time
         return np.array([
             self.cfg.ramp_rate_xy * dt,
@@ -228,70 +219,120 @@ class SensorAttack:
             self.cfg.ramp_rate_theta * dt
         ])
 
-    # ------------------------------------------------------------------
-    # A4: 阶跃突变
-    # ------------------------------------------------------------------
+    # ==================================================================
+    # A4: 阶跃 — 机械撞击导致传感器输出瞬间跳变
+    # ==================================================================
     def _attack_A4(self, t: float) -> np.ndarray:
-        """a = A · 1(t >= t_onset)，瞬时跳变后维持"""
         return np.array([
             self.cfg.step_amp_xy,
             -self.cfg.step_amp_xy * 0.6,
             self.cfg.step_amp_theta
         ])
 
-    # ------------------------------------------------------------------
-    # A5: 重放攻击 (通过 inject() 接口实现，不通过 step())
-    # ------------------------------------------------------------------
-
-    # ------------------------------------------------------------------
-    # A6: 脉冲序列
-    # ------------------------------------------------------------------
-    def _attack_A6(self, t: float) -> np.ndarray:
-        """周期方波，占空比 pulse_duty"""
-        dt = t - self.onset_time
-        phase_in_period = (dt % self.cfg.pulse_period) / self.cfg.pulse_period
-        if phase_in_period < self.cfg.pulse_duty:
-            amp = self.cfg.pulse_amp
-            return np.array([amp, amp * 0.5, amp * 0.3])
+    # ==================================================================
+    # A5: 重放攻击 — 录制历史测量值后循环回放
+    # ==================================================================
+    def _inject_A5(self, t: float, y_clean: np.ndarray) -> np.ndarray:
+        if self._replay_buffer:
+            if self._replay_idx >= len(self._replay_buffer):
+                self._replay_idx = 0
+            y_replay = self._replay_buffer[self._replay_idx].copy()
+            self._replay_idx += 1
+            return y_replay
         else:
-            return np.zeros(3)
+            return y_clean.copy()
 
-    # ------------------------------------------------------------------
-    # A7: 扫频攻击 (线性调频)
-    # ------------------------------------------------------------------
-    def _attack_A7(self, t: float) -> np.ndarray:
-        """a = A · sin(φ(t))，f(t) 从 f_start 线性扫描至 f_end"""
-        dt = t - self.onset_time
-        # 线性调频: 瞬时频率 f(t) = f0 + (f1-f0) * dt/T
-        f_inst = (self.cfg.chirp_f_start +
-                  (self.cfg.chirp_f_end - self.cfg.chirp_f_start)
-                  * min(dt, self.cfg.chirp_duration) / self.cfg.chirp_duration)
-        # 相位 = 积分频率
-        self._phase_acc += 2 * np.pi * f_inst * 0.05  # Ts=0.05 积分
-        val = self.cfg.chirp_amp * np.sin(self._phase_acc)
-        return np.array([val, val * 0.6, val * 0.4])
+    # ==================================================================
+    # A6: 信号丢失 — 接线松动/连接器氧化，传感器间歇性开路
+    #
+    # Gilbert-Elliott 双状态 Markov 模型:
+    #   State 0 (good):  正常输出
+    #   State 1 (fault): 传感器输出归零 (open circuit = 0V)
+    #
+    # 转移概率:
+    #   P(0→1) = dropout_p_gf : 突发故障概率 (小)
+    #   P(1→0) = dropout_p_fg : 恢复概率     (大)
+    #
+    # 产生突发的、间歇性的信号丢失，具有工业传感器连接故障的特征
+    # ==================================================================
+    def _inject_A6(self, t: float, y_clean: np.ndarray) -> np.ndarray:
+        # Markov 状态转移
+        if self._dropout_state == 0:
+            self._last_good_value = y_clean.copy()  # 记录故障前最后有效值
+            if self.rng.rand() < self.cfg.dropout_p_gf:
+                self._dropout_state = 1
+        else:
+            if self.rng.rand() < self.cfg.dropout_p_fg:
+                self._dropout_state = 0
 
-    # ------------------------------------------------------------------
-    # A8: 多频叠加注入
-    # ------------------------------------------------------------------
-    def _attack_A8(self, t: float) -> np.ndarray:
-        """a = Σ A_i · sin(2π·f_i·(t-t_onset))，多个非谐波频率叠加"""
-        dt = t - self.onset_time
-        val = sum(
-            amp * np.sin(2 * np.pi * freq * dt)
-            for freq, amp in zip(self.cfg.multitone_freqs, self.cfg.multitone_amps)
-        )
-        return np.array([val, val * 0.6, val * 0.4])
+        if self._dropout_state == 1:
+            if self.cfg.dropout_zero_output:
+                return np.zeros(3)                       # 开路 → 零输出
+            else:
+                if self._last_good_value is not None:
+                    return self._last_good_value.copy()  # 保持故障前末值
+                return y_clean.copy()                    # 兜底 (无缓存时)
+        return y_clean.copy()
+
+    # ==================================================================
+    # A7: 缩放攻击 — 传感器信号调理电路增益被篡改
+    #
+    # 唯一乘性攻击: y_att = diag(s_x, s_y, s_θ) · y_clean
+    #
+    # 物理场景:
+    #   - 可编程增益放大器(PGA)被恶意重配置
+    #   - ADC参考电压被修改
+    #   - 数字信号链中乘法因子被篡改
+    #
+    # s > 1:  放大 → 机器人以为动了更多，实际控制减弱
+    # 0<s<1:  缩小 → 机器人以为动了更少，实际控制过冲
+    # s < 0:  反向 → 传感器读数符号反转，最危险(方向完全错误)
+    # ==================================================================
+    def _inject_A7(self, t: float, y_clean: np.ndarray) -> np.ndarray:
+        if self._scaling_diag is None:
+            self._scaling_diag = np.array([
+                self.cfg.scale_x,
+                self.cfg.scale_y,
+                self.cfg.scale_theta
+            ])
+        return self._scaling_diag * y_clean
+
+    # ==================================================================
+    # A8: 传感器冻结 — 固件死锁/ADC锁存/I²C总线卡死
+    #
+    # y_att(t) = y_clean(t_freeze),  t ≥ t_onset
+    #
+    # 物理场景:
+    #   - 传感器MCU固件进入死循环,不再更新输出寄存器
+    #   - ADC采样保持电路锁存(单粒子翻转/闩锁效应)
+    #   - I²C/SPI总线SCL被拉低,传感器无法响应主机请求
+    #
+    # 与重放(A5)的区别: 冻结是单一时刻的快照, 重放是历史序列的回放
+    # 与恒定偏移(A1)的区别: 偏移是真实值+固定值, 冻结是与真实值无关的常数
+    # ==================================================================
+    def _inject_A8(self, t: float, y_clean: np.ndarray) -> np.ndarray:
+        if self._frozen_value is None:
+            self._frozen_value = y_clean.copy()
+        return self._frozen_value.copy()
+
+    # ==================================================================
+    # 工具方法
+    # ==================================================================
 
     @staticmethod
     def print_summary():
         """输出攻击类型汇总"""
-        print("\n" + "=" * 60)
-        print("Sensor Attack Catalog (传感器加性攻击目录)")
-        print("=" * 60)
-        for atype, name in SensorAttack.ATTACK_NAMES.items():
-            print(f"  {atype}: {name}")
-        print("=" * 60 + "\n")
+        print("\n" + "=" * 65)
+        print("Sensor Attack Catalog — 传感器攻击目录 (IEEE TIE)")
+        print("=" * 65)
+        for atype in ['A0','A1','A2','A3','A4','A5','A6','A7','A8']:
+            print(f"  {atype}: {SensorAttack.ATTACK_NAMES[atype]}")
+        print("=" * 65)
+        print("  A1-A4 : 加性攻击 (additive)")
+        print("  A5-A6 : 非加性攻击 — 通过 inject() 接口")
+        print("  A7    : 乘性攻击 (multiplicative) — 唯一非加性缩放类")
+        print("  A8    : 非加性攻击 — 传感器输出冻结")
+        print("=" * 65 + "\n")
 
 
 # ============================================================================
@@ -301,35 +342,100 @@ class SensorAttack:
 if __name__ == "__main__":
     SensorAttack.print_summary()
 
-    # 测试加性攻击 (A0-A4, A6-A8)
-    print("Testing additive attacks (step interface)...\n")
-    for atype in ['A0', 'A1', 'A2', 'A3', 'A4', 'A6', 'A7', 'A8']:
-        att = SensorAttack(attack_type=atype, onset_time=5.0, seed=42)
+    Ts = 0.05
+    onset = 5.0
+
+    # —— 测试加性攻击 A1-A4 ——
+    print("Testing additive attacks (A1-A4, step interface)...\n")
+    for atype in ['A1', 'A2', 'A3', 'A4']:
+        att = SensorAttack(attack_type=atype, onset_time=onset, seed=42)
         vals = []
-        for t in np.arange(5.0, 7.0, 0.05):
+        for t in np.arange(0.0, 8.0, Ts):
             vals.append(att.step(t))
         vals = np.array(vals)
+        pre = vals[:int(onset/Ts)]
+        post = vals[int(onset/Ts):]
+        assert np.allclose(pre, 0), f"{atype}: pre-onset should be zero!"
         print(f"  {atype} ({SensorAttack.ATTACK_NAMES[atype]}):")
-        print(f"    Range x: [{vals[:,0].min():.4f}, {vals[:,0].max():.4f}]")
-        print(f"    Range y: [{vals[:,1].min():.4f}, {vals[:,1].max():.4f}]")
-        print(f"    Range θ: [{vals[:,2].min():.4f}, {vals[:,2].max():.4f}]")
+        print(f"    Post-onset range x: [{post[:,0].min():.4f}, {post[:,0].max():.4f}]")
+        print(f"    Post-onset range y: [{post[:,1].min():.4f}, {post[:,1].max():.4f}]")
+        print(f"    Post-onset range θ: [{post[:,2].min():.4f}, {post[:,2].max():.4f}]")
 
-    # 测试重放攻击 (inject 接口)
-    print("\nTesting A5 Replay Attack (inject interface)...")
-    att = SensorAttack(attack_type='A5', onset_time=5.0, seed=42)
-    y_clean_hist = []
-    y_att_hist = []
-    for t in np.arange(0.0, 10.0, 0.05):
+    # —— 测试 A5 重放攻击 ——
+    print("\nTesting A5 Replay Attack...")
+    att = SensorAttack(attack_type='A5', onset_time=onset, seed=42)
+    y_clean_hist, y_att_hist = [], []
+    for t in np.arange(0.0, 10.0, Ts):
         y_clean = np.array([np.sin(t), np.cos(t), 0.1 * t])
         y_att = att.inject(t, y_clean)
         y_clean_hist.append(y_clean)
         y_att_hist.append(y_att)
     y_clean_hist = np.array(y_clean_hist)
     y_att_hist = np.array(y_att_hist)
-    # 验证: 攻击前注入=干净值, 攻击后注入≠干净值
-    pre_mask = np.arange(len(y_att_hist)) < 100  # t < 5s
-    pre_match = np.allclose(y_att_hist[pre_mask], y_clean_hist[pre_mask], atol=1e-10)
-    post_diff = np.mean(np.abs(y_att_hist[~pre_mask] - y_clean_hist[~pre_mask]))
-    print(f"  攻击前注入==干净值: {pre_match}")
-    print(f"  攻击后偏差均值:     {post_diff:.4f}m")
-    print("\nAll attacks verified.")
+    pre_mask = np.arange(len(y_att_hist)) < int(onset / Ts)
+    pre_ok = np.allclose(y_att_hist[pre_mask], y_clean_hist[pre_mask], atol=1e-10)
+    post_dev = np.mean(np.abs(y_att_hist[~pre_mask] - y_clean_hist[~pre_mask]))
+    print(f"  攻击前一致: {pre_ok}")
+    print(f"  攻击后平均偏差: {post_dev:.4f}m")
+
+    # —— 测试 A6 信号丢失 ——
+    print("\nTesting A6 Intermittent Dropout...")
+    att = SensorAttack(attack_type='A6', onset_time=onset, seed=42)
+    dropout_count = 0
+    y_att_hist, y_clean_hist = [], []
+    for t in np.arange(0.0, 20.0, Ts):  # 长一点以看到间歇性
+        y_clean = np.array([np.sin(t), np.cos(t), 0.1])
+        y_att = att.inject(t, y_clean)
+        y_att_hist.append(y_att)
+        y_clean_hist.append(y_clean)
+        if t >= onset and np.allclose(y_att, 0):
+            dropout_count += 1
+    y_att_hist = np.array(y_att_hist)
+    post = y_att_hist[int(onset/Ts):]
+    dropout_ratio = dropout_count / len(post) * 100
+    print(f"  丢包率 (攻击后): {dropout_ratio:.1f}%")
+    print(f"  故障态平均持续时间: {dropout_count / max(1, (post == 0).any(axis=1).sum() / max(1, np.sum(np.diff((post == 0).all(axis=1).astype(int)) == 1))):.1f} 步")
+    print(f"  攻击前输出一致: {np.allclose(y_att_hist[:int(onset/Ts)], y_clean_hist[:int(onset/Ts)], atol=1e-10)}")
+
+    # —— 测试 A7 缩放攻击 ——
+    print("\nTesting A7 Scaling Attack...")
+    att = SensorAttack(attack_type='A7', onset_time=onset, seed=42)
+    y_clean_hist, y_att_hist = [], []
+    for t in np.arange(0.0, 8.0, Ts):
+        y_clean = np.array([1.0, 2.0, 0.5])  # 固定输入用于测试缩放
+        y_att = att.inject(t, y_clean)
+        y_clean_hist.append(y_clean)
+        y_att_hist.append(y_att)
+    y_att_hist = np.array(y_att_hist)
+    post = y_att_hist[int(onset/Ts):]
+    print(f"  输入 y_clean: [{1.0}, {2.0}, {0.5}]")
+    print(f"  缩放因子:   s=[{att.cfg.scale_x}, {att.cfg.scale_y}, {att.cfg.scale_theta}]")
+    print(f"  输出 y_att:  [{post[0,0]:.3f}, {post[0,1]:.3f}, {post[0,2]:.3f}]")
+    print(f"  预期:        [{1.0*att.cfg.scale_x:.3f}, {2.0*att.cfg.scale_y:.3f}, {0.5*att.cfg.scale_theta:.3f}]")
+    assert np.allclose(post[0], [1.0*att.cfg.scale_x, 2.0*att.cfg.scale_y, 0.5*att.cfg.scale_theta])
+    pre_ok = np.allclose(y_att_hist[:int(onset/Ts)], y_clean_hist[:int(onset/Ts)], atol=1e-10)
+    print(f"  攻击前一致: {pre_ok}")
+
+    # —— 测试 A8 传感器冻结 ——
+    print("\nTesting A8 Sensor Freeze...")
+    att = SensorAttack(attack_type='A8', onset_time=onset, seed=42)
+    y_att_hist = []
+    y_clean_hist = []
+    for t in np.arange(0.0, 8.0, Ts):
+        y_clean = np.array([t, 2*t, 0.5*t])
+        y_att = att.inject(t, y_clean)
+        y_att_hist.append(y_att)
+        y_clean_hist.append(y_clean)
+    y_att_hist = np.array(y_att_hist)
+    post = y_att_hist[int(onset/Ts):]
+    # 冻结值应始终等于 onset 时刻的 y_clean
+    frozen_expected = y_clean_hist[int(onset/Ts)]
+    all_frozen = np.allclose(post, frozen_expected, atol=1e-10)
+    print(f"  冻结时刻 (t={onset}s) y_clean: {frozen_expected}")
+    print(f"  攻击后所有值 == 冻结值: {all_frozen}")
+    # 确认冻结值不随时间变化
+    assert all_frozen
+
+    print("\n" + "=" * 65)
+    print("  所有攻击自测通过！")
+    print("=" * 65 + "\n")

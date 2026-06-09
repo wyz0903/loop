@@ -10,8 +10,9 @@ simulate.py -- WMR 闭环仿真主程序
 参考：配置文档 Section 1 (求解器设置 T=35s, Ts=0.05)
 
 用法：
-  python simulate.py                # 运行仿真并显示结果
+  python simulate.py                # 运行 Lissajous 仿真并显示结果
   python simulate.py --no-plot      # 仅运行不显示图表
+  python simulate.py --compare      # 五族轨迹无攻击跟踪对比图
 """
 
 import os
@@ -23,12 +24,16 @@ matplotlib.use('TkAgg')
 import matplotlib.pyplot as plt
 from collections import defaultdict
 
-# 设置中文字体
-plt.rcParams['font.sans-serif'] = ['SimHei', 'Microsoft YaHei', 'DejaVu Sans']
+# IEEE 论文标准字体
+plt.rcParams['font.family'] = 'serif'
+plt.rcParams['font.serif'] = ['Times New Roman']
+plt.rcParams['mathtext.fontset'] = 'stix'
+plt.rcParams['font.size'] = 10
 plt.rcParams['axes.unicode_minus'] = False
 
-from model import WMRParams, ReferenceTrajectory, WMRKinematics
-from model import EKFEstimator, SensorSimulator
+from model import (WMRParams, WMRKinematics, EKFEstimator, SensorSimulator,
+                   LissajousTrajectory, CircularTrajectory, SIM_STEPS)
+from model import ReferenceTrajectory  # 向后兼容别名
 from controller import NMPCController, NMPCParams
 
 
@@ -87,7 +92,7 @@ def run_simulation(show_plot: bool = True):
     # ---- 初始化组件 ----
     wmr_params = WMRParams()
     Ts = wmr_params.Ts
-    n_steps = int(SIM_TIME / Ts)  # 700 步
+    n_steps = SIM_STEPS  # 700 步
 
     traj = ReferenceTrajectory(Ts=Ts)
     robot = WMRKinematics(wmr_params)
@@ -197,7 +202,7 @@ def plot_results(data: dict):
     ekf_res = data['ekf_innovation']  # (N, 3)
 
     fig, axes = plt.subplots(2, 2, figsize=(14, 10))
-    fig.suptitle('WMR 8字形轨迹跟踪闭环仿真 (Normal)', fontsize=14, fontweight='bold')
+    fig.suptitle('WMR Lissajous Trajectory Tracking (Normal)', fontsize=14, fontweight='bold')
 
     # ---- 图1: 2D轨迹 ----
     ax1 = axes[0, 0]
@@ -244,7 +249,7 @@ def plot_results(data: dict):
     ax4.axhline(y=0, color='k', linestyle=':', alpha=0.5)
     ax4.set_xlabel('Time [s]')
     ax4.set_ylabel('Innovation (新息)')
-    ax4.set_title('EKF Innovation (新息)')
+    ax4.set_title('EKF Innovation')
     ax4.legend(loc='best')
     ax4.grid(True, alpha=0.3)
 
@@ -281,10 +286,152 @@ def print_metrics(data: dict):
 
 
 # ============================================================================
+# 五族轨迹无攻击跟踪对比
+# ============================================================================
+
+def run_single_track(traj, robot, sensor, ekf, ctrl, nmpc_params, Ts, n_steps):
+    """用给定的轨迹生成器执行一次无攻击闭环仿真
+
+    Args:
+        traj: 轨迹生成器 (必须有 step(t) 和 generate_sequence(t, N) 方法)
+        robot, sensor, ekf, ctrl: 仿真组件
+        nmpc_params: NMPC 参数
+        Ts: 采样时间
+        n_steps: 总步数
+
+    Returns:
+        data: 包含所有时序信号的字典
+    """
+    data = defaultdict(list)
+    u_cmd = np.zeros(2)
+
+    for step in range(n_steps):
+        t = step * Ts
+        Upsilon_r, u_r = traj.step(t)
+        Ur_seq = traj.generate_sequence(t, nmpc_params.N)
+
+        true_state = robot.state.copy()
+        y_meas = sensor.measure(true_state)
+        Upsilon_hat, ekf_innovation = ekf.step(y_meas, u_cmd)
+        X_error = WMRKinematics.compute_error(Upsilon_r, Upsilon_hat)
+        u_cmd = ctrl.solve(X_error, Ur_seq)
+        u_a = WMRKinematics.clamp_control(u_cmd)
+        robot.step(u_a)
+
+        data['t'].append(t)
+        data['Upsilon_r'].append(Upsilon_r.copy())
+        data['true_state'].append(true_state.copy())
+        data['Upsilon_hat'].append(Upsilon_hat.copy())
+        data['X_error'].append(X_error.copy())
+        data['u_cmd'].append(u_cmd.copy())
+
+    return {k: np.array(v) for k, v in data.items()}
+
+
+def plot_all_trajectories():
+    """五族轨迹无攻击跟踪对比图"""
+    from generate_dataset import RandomizedTrajectory
+
+    wmr_params = WMRParams()
+    Ts = wmr_params.Ts
+    n_steps = SIM_STEPS
+    nmpc_params = NMPCParams()
+
+    # 五族轨迹的名称、颜色、生成器
+    TRAJ_CONFIGS = [
+        ('Lissajous',       '#2196F3', lambda: LissajousTrajectory(Ts=Ts)),
+        ('Circular',        '#4CAF50', lambda: CircularTrajectory(Ts=Ts)),
+        ('Spiral',          '#FF9800', lambda: _force_family('spiral', Ts)),
+        ('Random Waypoint', '#E91E63', lambda: _force_family('random_waypoint', Ts)),
+        ('Square',          '#9C27B0', lambda: _force_family('square', Ts)),
+    ]
+
+    fig, axes = plt.subplots(2, 3, figsize=(20, 13))
+    axes_flat = axes.flatten()
+    all_rms = {}
+
+    for idx, (name, color, factory) in enumerate(TRAJ_CONFIGS):
+        # 初始化组件
+        robot = WMRKinematics(wmr_params)
+        sensor = SensorSimulator()
+        ekf = EKFEstimator(wmr_params)
+        ctrl = NMPCController(nmpc_params)
+        ctrl.load_or_build()
+        traj = factory()
+
+        traj.reset()
+        robot.reset()
+        ekf.reset()
+        ctrl.reset()
+        np.random.seed(42)
+
+        print(f"[{idx+1}/5] 仿真 {name} ...", end='', flush=True)
+        data = run_single_track(traj, robot, sensor, ekf, ctrl, nmpc_params, Ts, n_steps)
+
+        Ur = data['Upsilon_r']
+        TrueState = data['true_state']
+        X_err = data['X_error']
+        pos_err = np.sqrt(X_err[:, 0]**2 + X_err[:, 1]**2)
+        rms_xy = np.sqrt(np.mean(pos_err**2))
+        all_rms[name] = rms_xy
+
+        ax = axes_flat[idx]
+        ax.plot(Ur[:, 0], Ur[:, 1], 'k--', linewidth=1.2, alpha=0.7, label='Ref')
+        ax.plot(TrueState[:, 0], TrueState[:, 1], color=color, linewidth=1.4, label='Track')
+        ax.plot(TrueState[0, 0], TrueState[0, 1], 'go', markersize=6)
+        ax.plot(TrueState[-1, 0], TrueState[-1, 1], 'r*', markersize=8)
+        # 空间边界框
+        b = wmr_params.pos_bound
+        ax.plot([-b, b, b, -b, -b], [-b, -b, b, b, -b], 'gray', linewidth=0.8, alpha=0.4, linestyle=':')
+        ax.set_xlim(-b-0.3, b+0.3); ax.set_ylim(-b-0.3, b+0.3)
+        ax.set_xlabel('X [m]'); ax.set_ylabel('Y [m]')
+        ax.set_title(f'{name}  (RMS$_ xy$={rms_xy:.4f} m)', fontsize=12, fontweight='bold', color=color)
+        ax.set_aspect('equal')
+        ax.legend(loc='upper right', fontsize=8)
+        ax.grid(True, alpha=0.25)
+        print(f' RMS_xy={rms_xy:.4f}m')
+
+    # 第6个子图: 汇总柱状图
+    ax6 = axes_flat[5]
+    names = list(all_rms.keys())
+    values = list(all_rms.values())
+    colors_bar = [cfg[1] for cfg in TRAJ_CONFIGS]
+    bars = ax6.bar(names, values, color=colors_bar, edgecolor='white', linewidth=1.2)
+    for bar, val in zip(bars, values):
+        ax6.text(bar.get_x() + bar.get_width()/2., bar.get_height() + 0.001,
+                 f'{val:.4f}', ha='center', va='bottom', fontsize=10, fontweight='bold')
+    ax6.set_ylabel('Position RMS$_ xy$ [m]')
+    ax6.set_title('Tracking Error Comparison', fontsize=13, fontweight='bold')
+    ax6.grid(True, alpha=0.3, axis='y')
+    ax6.set_ylim(0, max(values) * 1.25)
+
+    fig.suptitle('Five Trajectory Families — No-Attack NMPC Tracking (35s)',
+                 fontsize=15, fontweight='bold', y=0.98)
+    plt.tight_layout(rect=[0, 0, 1, 0.95])
+    plt.show()
+
+
+def _force_family(family: str, Ts: float):
+    """创建一个指定族的 RandomizedTrajectory"""
+    from generate_dataset import RandomizedTrajectory
+    _BASE = {'spiral': 0, 'random_waypoint': 500, 'square': 1500}
+    base = _BASE.get(family, 0)
+    for s in range(2000):
+        traj = RandomizedTrajectory(Ts=Ts, seed=base + s)
+        if traj.family == family:
+            return traj
+    raise RuntimeError(f'无法创建 {family} 轨迹')
+
+
+# ============================================================================
 # 主入口
 # ============================================================================
 
 if __name__ == "__main__":
     show = '--no-plot' not in sys.argv
-    logger = run_simulation(show_plot=show)
-    print_metrics(logger.to_arrays())
+
+    if '--compare' in sys.argv:
+        plot_all_trajectories()
+    else:
+        logger = run_simulation(show_plot=show)
+        print_metrics(logger.to_arrays())

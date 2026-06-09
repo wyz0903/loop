@@ -41,13 +41,14 @@ os.makedirs(OUTPUT_DIR, exist_ok=True)
 ALL_ATTACK_TYPES = ['A0', 'A1', 'A2', 'A3', 'A4', 'A5', 'A6', 'A7', 'A8']
 ATTACK_NAMES = {
     'A0': 'Normal', 'A1': 'ConstantBias', 'A2': 'Sinusoidal',
-    'A3': 'RampDrift', 'A4': 'StepAttack', 'A5': 'ReplayAttack',
-    'A6': 'PulseTrain', 'A7': 'ChirpSweep', 'A8': 'MultiTone',
+    'A3': 'Drift', 'A4': 'Step', 'A5': 'ReplayAttack',
+    'A6': 'Dropout', 'A7': 'Scaling', 'A8': 'Freeze',
 }
 
 # 输入通道: 内部运动学新息 + 控制上下文
 INPUT_CHANNELS = ['internal_innovation', 'u_cmd']   # internal_innovation(3) + u_cmd(2) = 5 通道
-N_STEPS = int(35.0 / 0.05)  # 700
+from model import SIM_STEPS
+N_STEPS = SIM_STEPS       # 700，避免 IEEE 754 截断误差
 WINDOW_SIZE = 100
 STRIDE = 1
 TRAIN_RATIO = 0.8  # config 0-15 train, 16-19 val
@@ -168,6 +169,8 @@ def main():
     args = parser.parse_args()
 
     os.makedirs(args.output_dir, exist_ok=True)
+    save_dir = os.path.join(args.output_dir, args.split_mode)
+    os.makedirs(save_dir, exist_ok=True)
 
     # 加载 metadata
     metadata_path = os.path.join(args.input_dir, 'metadata.csv')
@@ -254,10 +257,19 @@ def main():
 
         if not is_normal:
             atk_label = ALL_ATTACK_TYPES.index(atk_type)
-            onset_step = int(attack_onset / 0.05)
-            # 攻击结束时间（默认 inf = 永不结束）
+            # 优先使用元数据中的整数步索引 (避免浮点精度损失)
+            if 'attack_onset_step' in row.index and not pd.isna(row['attack_onset_step']):
+                onset_step = int(row['attack_onset_step'])
+            else:
+                onset_step = int(round(attack_onset / 0.05))
+            # 攻击结束时间 (默认 inf = 永不结束)
             attack_offset = float(row.get('attack_offset', 35.0 + 1.0))
-            offset_step = int(attack_offset / 0.05) if attack_offset < 35.0 else N_STEPS + 1
+            if 'attack_offset_step' in row.index and not pd.isna(row['attack_offset_step']):
+                offset_step = int(row['attack_offset_step'])
+                if attack_offset >= 35.0:
+                    offset_step = N_STEPS + 1
+            else:
+                offset_step = int(round(attack_offset / 0.05)) if attack_offset < 35.0 else N_STEPS + 1
             for w in range(n_w):
                 w_end = w * args.stride + args.window
                 w_start = w * args.stride
@@ -295,19 +307,19 @@ def main():
     normalizer = RobustNormalizer()
     X_train_all = normalizer.fit_transform(X_train_all)
     X_val_all = normalizer.transform(X_val_all)
-    normalizer.save(os.path.join(args.output_dir, 'normalizer.npz'))
+    normalizer.save(os.path.join(save_dir, 'normalizer.npz'))
     print(f"  特征通道 median: {normalizer.feat_median}")
     print(f"  特征通道 IQR:    {normalizer.feat_iqr}")
     print(f"  u_cmd max:       {normalizer.cmd_max}")
 
     # 保存
     print("\n保存 .npy 文件...")
-    np.save(os.path.join(args.output_dir, 'X_train.npy'), X_train_all)
-    np.save(os.path.join(args.output_dir, 'X_val.npy'), X_val_all)
-    np.save(os.path.join(args.output_dir, 'Y_train_cls.npy'), cls_train_all)
-    np.save(os.path.join(args.output_dir, 'Y_val_cls.npy'), cls_val_all)
-    np.save(os.path.join(args.output_dir, 'Y_train_atk.npy'), atk_train_all)
-    np.save(os.path.join(args.output_dir, 'Y_val_atk.npy'), atk_val_all)
+    np.save(os.path.join(save_dir, 'X_train.npy'), X_train_all)
+    np.save(os.path.join(save_dir, 'X_val.npy'), X_val_all)
+    np.save(os.path.join(save_dir, 'Y_train_cls.npy'), cls_train_all)
+    np.save(os.path.join(save_dir, 'Y_val_cls.npy'), cls_val_all)
+    np.save(os.path.join(save_dir, 'Y_train_atk.npy'), atk_train_all)
+    np.save(os.path.join(save_dir, 'Y_val_atk.npy'), atk_val_all)
 
     # 统计
     total_mb = (X_train_all.nbytes + X_val_all.nbytes +

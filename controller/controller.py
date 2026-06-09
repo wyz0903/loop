@@ -29,15 +29,17 @@ class NMPCParams:
     
     所有数值来源见配置文档 Section 3.1
     """
-    N: int = 20                # 预测步长
+    N: int = 30                # 预测步长 (调优: 20→30, 1.0s→1.5s, review_03)
     Ts: float = 0.05           # 采样时间 [s]
     alpha: float = 0.17        # 前端偏置 [m]
 
-    # 状态与输入权重 (配置文档 generate_nmpc.m)
-    Q: np.ndarray = np.diag([0.1, 0.1, 0.01])
-    R: np.ndarray = np.diag([0.002, 0.002])
+    # 状态与输入权重 (调优结果: Q_xy=0.15, R=0.00125, review_02)
+    # 调优前 Q=diag([0.1,0.1,0.01]), R=diag([0.002,0.002]), Avg RMS_xy=0.0381
+    # 调优后 Q=diag([0.15,0.15,0.01]), R=diag([0.00125,0.00125]), Avg RMS_xy=0.0272
+    Q: np.ndarray = np.diag([0.15, 0.15, 0.01])
+    R: np.ndarray = np.diag([0.00125, 0.00125])
 
-    # 控制约束 (Zhang et al. 2026, Section IV: TurtleBot4 安全模式)
+    # 控制约束
     v_max: float = 0.3         # 线速度上限 [m/s] (= a)
     w_max: float = 1.76        # 角速度上限 [rad/s] (= b = a/α)
 
@@ -106,7 +108,13 @@ class NMPCBuilder:
         k2 = self._f_dyn(X_sym + h/2 * k1, u_sym, ur_sym)
         k3 = self._f_dyn(X_sym + h/2 * k2, u_sym, ur_sym)
         k4 = self._f_dyn(X_sym + h * k3, u_sym, ur_sym)
-        X_next = X_sym + h/6 * (k1 + 2*k2 + 2*k3 + k4)
+        X_next_raw = X_sym + h/6 * (k1 + 2*k2 + 2*k3 + k4)
+        # 角度归一化: 防止 θ_e 在预测范围内偏离 [-π, π] 导致代价函数惩罚失准
+        X_next = ca.vertcat(
+            X_next_raw[0],
+            X_next_raw[1],
+            ca.atan2(ca.sin(X_next_raw[2]), ca.cos(X_next_raw[2]))
+        )
 
         self._F_RK4 = ca.Function('F_RK4', [X_sym, u_sym, ur_sym], [X_next])
 
@@ -227,20 +235,50 @@ class NMPCController:
 
     def load_or_build(self, force_rebuild: bool = False):
         """加载已有求解器，或构建新的
-        
+
         Args:
             force_rebuild: 强制重新编译
         """
+        import hashlib
+        import json
+        hash_path = self.solver_path + '.hash'
+
+        # 计算当前参数哈希
+        current_hash = hashlib.md5(json.dumps({
+            'N': self.p.N,
+            'Q': self.p.Q.flatten().tolist(),
+            'R': self.p.R.flatten().tolist(),
+            'v_max': self.p.v_max,
+            'w_max': self.p.w_max,
+            'x_bound': self.p.x_bound,
+            'Ts': self.p.Ts,
+            'alpha': self.p.alpha,
+        }, sort_keys=True).encode()).hexdigest()
+
         if not force_rebuild and os.path.exists(self.solver_path):
-            print(f"[NMPC] 加载已有求解器: {self.solver_path}")
-            self._solver = ca.Function.load(self.solver_path)
-        else:
-            print("[NMPC] 正在构建 CasADi 优化问题并编译...")
-            builder = NMPCBuilder(self.p)
-            solver = builder.build()
-            solver.save(self.solver_path)
-            print(f"[NMPC] 求解器已保存: {self.solver_path}")
-            self._solver = solver
+            # 参数哈希验证: 检测参数变更，自动触发重新编译
+            if os.path.exists(hash_path):
+                with open(hash_path, 'r') as f:
+                    saved_hash = f.read().strip()
+                if current_hash == saved_hash:
+                    print(f"[NMPC] 加载已有求解器: {self.solver_path}")
+                    self._solver = ca.Function.load(self.solver_path)
+                    self._warmup()
+                    return
+                else:
+                    print(f"[NMPC] 参数已变更，重新编译...")
+            else:
+                print(f"[NMPC] 无哈希文件，重新编译以确保一致性...")
+
+        print("[NMPC] 正在构建 CasADi 优化问题并编译...")
+        builder = NMPCBuilder(self.p)
+        solver = builder.build()
+        solver.save(self.solver_path)
+        # 保存参数哈希
+        with open(hash_path, 'w') as f:
+            f.write(current_hash)
+        print(f"[NMPC] 求解器已保存: {self.solver_path}")
+        self._solver = solver
 
         # 预热：执行一次虚拟求解以初始化 IPOPT 内部结构
         self._warmup()
