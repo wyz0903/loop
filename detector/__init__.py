@@ -12,5 +12,7 @@ detector — 传感器攻击检测与信号恢复模块
 
 from detector.backend import (NNDetector, OracleDetector,
                                DetectionResult, create_detector)
+from detector.cfm_backend import CFMDetectorBackend
 
-__all__ = ['NNDetector', 'OracleDetector', 'DetectionResult', 'create_detector']
+__all__ = ['NNDetector', 'OracleDetector', 'CFMDetectorBackend',
+           'DetectionResult', 'create_detector']

@@ -52,6 +52,7 @@ from model import (WMRParams, WMRKinematics, EKFEstimator, SensorSimulator,
                    SIM_TIME, SIM_STEPS)
 from controller import NMPCController, NMPCParams
 from attack import SensorAttack, AttackConfig
+from detector import create_detector
 
 # ============================================================================
 # 全局常量
@@ -165,7 +166,8 @@ class SimulationWorker(threading.Thread):
     def __init__(self, result_queue: queue.Queue,
                  traj_family: str, traj_seed: int,
                  attack_type: str, attack_onset: float,
-                 attack_duration: float, sim_time: float):
+                 attack_duration: float, sim_time: float,
+                 detector_tier: str = 'none'):
         super().__init__(daemon=True)
         self._q = result_queue
         self._traj_family = traj_family
@@ -174,6 +176,7 @@ class SimulationWorker(threading.Thread):
         self._attack_onset = attack_onset
         self._attack_duration = attack_duration
         self._sim_time = sim_time
+        self._detector_tier = detector_tier
 
     def run(self):
         try:
@@ -219,11 +222,39 @@ class SimulationWorker(threading.Thread):
         attacker.reset()
         np.random.seed(self._traj_seed)
 
+        # ---- 检测器 ----
+        detector_tier = self._detector_tier
+        model_dir = os.path.join(PROJECT_ROOT, 'models')
+        norm_dir = os.path.join(PROJECT_ROOT, 'dataset_win', 'config', 'normalizer.npz')
+        cfm_model = os.path.join(model_dir, 'cfm_cls_best.pt')
+        nn_model = os.path.join(model_dir, 'cls_best.pt')
+
+        if detector_tier == 'cfm' and not os.path.exists(cfm_model):
+            self._q.put(('warning', f'CFM模型未找到: {cfm_model}\n回退为无检测器'))
+            detector_tier = 'none'
+        elif detector_tier == 'nn' and not os.path.exists(nn_model):
+            self._q.put(('warning', f'NN模型未找到: {nn_model}\n回退为无检测器'))
+            detector_tier = 'none'
+
+        if detector_tier == 'cfm':
+            model_p = cfm_model
+        elif detector_tier == 'nn':
+            model_p = nn_model
+        else:
+            model_p = None
+
+        detector = create_detector(
+            detector_tier, attack_type=self._attack_type, seed=self._traj_seed,
+            model_path=model_p, norm_path=norm_dir)
+        if detector is not None:
+            detector.reset()
+
         # ---- 仿真循环 ----
         data = {
             't': np.zeros(n_steps, dtype=np.float32),
             'true_state': np.zeros((n_steps, 3), dtype=np.float32),
             'y_meas': np.zeros((n_steps, 3), dtype=np.float32),
+            'y_rec': np.zeros((n_steps, 3), dtype=np.float32),
             'attack_signal': np.zeros((n_steps, 3), dtype=np.float32),
             'sensor_noise': np.zeros((n_steps, 3), dtype=np.float32),
             'Upsilon_r': np.zeros((n_steps, 3), dtype=np.float32),
@@ -234,6 +265,9 @@ class SimulationWorker(threading.Thread):
             'u_cmd': np.zeros((n_steps, 2), dtype=np.float32),
             'u_a': np.zeros((n_steps, 2), dtype=np.float32),
             'attack_active': np.zeros(n_steps, dtype=np.float32),
+            'det_class': np.zeros(n_steps, dtype=object),
+            'det_conf': np.zeros(n_steps, dtype=np.float32),
+            'det_attack_est': np.zeros((n_steps, 3), dtype=np.float32),
         }
 
         u_cmd = np.zeros(2)
@@ -261,8 +295,26 @@ class SimulationWorker(threading.Thread):
             X_pred_internal = _internal_kinematic_step(internal_state, u_cmd)
             internal_state = X_pred_internal.copy()
 
+            # ---- 检测器 ----
+            if detector is None:
+                y_ekf = y_meas.copy()
+                det_class = 'A0'
+                det_conf = 0.0
+                det_attack_est = np.zeros(3)
+            else:
+                detector.set_control(u_cmd)
+                result = detector.detect(y_meas)
+                y_ekf = result.y_recovered.copy()
+                det_class = result.attack_class
+                det_conf = result.confidence
+                det_attack_est = result.attack_estimate.copy()
+
             # 4. EKF
-            Upsilon_hat, ekf_innovation = ekf.step(y_meas, u_cmd)
+            Upsilon_hat, ekf_innovation = ekf.step(y_ekf, u_cmd)
+
+            # 回传 EKF 状态给检测器
+            if detector is not None:
+                detector.set_ekf_state(Upsilon_hat)
 
             # 4.5 周期性重校准
             if t < self._attack_onset and step - _last_recalib_step >= _recalib_interval:
@@ -283,6 +335,7 @@ class SimulationWorker(threading.Thread):
             data['t'][step] = t
             data['true_state'][step] = true_state
             data['y_meas'][step] = y_meas
+            data['y_rec'][step] = y_ekf
             data['attack_signal'][step] = attack_signal
             data['sensor_noise'][step] = noise
             data['Upsilon_r'][step] = Upsilon_r
@@ -293,6 +346,9 @@ class SimulationWorker(threading.Thread):
             data['u_cmd'][step] = u_cmd
             data['u_a'][step] = u_a
             data['attack_active'][step] = 1.0 if attacker._is_active(t) else 0.0
+            data['det_class'][step] = det_class
+            data['det_conf'][step] = det_conf
+            data['det_attack_est'][step] = det_attack_est
 
             # 进度报告
             if step % 10 == 0:
@@ -312,6 +368,7 @@ class SimulationWorker(threading.Thread):
         data['sim_time'] = self._sim_time
         data['seed'] = self._traj_seed
         data['elapsed'] = elapsed_total
+        data['detector_tier'] = detector_tier
 
         # 计算攻击后 RMSE
         onset_idx = int(round(self._attack_onset / Ts)) if self._attack_onset < self._sim_time else n_steps
@@ -427,6 +484,16 @@ class ControlPanel(ttk.Frame):
         ttk.Spinbox(self._frame_attack, from_=1.0, to=50.0, increment=1.0,
                     textvariable=self._dur_var, width=7).grid(
             row=0, column=5, padx=5, pady=3, sticky='w')
+
+        # 检测器选择
+        ttk.Label(self._frame_attack, text='检测器:').grid(
+            row=1, column=0, padx=5, pady=3, sticky='w')
+        self._detector_var = tk.StringVar(value='cfm')
+        detector_choices = ['none  — 无检测器', 'nn  — NNDetector',
+                            'cfm  — CFMDetector (PINN-Flow)', 'oracle  — Oracle (理论上界)']
+        self._detector_combo = ttk.Combobox(self._frame_attack, textvariable=self._detector_var,
+                                             values=detector_choices, state='readonly', width=35)
+        self._detector_combo.grid(row=1, column=1, padx=5, pady=3, sticky='w')
 
         row += 1
 
@@ -643,6 +710,9 @@ class ControlPanel(ttk.Frame):
     def get_sim_time(self) -> float:
         return self._simtime_var.get()
 
+    def get_detector_tier(self) -> str:
+        return self._detector_var.get().split('  — ')[0].strip()
+
     def set_progress(self, step: int, total: int, t: float, elapsed: float):
         self._progress['maximum'] = total
         self._progress['value'] = step
@@ -804,6 +874,7 @@ class InteractiveApp(tk.Tk):
         self._detail_var.set('仿真运行中...')
 
         # 启动后台线程
+        detector_tier = self._panel.get_detector_tier()
         self._worker_queue = queue.Queue()
         self._worker = SimulationWorker(
             self._worker_queue,
@@ -813,6 +884,7 @@ class InteractiveApp(tk.Tk):
             attack_onset=attack_onset,
             attack_duration=attack_duration,
             sim_time=sim_time,
+            detector_tier=detector_tier,
         )
         self._worker.start()
         self.after(100, self._poll_worker)
@@ -842,12 +914,17 @@ class InteractiveApp(tk.Tk):
                     self._panel.enable_slider(self._n_steps)
                     self._update_cursor(0)
                     atk = data.get('attack_type_label', 'A0')
+                    det_tier = data.get('detector_tier', 'none')
                     rmse = data.get('pos_rmse', 0)
                     self._detail_var.set(
-                        f'仿真完成 | 攻击={atk} | RMSE={rmse:.4f}m | '
+                        f'仿真完成 | 攻击={atk} | 检测器={det_tier} | RMSE={rmse:.4f}m | '
                         f'用时={data["elapsed"]:.1f}s | 拖拽滑块回放')
                     self._panel._status_var.set(
-                        f'仿真完成 | {atk} | pos_rmse={rmse:.4f}m | 总用时={data["elapsed"]:.1f}s')
+                        f'仿真完成 | {atk} | det={det_tier} | pos_rmse={rmse:.4f}m | 总用时={data["elapsed"]:.1f}s')
+
+                elif msg_type == 'warning':
+                    _, warning_msg = msg
+                    messagebox.showwarning('检测器初始化警告', warning_msg)
 
                 elif msg_type == 'error':
                     _, error_msg = msg
@@ -1044,6 +1121,11 @@ class InteractiveApp(tk.Tk):
         ax.plot(t_arr, data['attack_signal'][:, 0], 'r--', lw=0.7, alpha=0.6, label='a_x')
         ax.plot(t_arr, data['attack_signal'][:, 1], 'g--', lw=0.7, alpha=0.6, label='a_y')
         ax.plot(t_arr, data['attack_signal'][:, 2], 'b--', lw=0.7, alpha=0.6, label='a_θ')
+        # 检测器估计覆盖层
+        if data.get('detector_tier', 'none') != 'none':
+            det_a_norm = np.linalg.norm(data['det_attack_est'], axis=1)
+            ax.plot(t_arr, det_a_norm, color='cyan', lw=1.2, alpha=0.8, ls='-.',
+                    label='||â_det(k)||')
         ax.legend(loc='upper right', fontsize=7)
 
         # ---- (2,1) 测量 vs 真值 vs 估计 ----
@@ -1129,7 +1211,8 @@ class InteractiveApp(tk.Tk):
         self._detail_var.set(
             f'k={k:4d} | t={t_k:6.2f}s | '
             f'x={true_state_k[0]:+.3f}m y={true_state_k[1]:+.3f}m θ={true_state_k[2]:+.3f}rad | '
-            f'|e_xy|={pos_err:.3f}m | {atk_status} | ||a||={atk_norm:.3f}')
+            f'|e_xy|={pos_err:.3f}m | {atk_status} | ||a||={atk_norm:.3f}'
+            f' | Det:{data["det_class"][k]}({data["det_conf"][k]:.2f})')
 
         # 更新滑块标签
         self._panel.update_time_label(k, t_k)

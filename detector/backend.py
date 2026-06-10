@@ -679,11 +679,12 @@ def create_detector(tier: str, attack_type: str = 'A0', seed: int = 42,
         tier: 检测器级别
             'none'   — 无检测，y_rec = y_meas
             'nn'     — NNDetector (神经网络分类 + 类型特定恢复)
+            'cfm'    — CFMDetectorBackend (PINN-Flow 流匹配 + Transformer)
             'oracle' — OracleDetector, 已知 ground truth (理论上界)
         attack_type: 攻击类型标签 (仅 oracle tier 使用)
         seed:        随机种子
-        model_path:  NN 模型权重路径 (仅 nn tier)
-        norm_path:   归一化参数路径 (仅 nn tier)
+        model_path:  模型权重路径 (nn/cfm tier)
+        norm_path:   归一化参数路径 (nn/cfm tier)
 
     Returns:
         检测器实例 或 None (tier='none')
@@ -693,8 +694,11 @@ def create_detector(tier: str, attack_type: str = 'A0', seed: int = 42,
         return None
     elif tier == 'nn':
         return NNDetector(model_path=model_path, norm_path=norm_path)
+    elif tier == 'cfm':
+        from detector.cfm_backend import CFMDetectorBackend  # 惰性导入, 避免循环依赖
+        return CFMDetectorBackend(model_path=model_path, norm_path=norm_path)
     elif tier == 'oracle':
         return OracleDetector(attack_type=attack_type, seed=seed)
     else:
         raise ValueError(f"Unknown detector tier: {tier}. "
-                         f"Choose from: none, nn, oracle")
+                         f"Choose from: none, nn, cfm, oracle")
