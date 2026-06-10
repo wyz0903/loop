@@ -329,7 +329,14 @@ def compute_physics_residual(y_rec: torch.Tensor,
     u_now = u_cmd[:, :-1, :]       # (B, W−1, 2)
 
     y_pred_next = kinematic_step_batch(y_now, u_now)
-    return y_next - y_pred_next     # (B, W−1, 3)
+    r_phys = y_next - y_pred_next                        # (B, W−1, 3)
+    # 角度通道包裹: 当航向角跨越 ±π 边界时, 直接差值会产生 ~2π 的虚假残差,
+    # 导致梯度爆炸。使用 atan2(sin, cos) 将角度差包裹到 [-π, π]。
+    # 注意: 不可用切片赋值 (inplace), 需通过 stack 保持 autograd 图完整。
+    r_theta = torch.atan2(torch.sin(r_phys[..., 2]),
+                           torch.cos(r_phys[..., 2]))
+    r_phys = torch.stack([r_phys[..., 0], r_phys[..., 1], r_theta], dim=-1)
+    return r_phys
 
 
 # ============================================================================

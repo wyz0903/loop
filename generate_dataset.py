@@ -485,10 +485,8 @@ def run_single_simulation(traj: RandomizedTrajectory,
     data = defaultdict(list)
     u_cmd = np.zeros(2)
 
-    # 内部运动学模型状态 — 与机器人初始位姿一致
-    internal_state = init_state.copy()
-    _recalib_interval = 200        # 内部状态重校准间隔 (10s)
-    _last_recalib_step = -_recalib_interval  # 确保第一步就校准
+    # 内部运动学预测起点 — 第一步用初始位姿 (匹配推理端 set_ekf_state per-step 锚定)
+    Upsilon_hat_prev = init_state.copy()
 
     for step in range(n_steps):
         t = step * Ts
@@ -504,19 +502,15 @@ def run_single_simulation(traj: RandomizedTrajectory,
         y_meas = attacker.inject(t, y_clean)
         attack_signal = y_meas - y_clean  # 等效攻击信号 (重放攻击下非加性)
 
-        # 3. 内部运动学新息（与 CFMDetector 部署时一致）
-        X_pred_internal = _internal_kinematic_step(internal_state, u_cmd)
+        # 3. 内部运动学新息 (从上一帧 EKF 后验出发 — 匹配推理端 per-step 锚定)
+        X_pred_internal = _internal_kinematic_step(Upsilon_hat_prev, u_cmd)
         internal_innovation = y_meas - X_pred_internal
-        internal_state = X_pred_internal.copy()
 
         # 4. EKF 估计 (无检测器干预 — 静态分布)
         Upsilon_hat, ekf_innovation = ekf.step(y_meas, u_cmd)
 
-        # 4.5 周期性内部运动学状态重校准
-        # 仅在攻击未激活时用 EKF 估计重置内部状态，控制 Euler 积分漂移
-        if t < attack_onset and step - _last_recalib_step >= _recalib_interval:
-            internal_state = Upsilon_hat.copy()
-            _last_recalib_step = step
+        # 4.5 保存 EKF 后验供下一步运动学预测 (匹配推理端 detector.set_ekf_state)
+        Upsilon_hat_prev = Upsilon_hat.copy()
 
         # 5. 跟踪误差
         X_error = WMRKinematics.compute_error(Upsilon_r, Upsilon_hat)
