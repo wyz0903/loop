@@ -91,9 +91,7 @@ ATK_COLORS = {
 }
 
 # IEEE 论文绘图样式
-plt.rcParams['font.family'] = 'serif'
-plt.rcParams['font.serif'] = ['Times New Roman']
-plt.rcParams['mathtext.fontset'] = 'stix'
+plt.rcParams['font.sans-serif'] = ['Microsoft YaHei', 'SimHei']
 plt.rcParams['font.size'] = 9
 plt.rcParams['axes.unicode_minus'] = False
 
@@ -103,7 +101,7 @@ plt.rcParams['axes.unicode_minus'] = False
 # ============================================================================
 
 def _internal_kinematic_step(state: np.ndarray, u_cmd: np.ndarray) -> np.ndarray:
-    """内部运动学 Euler 积分 — 与 NNDetector._kinematic_step 逐位一致"""
+    """内部运动学 Euler 积分 — 与 CFMDetector 内部运动学逐位一致"""
     alpha = 0.17
     Ts = 0.05
     v, w = u_cmd[0], u_cmd[1]
@@ -227,19 +225,13 @@ class SimulationWorker(threading.Thread):
         model_dir = os.path.join(PROJECT_ROOT, 'models')
         norm_dir = os.path.join(PROJECT_ROOT, 'dataset_win', 'config', 'normalizer.npz')
         cfm_model = os.path.join(model_dir, 'cfm_cls_best.pt')
-        nn_model = os.path.join(model_dir, 'cls_best.pt')
 
         if detector_tier == 'cfm' and not os.path.exists(cfm_model):
             self._q.put(('warning', f'CFM模型未找到: {cfm_model}\n回退为无检测器'))
             detector_tier = 'none'
-        elif detector_tier == 'nn' and not os.path.exists(nn_model):
-            self._q.put(('warning', f'NN模型未找到: {nn_model}\n回退为无检测器'))
-            detector_tier = 'none'
 
         if detector_tier == 'cfm':
             model_p = cfm_model
-        elif detector_tier == 'nn':
-            model_p = nn_model
         else:
             model_p = None
 
@@ -489,7 +481,7 @@ class ControlPanel(ttk.Frame):
         ttk.Label(self._frame_attack, text='检测器:').grid(
             row=1, column=0, padx=5, pady=3, sticky='w')
         self._detector_var = tk.StringVar(value='cfm')
-        detector_choices = ['none  — 无检测器', 'nn  — NNDetector',
+        detector_choices = ['none  — 无检测器',
                             'cfm  — CFMDetector (PINN-Flow)', 'oracle  — Oracle (理论上界)']
         self._detector_combo = ttk.Combobox(self._frame_attack, textvariable=self._detector_var,
                                              values=detector_choices, state='readonly', width=35)

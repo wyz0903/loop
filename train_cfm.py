@@ -42,8 +42,85 @@ from detector.cfm_detector import (CFMDetector, compute_physics_residual,
                                     DIM_FEEDFORWARD, NUM_FLOW_BLOCKS,
                                     DIM_FEEDFORWARD_FLOW, DROPOUT, TRACE_R)
 
-# 从 train_classifier 复用数据集类
-from train_classifier import PreprocessedDataset, ALL_ATTACK_TYPES, ATTACK_NAMES_CN
+# ============================================================================
+# 攻击类型常量（全局统一定义）
+# ============================================================================
+
+ALL_ATTACK_TYPES = ['A0', 'A1', 'A2', 'A3', 'A4', 'A5', 'A6', 'A7', 'A8']
+ATTACK_NAMES_CN = {
+    'A0': '正常', 'A1': '恒定偏移', 'A2': '正弦注入',
+    'A3': '斜坡漂移', 'A4': '阶跃', 'A5': '重放攻击',
+    'A6': '信号丢失', 'A7': '缩放攻击', 'A8': '传感器冻结',
+}
+
+# ============================================================================
+# 数据集类
+# ============================================================================
+
+class PreprocessedDataset(Dataset):
+    """加载预处理的 .npy 窗口数据
+
+    数据已在 preprocess_data.py 中完成:
+      - 滑动窗口提取
+      - RobustScaler + 物理归一化
+      - 训练/验证划分
+
+    A0 降采样: 训练时每个 epoch 随机丢弃一部分 A0 窗口，
+    减少解码器"输出≈0"的先验偏差。
+    """
+
+    def __init__(self, data_dir: str = DATA_DIR, split: str = 'train',
+                 downsample_a0: float = 0.0):
+        """
+        Args:
+            downsample_a0: A0 降采样比例 (0.0=不降采样, 0.5=丢弃一半A0, 仅训练集生效)
+        """
+        self.split = split
+        # mmap 模式: 多进程共享 OS 文件缓存
+        self.X = np.load(os.path.join(data_dir, f'X_{split}.npy'), mmap_mode='r')
+        self.cls_labels = np.load(os.path.join(data_dir, f'Y_{split}_cls.npy'), mmap_mode='r')
+        self.atk_labels = np.load(os.path.join(data_dir, f'Y_{split}_atk.npy'), mmap_mode='r')
+
+        # A0 降采样: 仅训练集
+        self._active_indices = np.arange(len(self.cls_labels))
+        if downsample_a0 > 0 and split == 'train':
+            a0_idx = np.where(self.cls_labels == 0)[0]
+            n_keep = int(len(a0_idx) * (1.0 - downsample_a0))
+            if n_keep < len(a0_idx):
+                rng = np.random.RandomState(42)
+                a0_keep = rng.choice(a0_idx, size=max(n_keep, 1000), replace=False)
+                non_a0_idx = np.where(self.cls_labels != 0)[0]
+                self._active_indices = np.sort(np.concatenate([a0_keep, non_a0_idx]))
+                print(f"[Dataset] A0 降采样 {downsample_a0:.0%}: "
+                      f"{len(a0_idx)}→{len(a0_keep)} A0 窗口")
+
+        self._compute_class_weights()
+        print(f"[Dataset] {split}: {len(self):,} 窗口, X={self.X.shape}")
+
+    def _compute_class_weights(self):
+        class_counts = defaultdict(int)
+        for idx in self._active_indices:
+            lbl = self.cls_labels[idx]
+            class_counts[ALL_ATTACK_TYPES[lbl]] += 1
+        total = len(self._active_indices)
+        self.class_weights = torch.zeros(len(ALL_ATTACK_TYPES))
+        for i, atk in enumerate(ALL_ATTACK_TYPES):
+            count = class_counts.get(atk, 0)
+            self.class_weights[i] = total / max(count, 1) / len(ALL_ATTACK_TYPES)
+
+        self.sample_weights = np.array([
+            self.class_weights[self.cls_labels[idx]].item()
+            for idx in self._active_indices
+        ])
+
+    def __len__(self) -> int:
+        return len(self._active_indices)
+
+    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        real_idx = self._active_indices[idx]
+        return (torch.from_numpy(self.X[real_idx]),
+                torch.tensor(self.cls_labels[real_idx], dtype=torch.long),
+                torch.from_numpy(self.atk_labels[real_idx]))
 
 # ============================================================================
 # 全局配置
@@ -383,6 +460,10 @@ def main():
     parser.add_argument('--dropout', type=float, default=DROPOUT)
     parser.add_argument('--eval-only', type=str, default=None)
     parser.add_argument('--no-plot', action='store_true')
+    parser.add_argument('--eval-after-train', action='store_true',
+                        help='训练完成后自动运行综合评估')
+    parser.add_argument('--eval-model-name', type=str, default=None,
+                        help='评估输出目录名称 (默认: cfm_v{timestamp})')
     args = parser.parse_args()
 
     # 验证数据
@@ -591,6 +672,29 @@ def main():
         plot_training_curves(history, os.path.join(MODEL_DIR, 'cfm_curves.png'))
 
     print(f"\n训练完成!")
+
+    # ---- 训练后自动评估 ----
+    if args.eval_after_train and not args.eval_only:
+        import subprocess, time as _t
+        model_name = args.eval_model_name or f"cfm_v{int(_t.time())}"
+        eval_dir = os.path.join(SCRIPT_DIR, 'eval', model_name)
+        print(f"\n{'='*60}")
+        print(f"自动评估: {model_name}")
+        print(f"输出目录: {eval_dir}")
+        print(f"{'='*60}")
+        eval_cmd = [
+            sys.executable, os.path.join(SCRIPT_DIR, 'evaluate.py'),
+            '--model-path', best_path,
+            '--norm-path', norm_path,
+            '--output-dir', eval_dir,
+            '--model-name', model_name,
+        ]
+        print(f"运行: {' '.join(eval_cmd)}")
+        ret = subprocess.run(eval_cmd)
+        if ret.returncode == 0:
+            print(f"\n评估完成! 结果: {eval_dir}")
+        else:
+            print(f"\n评估失败 (exit code {ret.returncode})")
 
 
 if __name__ == "__main__":

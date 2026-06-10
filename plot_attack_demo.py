@@ -19,9 +19,7 @@ from generate_dataset import (RandomizedTrajectory, _rk4_unicycle,
                               _internal_kinematic_step, ATTACK_NAMES)
 
 # ---- IEEE 标准字体 ----
-plt.rcParams['font.family'] = 'serif'
-plt.rcParams['font.serif'] = ['Times New Roman']
-plt.rcParams['mathtext.fontset'] = 'stix'
+plt.rcParams['font.sans-serif'] = ['Microsoft YaHei', 'SimHei']
 plt.rcParams['font.size'] = 8
 
 Ts = 0.05

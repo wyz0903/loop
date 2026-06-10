@@ -578,9 +578,7 @@ def plot_trajectory_shapes():
     _rc_backup = {k: mpl.rcParams[k] for k in
                   ['font.family', 'font.serif', 'mathtext.fontset',
                    'font.size', 'axes.titlesize', 'axes.labelsize']}
-    plt.rcParams['font.family'] = 'serif'
-    plt.rcParams['font.serif'] = ['Times New Roman']
-    plt.rcParams['mathtext.fontset'] = 'stix'
+    plt.rcParams['font.sans-serif'] = ['Microsoft YaHei', 'SimHei']
     plt.rcParams['font.size'] = 10
     plt.rcParams['axes.titlesize'] = 11
     plt.rcParams['axes.labelsize'] = 9

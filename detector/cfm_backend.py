@@ -1,16 +1,13 @@
 """
 detector/cfm_backend.py — CFMDetector 推理后端
 ================================================
-即插即用检测器, 使用 PINN-Flow 模型替代 NNDetector。
+即插即用检测器, 使用 PINN-Flow 条件流匹配模型。
 
-后处理策略 (仅 2 项, 对比当前 8 项):
+后处理策略 (精简高效):
   1. ODE 求解器 (Euler 10步) — 模型推理的组成部分
   2. 置信度阈值: confidence < 0.5 → 直通不恢复
 
-  移除的机制: EMA, 多数投票, 尾部加权平均, A5 迟滞计数器,
-  创新息持久偏移检测, 周期性内部状态重校准, 输出裁剪.
-
-公用 API 与 NNDetector 完全兼容:
+公用 API:
   - detect(y_meas) → DetectionResult
   - set_control(u_cmd)
   - set_ekf_state(ekf_state)
@@ -37,10 +34,10 @@ from detector.backend import DetectionResult, STATE_DIM, TS, ALPHA, NN_WINDOW_SI
 class CFMDetectorBackend:
     """PINN-Flow 攻击检测器 — 即插即用, 不改动控制系统。
 
-    相较于 NNDetector 的核心差异:
-      - 使用单一 Transformer 主干 + 流匹配生成 (无攻击类型特定模块)
+    核心设计:
+      - 单一 Transformer 主干 + AdaLN-Zero 流匹配生成
       - 仅 2 项后处理: ODE 求解 + 置信度阈值
-      - 统一恢复: y_rec = y_meas − â  (A5 除外, 使用死推算)
+      - 统一恢复: y_rec = y_meas − â
     """
 
     ALL_ATTACK_TYPES = ['A0', 'A1', 'A2', 'A3', 'A4', 'A5', 'A6', 'A7', 'A8']

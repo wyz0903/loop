@@ -48,13 +48,13 @@ DEFAULT_ATTACK_ONSET = 15.0      # 默认攻击开始时间
 RESULT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'dataset')
 os.makedirs(RESULT_DIR, exist_ok=True)
 
-# 内部运动学模型参数（与 NNDetector._kinematic_step 完全一致）
+# 内部运动学模型参数（与 CFMDetector 内部运动学一致）
 _ALPHA = 0.17
 _TS = 0.05
 
 
 def _internal_kinematic_step(state: np.ndarray, u_cmd: np.ndarray) -> np.ndarray:
-    """内部运动学 Euler 积分 — 与 NNDetector._kinematic_step 逐位一致
+    """内部运动学 Euler 积分 — 与 CFMDetector 内部运动学一致
 
     WMR 前端位姿运动学:
       dX/dt = F_h(theta) * u
@@ -487,7 +487,7 @@ def run_single_simulation(traj: RandomizedTrajectory,
 
     # 内部运动学模型状态 — 与机器人初始位姿一致
     internal_state = init_state.copy()
-    _recalib_interval = 200        # 与 NNDetector.RECALIB_INTERVAL 一致 (10s)
+    _recalib_interval = 200        # 内部状态重校准间隔 (10s)
     _last_recalib_step = -_recalib_interval  # 确保第一步就校准
 
     for step in range(n_steps):
@@ -504,7 +504,7 @@ def run_single_simulation(traj: RandomizedTrajectory,
         y_meas = attacker.inject(t, y_clean)
         attack_signal = y_meas - y_clean  # 等效攻击信号 (重放攻击下非加性)
 
-        # 3. 内部运动学新息（与 NNDetector 部署时逐位一致）
+        # 3. 内部运动学新息（与 CFMDetector 部署时一致）
         X_pred_internal = _internal_kinematic_step(internal_state, u_cmd)
         internal_innovation = y_meas - X_pred_internal
         internal_state = X_pred_internal.copy()
@@ -512,7 +512,7 @@ def run_single_simulation(traj: RandomizedTrajectory,
         # 4. EKF 估计 (无检测器干预 — 静态分布)
         Upsilon_hat, ekf_innovation = ekf.step(y_meas, u_cmd)
 
-        # 4.5 周期性内部运动学状态重校准 (与 NNDetector._maybe_recalibrate 一致)
+        # 4.5 周期性内部运动学状态重校准
         # 仅在攻击未激活时用 EKF 估计重置内部状态，控制 Euler 积分漂移
         if t < attack_onset and step - _last_recalib_step >= _recalib_interval:
             internal_state = Upsilon_hat.copy()

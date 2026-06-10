@@ -5,7 +5,7 @@ simulate_detector.py — 多级检测器对比仿真
 
 检测器分级:
   Tier 0 (none)  : 无检测 — y_meas 直接入 EKF (最差基线)
-  Tier 1 (nn)    : NNDetector — 神经网络分类 + 信号恢复 + 漂移补偿
+  Tier 1 (cfm)   : CFMDetector — PINN-Flow 流匹配 + Transformer 统一架构
   Tier 2 (oracle): OracleDetector — 已知 ground truth a(k)，理论上界
 
 轨迹类型 (5族，与训练数据一致):
@@ -32,9 +32,7 @@ import matplotlib.pyplot as plt
 from collections import defaultdict
 
 # IEEE 论文标准字体
-plt.rcParams['font.family'] = 'serif'
-plt.rcParams['font.serif'] = ['Times New Roman']
-plt.rcParams['mathtext.fontset'] = 'stix'
+plt.rcParams['font.sans-serif'] = ['Microsoft YaHei', 'SimHei']
 plt.rcParams['font.size'] = 10
 plt.rcParams['axes.unicode_minus'] = False
 
@@ -42,7 +40,7 @@ from model import (WMRParams, WMRKinematics, EKFEstimator, SensorSimulator,
                    LissajousTrajectory, CircularTrajectory, SIM_STEPS)
 from controller import NMPCController, NMPCParams
 from attack import SensorAttack, AttackConfig
-from detector import (NNDetector, OracleDetector,
+from detector import (OracleDetector,
                       DetectionResult, create_detector)
 
 # ============================================================================
@@ -58,17 +56,17 @@ os.makedirs(RESULT_DIR, exist_ok=True)
 
 TIER_COLORS = {
     'none':   '#d62728',   # 红色 — 最差基线
-    'nn':     '#2ca02c',   # 绿色 — NN 检测
+    'cfm':    '#9467bd',   # 紫色 — PINN-Flow CFM
     'oracle': '#1f77b4',   # 蓝色 — 理论上界
 }
 TIER_LABELS = {
     'none':   'Tier 0: No Detector',
-    'nn':     'Tier 1: NNDetector',
+    'cfm':    'Tier 1: CFMDetector (PINN-Flow)',
     'oracle': 'Tier 2: Oracle (Upper Bound)',
 }
 TIER_LINESTYLE = {
     'none':   '--',
-    'nn':     '-',
+    'cfm':    ':',
     'oracle': '-.',
 }
 
@@ -88,7 +86,7 @@ def run_simulation(attack_type: str = 'A4',
 
     Args:
         attack_type:     攻击类型 'A0'~'A8'
-        detector_tier:   检测器级别 'none'/'nn'/'oracle'
+        detector_tier:   检测器级别 'none'/'cfm'/'oracle'
         trajectory_type: 轨迹类型 (5族: lissajous/circular/spiral/random_waypoint/square)
         seed:            随机种子
         attack_onset:    攻击开始时间 [s] (None=默认15s, A0=永不攻击)
@@ -270,7 +268,7 @@ def run_comparison(attack_type: str = 'A4',
         {tier_name: data_dict} 字典
     """
     if tiers is None:
-        tiers = ['none', 'nn', 'oracle']
+        tiers = ['none', 'cfm', 'oracle']
 
     onset = attack_onset if attack_onset is not None else ATTACK_ONSET
     print(f"\n{'='*60}")
@@ -519,7 +517,7 @@ def plot_summary(all_metrics: list):
     df = pd.DataFrame(all_metrics)
 
     attacks = sorted(df['attack_type'].unique())
-    tier_order = ['none', 'nn', 'oracle']
+    tier_order = ['none', 'cfm', 'oracle']
     tiers_in_data = sorted(df['detector_tier'].unique(),
                            key=lambda t: tier_order.index(t)
                            if t in tier_order else 99)
@@ -607,7 +605,7 @@ def batch_all(attack_types: list = None,
     if attack_types is None:
         attack_types = ['A0', 'A1', 'A2', 'A3', 'A4', 'A5', 'A6', 'A7', 'A8']
     if tiers is None:
-        tiers = ['none', 'nn', 'oracle']
+        tiers = ['none', 'cfm', 'oracle']
 
     all_metrics = []
     rng = np.random.RandomState(seed)
@@ -644,7 +642,7 @@ def batch_all(attack_types: list = None,
             np.savez_compressed(os.path.join(RESULT_DIR, fname), **save_dict)
 
             metrics = compute_metrics(data)
-            if tier in ('nn', 'oracle'):
+            if tier in ('cfm', 'oracle'):
                 metrics.update(compute_detector_metrics(data))
             all_metrics.append(metrics)
 
@@ -771,7 +769,7 @@ def main():
             print(f"  {TIER_LABELS.get(tier, tier)}")
             print(f"    Post-attack RMSE: {rmse:.4f}m, Max: {max_err:.4f}m {imp_str}")
 
-            if tier in ('nn', 'oracle'):
+            if tier in ('cfm', 'oracle'):
                 det_m = compute_detector_metrics(data)
                 print(f"    Detection Acc: {det_m['detection_accuracy']:.1%}, "
                       f"Latency: {det_m['detection_latency_sec']:.2f}s, "

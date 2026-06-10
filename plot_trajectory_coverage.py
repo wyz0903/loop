@@ -11,9 +11,7 @@ import matplotlib.pyplot as plt
 import matplotlib as mpl
 
 # ---- IEEE 论文标准字体 ----
-plt.rcParams['font.family'] = 'serif'
-plt.rcParams['font.serif'] = ['Times New Roman']
-plt.rcParams['mathtext.fontset'] = 'stix'
+plt.rcParams['font.sans-serif'] = ['Microsoft YaHei', 'SimHei']
 plt.rcParams['font.size'] = 10
 
 RESULT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'dataset')

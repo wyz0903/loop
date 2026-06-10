@@ -282,7 +282,7 @@ class FlowMatchingHead(nn.Module):
 # ============================================================================
 
 def kinematic_step_batch(state: torch.Tensor, u_cmd: torch.Tensor) -> torch.Tensor:
-    """批量运动学 Euler 积分 — 与 NNDetector._kinematic_step 完全一致。
+    """批量运动学 Euler 积分 — WMR 前端位姿运动学标准形式。
 
     WMR 前端位姿运动学:
       dx/dt = v·cos(θ) − α·ω·sin(θ)

@@ -22,9 +22,7 @@ import matplotlib.pyplot as plt
 from collections import defaultdict
 
 # IEEE 论文标准字体
-plt.rcParams['font.family'] = 'serif'
-plt.rcParams['font.serif'] = ['Times New Roman']
-plt.rcParams['mathtext.fontset'] = 'stix'
+plt.rcParams['font.sans-serif'] = ['Microsoft YaHei', 'SimHei']
 plt.rcParams['font.size'] = 10
 plt.rcParams['axes.unicode_minus'] = False
 
@@ -39,7 +37,7 @@ ATTACK_NAMES = {
 TIER_COLORS = {'none': '#d62728', 'nn': '#2ca02c', 'oracle': '#1f77b4'}
 TIER_LABELS = {
     'none': 'Tier 0: No Detector',
-    'nn': 'Tier 1: NNDetector',
+    'cfm': 'Tier 1: CFMDetector (PINN-Flow)',
     'oracle': 'Tier 2: Oracle (Upper Bound)',
 }
 TIER_LINESTYLE = {'none': '--', 'nn': '-', 'oracle': '-.'}
@@ -223,7 +221,7 @@ def generate_plots(df: pd.DataFrame):
     tiers_in_data = [t for t in tiers_in_data if t in df['Tier'].values]
 
     fig, axes = plt.subplots(2, 2, figsize=(15, 11))
-    fig.suptitle('NNDetector Performance — Unified Recovery (y_rec = y_meas − â)',
+    fig.suptitle('CFMDetector Performance — Flow Matching Recovery',
                  fontsize=14, fontweight='bold')
 
     x = np.arange(len(attacks))
@@ -351,8 +349,8 @@ def export_latex_table(df: pd.DataFrame):
 
     tex_df = pd.DataFrame(tex_rows)
     latex_str = tex_df.to_latex(index=False, float_format="%.3f",
-                                caption='NNDetector Performance Summary',
-                                label='tab:nndetector_performance')
+                                caption='CFMDetector Performance Summary',
+                                label='tab:cfmdetector_performance')
 
     with open(latex_path, 'w', encoding='utf-8') as f:
         f.write(latex_str)
@@ -368,10 +366,10 @@ def generate_report(df: pd.DataFrame):
     oracle_data = df[df['Tier'] == 'oracle']
 
     lines = []
-    lines.append("# NNDetector Performance Analysis Report")
+    lines.append("# CFMDetector Performance Analysis Report")
     lines.append("")
     lines.append("> Generated: " + pd.Timestamp.now().strftime('%Y-%m-%d %H:%M'))
-    lines.append("> Detector: NNDetector — internal kinematics innovation + AttackClassifier + unified recovery (y_rec = y_meas - a)")
+    lines.append("> Detector: CFMDetector — PINN-Flow Conditional Flow Matching + Transformer backbone")
     lines.append("> Strategy: additive attacks via subtraction recovery, A5 replay -> internal kinematics dead reckoning")
     lines.append("")
 
@@ -469,7 +467,7 @@ def main():
     args = parser.parse_args()
 
     print("=" * 60)
-    print("NNDetector Performance Analysis")
+    print("CFMDetector Performance Analysis")
     print("=" * 60)
 
     # 检查数据
