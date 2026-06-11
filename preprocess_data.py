@@ -47,8 +47,8 @@ ATTACK_NAMES = {
 
 # 输入通道: 内部运动学新息 + 控制上下文
 INPUT_CHANNELS = ['internal_innovation', 'u_cmd']   # internal_innovation(3) + u_cmd(2) = 5 通道
-from model import SIM_STEPS
-N_STEPS = SIM_STEPS       # 700，避免 IEEE 754 截断误差
+from model import SIM_STEPS, SIM_TIME
+N_STEPS = SIM_STEPS       # 1000，避免 IEEE 754 截断误差
 WINDOW_SIZE = 100
 STRIDE = 1
 TRAIN_RATIO = 0.8  # config 0-15 train, 16-19 val
@@ -263,13 +263,13 @@ def main():
             else:
                 onset_step = int(round(attack_onset / 0.05))
             # 攻击结束时间 (默认 inf = 永不结束)
-            attack_offset = float(row.get('attack_offset', 35.0 + 1.0))
+            attack_offset = float(row.get('attack_offset', SIM_TIME + 1.0))
             if 'attack_offset_step' in row.index and not pd.isna(row['attack_offset_step']):
                 offset_step = int(row['attack_offset_step'])
-                if attack_offset >= 35.0:
+                if attack_offset >= SIM_TIME:
                     offset_step = N_STEPS + 1
             else:
-                offset_step = int(round(attack_offset / 0.05)) if attack_offset < 35.0 else N_STEPS + 1
+                offset_step = int(round(attack_offset / 0.05)) if attack_offset < SIM_TIME else N_STEPS + 1
             for w in range(n_w):
                 w_end = w * args.stride + args.window
                 w_start = w * args.stride

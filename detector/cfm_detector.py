@@ -281,8 +281,29 @@ class FlowMatchingHead(nn.Module):
 # 5. 物理运动学工具 (用于 PINN 损失)
 # ============================================================================
 
+def _kinematics_rhs(state: torch.Tensor, u_cmd: torch.Tensor) -> torch.Tensor:
+    """WMR 前端位姿运动学右手边: dX/dt = F_h(θ)·u
+
+    Args:
+        state: (..., 3) 当前状态 [x, y, θ]
+        u_cmd: (..., 2) 控制指令 [v, ω]
+
+    Returns:
+        dX: (..., 3) 状态导数 [dx/dt, dy/dt, dθ/dt]
+    """
+    v = u_cmd[..., 0]
+    w = u_cmd[..., 1]
+    theta = state[..., 2]
+    cos_t = torch.cos(theta)
+    sin_t = torch.sin(theta)
+    dx = v * cos_t - ALPHA * w * sin_t
+    dy = v * sin_t + ALPHA * w * cos_t
+    dtheta = w
+    return torch.stack([dx, dy, dtheta], dim=-1)
+
+
 def kinematic_step_batch(state: torch.Tensor, u_cmd: torch.Tensor) -> torch.Tensor:
-    """批量运动学 Euler 积分 — WMR 前端位姿运动学标准形式。
+    """批量运动学 RK4 积分 — 与 model.py WMRKinematics.rk4_step() 一致。
 
     WMR 前端位姿运动学:
       dx/dt = v·cos(θ) − α·ω·sin(θ)
@@ -294,23 +315,21 @@ def kinematic_step_batch(state: torch.Tensor, u_cmd: torch.Tensor) -> torch.Tens
         u_cmd: (B, L, 2) 控制指令 [v, ω]
 
     Returns:
-        next_state: (B, L, 3) 下一步预测状态
+        next_state: (B, L, 3) RK4 积分下一步状态
     """
-    v = u_cmd[..., 0]
-    w = u_cmd[..., 1]
-    theta = state[..., 2]
+    h = TS
+    k1 = _kinematics_rhs(state, u_cmd)
+    k2 = _kinematics_rhs(state + 0.5 * h * k1, u_cmd)
+    k3 = _kinematics_rhs(state + 0.5 * h * k2, u_cmd)
+    k4 = _kinematics_rhs(state + h * k3, u_cmd)
 
-    cos_t = torch.cos(theta)
-    sin_t = torch.sin(theta)
+    next_state = state + (h / 6.0) * (k1 + 2.0 * k2 + 2.0 * k3 + k4)
 
-    dx = v * cos_t - ALPHA * w * sin_t
-    dy = v * sin_t + ALPHA * w * cos_t
-
-    next_x = state[..., 0] + TS * dx
-    next_y = state[..., 1] + TS * dy
-    next_theta = state[..., 2] + TS * w
-
-    return torch.stack([next_x, next_y, next_theta], dim=-1)
+    # 角度归一化 (与 model.py 一致)
+    next_theta = torch.atan2(torch.sin(next_state[..., 2]),
+                              torch.cos(next_state[..., 2]))
+    next_state = torch.stack([next_state[..., 0], next_state[..., 1], next_theta], dim=-1)
+    return next_state
 
 
 def compute_physics_residual(y_rec: torch.Tensor,
@@ -520,7 +539,7 @@ if __name__ == "__main__":
     r_phys = compute_physics_residual(y_rec, u_cmd)
     print(f"物理残差: {r_phys.shape}  (期望: [4, {WINDOW_SIZE-1}, 3])")
 
-    # 验证运动学步与 detector/backend.py 一致
+    # 验证运动学步与 model.py WMRKinematics.rk4_step() 一致
     import numpy as np
     state_np = np.array([[0.1, 0.2, 0.3]], dtype=np.float32)
     u_np = np.array([[0.15, 0.5]], dtype=np.float32)
@@ -530,16 +549,24 @@ if __name__ == "__main__":
     u_t = torch.from_numpy(u_np).to(device)
     next_t = kinematic_step_batch(state_t, u_t).cpu().numpy()
 
-    # 参考版本 (来自 backend.py)
-    v_r, w_r = u_np[0]
-    theta_r = state_np[0, 2]
-    cos_r = np.cos(theta_r)
-    sin_r = np.sin(theta_r)
-    dx_r = v_r * cos_r - ALPHA * w_r * sin_r
-    dy_r = v_r * sin_r + ALPHA * w_r * cos_r
-    next_ref = state_np[0] + TS * np.array([dx_r, dy_r, w_r])
+    # 参考版本 — numpy RK4 (与 model.py WMRKinematics.rk4_step() 一致)
+    def _rhs_np(s, v, w):
+        theta = s[2]
+        cos_t, sin_t = np.cos(theta), np.sin(theta)
+        return np.array([v * cos_t - ALPHA * w * sin_t,
+                         v * sin_t + ALPHA * w * cos_t, w])
 
-    print(f"\n运动学步一致性检查:")
+    h = TS
+    v_r, w_r = u_np[0]
+    s0 = state_np[0]
+    k1 = _rhs_np(s0, v_r, w_r)
+    k2 = _rhs_np(s0 + 0.5 * h * k1, v_r, w_r)
+    k3 = _rhs_np(s0 + 0.5 * h * k2, v_r, w_r)
+    k4 = _rhs_np(s0 + h * k3, v_r, w_r)
+    next_ref = s0 + h / 6.0 * (k1 + 2.0 * k2 + 2.0 * k3 + k4)
+    next_ref[2] = np.arctan2(np.sin(next_ref[2]), np.cos(next_ref[2]))
+
+    print(f"\n运动学步一致性检查 (RK4):")
     print(f"  Torch版本:  {next_t[0]}")
     print(f"  参考版本:   {next_ref}")
     print(f"  一致:       {np.allclose(next_t[0], next_ref, atol=1e-6)}")

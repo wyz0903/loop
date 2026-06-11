@@ -169,8 +169,12 @@ class CFMDetectorBackend:
         self._u_cmd = np.asarray(u_cmd, dtype=float).ravel()
 
     def set_ekf_state(self, ekf_state: np.ndarray) -> None:
-        """接收外部 EKF 估计 (保留以备将来使用, 当前不使用周期性重校准)。"""
-        pass
+        """接收 EKF 后验估计 Upsilon_hat，锚定内部运动学状态。
+
+        EKF 接收的是检测器恢复后的信号 y_rec，其估计始终是全系统对真实位姿
+        的最优估计。每步锚定可彻底切断开环 Euler 积分的误差累积。
+        """
+        self._internal_state = np.asarray(ekf_state, dtype=float).ravel().copy()
 
     def reset(self) -> None:
         """重置所有内部状态。"""

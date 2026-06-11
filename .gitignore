@@ -43,3 +43,6 @@ dataset/
 
 # Review outputs
 review/
+
+# Evaluation outputs
+eval/

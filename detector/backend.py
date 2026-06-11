@@ -41,6 +41,7 @@ SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 STATE_DIM = 3             # 传感器测量维度 [x, y, theta]
 TS = 0.05                 # 采样周期 [s]
 ALPHA = 0.17              # 前端偏置距离 [m] (与 model.py 同步)
+NN_WINDOW_SIZE = 100      # 神经网络输入窗口大小 [步]
 
 
 # ============================================================================

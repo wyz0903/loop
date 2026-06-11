@@ -54,6 +54,15 @@ ATTACK_NAMES_CN = {
 }
 
 # ============================================================================
+# 全局路径配置 (必须在类定义之前，因为类默认参数引用了这些变量)
+# ============================================================================
+
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+DATA_DIR = os.path.join(SCRIPT_DIR, 'dataset_win', 'config')
+MODEL_DIR = os.path.join(SCRIPT_DIR, 'models')
+os.makedirs(MODEL_DIR, exist_ok=True)
+
+# ============================================================================
 # 数据集类
 # ============================================================================
 
@@ -123,15 +132,8 @@ class PreprocessedDataset(Dataset):
                 torch.from_numpy(self.atk_labels[real_idx]))
 
 # ============================================================================
-# 全局配置
-# ============================================================================
-
-SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-DATA_DIR = os.path.join(SCRIPT_DIR, 'dataset_win', 'config')
-MODEL_DIR = os.path.join(SCRIPT_DIR, 'models')
-os.makedirs(MODEL_DIR, exist_ok=True)
-
 # 训练超参数
+# ============================================================================
 BATCH_SIZE = 2048
 NUM_WORKERS = 2
 PREFETCH_FACTOR = 4
