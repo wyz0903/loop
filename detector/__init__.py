@@ -1,18 +1,12 @@
 """
-detector — 传感器攻击检测与信号恢复模块
-==========================================
-即插即用的攻击检测器，不改动 EKF 或 NMPC。
+detector — CFM 攻击检测器模型定义与训练评估
+============================================
+纯数据集层面的深度学习流水线: 模型定义、数据预处理、训练、评估。
 
 公共 API:
-  CFMDetectorBackend — PINN-Flow 条件流匹配检测器 (主力)
-  OracleDetector     — 理想检测器 (理论上界)
-  DetectionResult    — 检测结果数据结构
-  create_detector    — 检测器工厂函数
+  CFMDetector — PINN-Flow 条件流匹配模型
 """
 
-from detector.backend import (OracleDetector,
-                               DetectionResult, create_detector)
-from detector.cfm_backend import CFMDetectorBackend
+from detector.cfm_detector import CFMDetector
 
-__all__ = ['CFMDetectorBackend', 'OracleDetector',
-           'DetectionResult', 'create_detector']
+__all__ = ['CFMDetector']

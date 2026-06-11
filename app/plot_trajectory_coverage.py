@@ -14,7 +14,7 @@ import matplotlib as mpl
 plt.rcParams['font.sans-serif'] = ['Microsoft YaHei', 'SimHei']
 plt.rcParams['font.size'] = 10
 
-RESULT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'dataset')
+RESULT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'dataset')
 POS_BOUND = 2.5
 
 # ---- 读取 metadata ----
@@ -85,7 +85,7 @@ fig.suptitle('Normal Trajectory Coverage — All Families (50 s, ±2.5 m boundar
              fontsize=14, fontweight='bold', y=1.01)
 plt.tight_layout()
 
-outpath = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+outpath = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..',
                        'fig_trajectory_coverage.png')
 fig.savefig(outpath, dpi=200, bbox_inches='tight')
 print(f'图片已保存: {outpath}')

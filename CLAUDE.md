@@ -21,20 +21,23 @@
 
 1. 通过controller.py编译 NMPC 求解器（仅限首次运行，需要 CasADi + IPOPT）
 2. 数据集通过generate_dataset.py生成数据集。将生成 `.npz` 文件输出到 `dataset/` 目录中，并生成一个 `metadata.csv`
-3. 通过preprocess_data.py对数据进行预处理。输出 `dataset_win/config/X_train.npy`、`Y_train_cls.npy`、`Y_train_atk.npy`、`normalizer.npz` 等文件
-4. 训练CFM检测器，通过train_cfm.py。保存模型至 `models/cfm_cls_best.pt` 和 `models/cfm_cls_config.npz`
-5. 运行检测器仿真，通过simulate_detector.py。输出 `results/sim_det_*.npz` 和对比图表
-6. 运行综合评估，通过evaluate.py。输出 `eval/{model_name}/` 含指标、混淆矩阵、重建对比图、轨迹跟踪对比图
-7. 通过analyze.py导出分析结果
+3. 通过detector/preprocess_data.py对数据进行预处理。输出 `dataset_win/X_train.npy`、`Y_train_cls.npy`、`Y_train_atk.npy`、`normalizer.npz` 等文件。默认按轨迹族分层 IID 划分为 train/val/test (70/15/15)
+4. 训练CFM检测器，通过detector/train_cfm.py。保存模型至 `detector/models/cfm_cls_best.pt`
+5. 运行检测器仿真，通过simulate.py。输出 `results/sim_*.npz` 和图表
+6. 运行综合评估，通过detector/evaluate.py。输出 `eval/{model_name}/` 含指标、混淆矩阵、重建对比图
+7. 通过detector/test/analyze.py导出DL分析结果
+8. 通过app/interactive_app.py启动交互式可视化GUI
 
 ### 独立测试脚本
 
 ```
-python simulate.py              # 基准闭环仿真（正常运行，无攻击）
-python simulate.py --no-plot    # 跳过图形显示
-python simulate.py --compare    # 五族轨迹无攻击跟踪对比图
-python attack.py                # 打印攻击类型目录 + 攻击模块自检
-python model.py                 # 运行运动学 / EKF 模块自检
+python simulate.py                    # CFM模式闭环仿真（默认A4+lissajous）
+python simulate.py --no-detector      # 无检测器基线
+python simulate.py --attack A0        # 无攻击正常运行
+python simulate.py --compare          # 五族轨迹无攻击跟踪对比图
+python simulate.py --all              # 批量所有9种攻击
+python attack.py                      # 打印攻击类型目录 + 攻击模块自检
+python model.py                       # 运行运动学 / EKF 模块自检
 ```
 
 ## 模型架构
@@ -65,18 +68,20 @@ ReferenceTrajectory(参考轨迹) → NMPC → u_cmd → WMRKinematics(RK4运动
 | 文件 | 作用 |
 | ---------------------- | ------------------------------------------------------------ |
 | `model.py` | WMR 运动学 (RK4)，EKF 估计器，李萨如 (Lissajous)/圆形 (Circular) 轨迹生成器，传感器模拟器 |
-| `controller.py` | CasADi Opti NMPC：误差动力学 RK4 预测，菱形约束，控制增量代价函数，IPOPT 求解器 |
+| `controller/controller.py` | CasADi Opti NMPC：误差动力学 RK4 预测，菱形约束，控制增量代价函数，IPOPT 求解器 |
 | `attack.py` | 8 种传感器攻击类型 (A1–A8) + 正常情况 (A0)；统一的 `inject()` 注入接口 |
-| `detector/cfm_detector.py` | CFMDetector 模型定义：TransformerBackbone + AdaLN-Zero FlowMatchingHead + ClassificationHead |
-| `detector/cfm_backend.py` | CFMDetectorBackend 推理包装器：滑动窗口缓冲 + ODE 采样 + 信号恢复 |
-| `detector/backend.py` | OracleDetector（理论性能上界）+ DetectionResult 数据结构 + create_detector 工厂函数 |
+| `simulate.py` | 统一闭环仿真：CFM检测器 / 无检测器基线 / 五族轨迹对比 |
 | `generate_dataset.py` | 开环数据生成：5 种随机轨迹系列 × 9 种攻击 |
-| `preprocess_data.py` | 100 步滑动窗口，RobustScaler（基于四分位距 IQR）+ 物理量归一化，防数据泄漏的文件级拆分 |
-| `train_cfm.py` | CFMDetector 训练脚本：L = L_cls + λ_fm·L_fm + λ_phys·L_phys（分类+流匹配+物理正则化） |
-| `simulate.py` | 包含图表的基准闭环仿真（无检测器介入） |
-| `simulate_detector.py` | 3 层级对比运行脚本：none（无） / cfm（PINN-Flow） / oracle（理论上界） |
-| `evaluate.py` | 综合评估流水线：闭环仿真 + 混淆矩阵 + 重建对比 + 轨迹跟踪对比 |
-| `analyze.py` | 计算指标 + 生成 CSV/Markdown/LaTeX 报告 + 汇总图表 |
+| `cfm_backend.py` | CFMDetectorBackend 推理包装器：滑动窗口缓冲 + ODE 采样 + 信号恢复 + DetectionResult |
+| `detector/cfm_detector.py` | CFMDetector 模型定义：TransformerBackbone + AdaLN-Zero FlowMatchingHead + ClassificationHead |
+| `detector/preprocess_data.py` | 100 步滑动窗口，RobustScaler（基于四分位距 IQR）+ 物理量归一化，防数据泄漏的文件级拆分 |
+| `detector/train_cfm.py` | CFMDetector 训练脚本：L = L_cls + λ_fm·L_fm + λ_phys·L_phys（分类+流匹配+物理正则化） |
+| `detector/evaluate.py` | 综合评估流水线：闭环仿真 + 混淆矩阵 + 重建对比 + 轨迹跟踪对比 |
+| `detector/models/` | 训练好的模型权重 (cfm_cls_best.pt, cfm_cls_config.npz) |
+| `detector/test/analyze.py` | DL指标分析：混淆矩阵 + 检测准确率/延迟/虚警率 + 汇总图 |
+| `app/interactive_app.py` | tkinter 交互式 GUI：轨迹/攻击自由组合 + 时间滑块回放 + 6面板实时显示 |
+| `app/plot_attack_demo.py` | 攻击演示图生成（3×3子图，论文用） |
+| `app/plot_trajectory_coverage.py` | 五族轨迹空间覆盖范围图 |
 
 ### 攻击类型
 
@@ -97,7 +102,7 @@ ReferenceTrajectory(参考轨迹) → NMPC → u_cmd → WMRKinematics(RK4运动
 ### 轨迹系列
 
 1. **lissajous (李萨如)** — 8字形，随机的 [v_r, ω_freq] 参数
-2. **circular (圆形)** — 恒定曲率，随机的 [v_r, ω_r] 参数（在 `trajectory` 拆分模式中保留用于跨系列测试）
+2. **circular (圆形)** — 恒定曲率，随机的 [v_r, ω_r] 参数
 3. **spiral (螺旋线)** — 半径从 R₀ 逐渐扩展到 Rmax 的阿基米德螺旋线
 4. **random_waypoint (随机航点)** — 具有随机切换的、分段恒定的 ω_r
 5. **square (方形)** — 直行段 + 90°圆弧转弯，边长和速度随机
@@ -109,7 +114,7 @@ ReferenceTrajectory(参考轨迹) → NMPC → u_cmd → WMRKinematics(RK4运动
 - **统一端到端训练**：单一损失函数 L = L_cls + λ_fm·L_fm + λ_phys·L_phys。L_cls 为交叉熵分类损失，L_fm 为流匹配 MSE 损失，L_phys 为运动学 ODE 残差约束（PINN 正则化）。
 - **物理信息正则化 (PINN)**：L_phys = max(0, mean(||r_phys||²) − κ·Tr(R))，其中 r_phys 为恢复信号的运动学残差，约束恢复后的信号满足 WMR 运动学方程。
 - **精简后处理 (仅 2 项策略)**：ODE Euler 10 步采样 + 置信度阈值门控（conf < 0.5 直通）。移除旧版的 EMA、多数投票、尾部加权平均、A5 迟滞计数器、持久偏移检测、周期性重校准等复杂机制。
-- **防泄漏数据拆分**：来自同一个 `.npz` 仿真文件的窗口数据始终会被完整地分配到训练集或验证集中，防止信息泄漏。
+- **防泄漏分层 IID 拆分**：按轨迹族分层抽样为 train/val/test (70/15/15)，同一 config 的所有窗口整体进入同一划分，保证各划分同分布且无信息泄漏。
 
 ### 物理常量（TurtleBot4 安全模式设定）
 

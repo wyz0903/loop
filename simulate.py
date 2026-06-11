@@ -1,26 +1,25 @@
 """
-simulate.py -- WMR 闭环仿真主程序
-==========================================================================
-整合模型、控制器、传感器、EKF，执行完整的轨迹跟踪闭环仿真。
+simulate.py — WMR 闭环仿真 (含 CFM 检测器集成)
+================================================
+统一的闭环仿真脚本，支持: 正常运行 / 攻击场景 / CFM 检测器介入。
 
-仿真流程：
-  t=0..T: 参考轨迹生成 -> EKF估计 -> 误差计算 -> NMPC求解 -> 机器人运动
-  每一步记录：真实状态、估计状态、传感器测量、控制指令、EKF新息
-
-参考：配置文档 Section 1 (求解器设置 T=35s, Ts=0.05)
-
-用法：
-  python simulate.py                # 运行 Lissajous 仿真并显示结果
-  python simulate.py --no-plot      # 仅运行不显示图表
-  python simulate.py --compare      # 五族轨迹无攻击跟踪对比图
+模式:
+  python simulate.py                        # CFM 模式 (默认 A4, lissajous)
+  python simulate.py --no-detector          # 无检测器基线
+  python simulate.py --attack A1            # 指定攻击类型
+  python simulate.py --all                  # 批量所有 9 种攻击
+  python simulate.py --compare              # 五族轨迹无攻击跟踪对比
+  python simulate.py --no-plot              # 跳过图形显示
 """
 
 import os
 import sys
 import time
+import argparse
 import numpy as np
+import pandas as pd
 import matplotlib
-matplotlib.use('TkAgg')
+matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 from collections import defaultdict
 
@@ -31,275 +30,447 @@ plt.rcParams['axes.unicode_minus'] = False
 
 from model import (WMRParams, WMRKinematics, EKFEstimator, SensorSimulator,
                    LissajousTrajectory, CircularTrajectory, SIM_STEPS)
-from model import ReferenceTrajectory  # 向后兼容别名
 from controller import NMPCController, NMPCParams
-
+from attack import SensorAttack, AttackConfig
+from cfm_backend import CFMDetectorBackend
 
 # ============================================================================
-# 仿真配置
+# 全局配置
 # ============================================================================
 
-# 仿真时间参数 (配置文档 Section 1)
-SIM_TIME = 35.0       # 仿真总时长 [s]
-# Ts 由 WMRParams 定义 (0.05s)
-
-# 结果保存路径
+SIM_TIME = 35.0
+ATTACK_ONSET_DEFAULT = 15.0
+ATTACK_ONSET_MIN = 5.0
+ATTACK_ONSET_MAX = 30.0
 RESULT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'results')
 os.makedirs(RESULT_DIR, exist_ok=True)
 
+ALL_ATTACK_TYPES = ['A0', 'A1', 'A2', 'A3', 'A4', 'A5', 'A6', 'A7', 'A8']
+ATTACK_NAMES = {
+    'A0': 'Normal', 'A1': 'Constant Bias', 'A2': 'Sinusoidal',
+    'A3': 'Drift', 'A4': 'Step', 'A5': 'Replay Attack',
+    'A6': 'Intermittent Dropout', 'A7': 'Scaling', 'A8': 'Sensor Freeze',
+}
 
-# ============================================================================
-# 数据记录器
-# ============================================================================
-
-class DataLogger:
-    """仿真数据记录器，存储每一步的时间序列数据"""
-    
-    def __init__(self):
-        self.data = defaultdict(list)
-    
-    def record(self, **kwargs):
-        """记录一步数据"""
-        for key, value in kwargs.items():
-            self.data[key].append(value)
-    
-    def to_arrays(self):
-        """将所有记录转换为 numpy 数组"""
-        return {k: np.array(v) for k, v in self.data.items()}
-    
-    def save(self, filepath: str):
-        """保存为 .npz 文件"""
-        arrays = self.to_arrays()
-        np.savez(filepath, **arrays)
-        print(f"[LOG] 数据已保存: {filepath}")
+TRAJECTORY_FAMILIES = ['lissajous', 'circular', 'spiral', 'random_waypoint', 'square']
 
 
 # ============================================================================
-# 闭环仿真循环
+# 辅助函数
 # ============================================================================
 
-def run_simulation(show_plot: bool = True):
-    """执行一次完整的闭环仿真
-    
-    Args:
-        show_plot: 是否显示结果图表
-        
-    Returns:
-        logger: 包含所有记录数据的 DataLogger
-    """
-    # ---- 初始化组件 ----
-    wmr_params = WMRParams()
-    Ts = wmr_params.Ts
-    n_steps = SIM_STEPS  # 700 步
+def _get_onset_idx(data: dict) -> int:
+    """从仿真数据中获取攻击起始索引 (考虑窗口填充期)"""
+    n_steps = len(data['t']) if 't' in data else 700
+    if 'attack_active' in data:
+        active = data['attack_active']
+        if hasattr(active, 'max') and active.max() > 0.5:
+            raw_onset = int(np.argmax(active > 0.5))
+            return min(max(raw_onset, 100), n_steps - 1)
+    if 'attack_onset' in data:
+        raw_onset = int(float(data['attack_onset']) / data.get('Ts', 0.05))
+        return min(max(raw_onset, 100), n_steps - 1)
+    return min(max(int(ATTACK_ONSET_DEFAULT / 0.05), 100), n_steps - 1)
 
-    traj = ReferenceTrajectory(Ts=Ts)
-    robot = WMRKinematics(wmr_params)
-    sensor = SensorSimulator()
-    ekf = EKFEstimator(wmr_params)
-    
-    nmpc_params = NMPCParams()
-    ctrl = NMPCController(nmpc_params)
-    ctrl.load_or_build()
 
-    # 重置所有组件
-    traj.reset()
-    robot.reset()              # [0, 0.1, 0]
-    ekf.reset()                # [0, 0.1, 0]
-    ctrl.reset()
-    np.random.seed(42)         # 固定随机种子以确保可复现
+def _create_trajectory(traj_type: str, Ts: float, seed: int):
+    """创建指定类型的轨迹生成器"""
+    from generate_dataset import RandomizedTrajectory
 
-    logger = DataLogger()
-    
-    # 初始化控制指令
-    u_cmd = np.zeros(2)        # 初始控制指令
-    u_a = np.zeros(2)          # 实际执行指令 (Normal下 = u_cmd)
-
-    print(f"[SIM] 开始闭环仿真: T={SIM_TIME}s, Ts={Ts}s, Steps={n_steps}")
-    t_start = time.time()
-
-    for step in range(n_steps):
-        t = step * Ts
-
-        # 1. 生成参考轨迹
-        Upsilon_r, u_r = traj.step(t)
-        Ur_seq = traj.generate_sequence(t, nmpc_params.N)
-
-        # 2. 传感器测量 (含噪声)
-        true_state = robot.state.copy()
-        y_meas = sensor.measure(true_state)
-
-        # 3. EKF 状态估计
-        Upsilon_hat, ekf_innovation = ekf.step(y_meas, u_cmd)
-
-        # 4. 计算跟踪误差 (在机器人本体坐标系下)
-        X_error = WMRKinematics.compute_error(Upsilon_r, Upsilon_hat)
-
-        # 5. NMPC 求解最优控制
-        u_cmd = ctrl.solve(X_error, Ur_seq)
-
-        # 6. 控制指令限幅
-        u_a = WMRKinematics.clamp_control(u_cmd)
-
-        # 7. 机器人运动 (RK4积分)
-        robot.step(u_a)
-
-        # 8. 记录数据
-        logger.record(
-            t=t,
-            Upsilon_r=Upsilon_r.copy(),
-            u_r=u_r.copy(),
-            true_state=true_state.copy(),
-            y_meas=y_meas.copy(),
-            Upsilon_hat=Upsilon_hat.copy(),
-            ekf_innovation=ekf_innovation.copy(),
-            X_error=X_error.copy(),
-            u_cmd=u_cmd.copy(),
-            u_a=u_a.copy(),
-        )
-
-        # 每 100 步输出进度
-        if (step + 1) % 100 == 0:
-            elapsed = time.time() - t_start
-            err_norm = np.linalg.norm(X_error[:2])
-            print(f"  Step {step+1:4d}/{n_steps} | t={t:5.1f}s | "
-                  f"|e_xy|={err_norm:.4f} | 耗时={elapsed:.1f}s")
-
-    t_total = time.time() - t_start
-    print(f"[SIM] 仿真完成！总耗时: {t_total:.1f}s "
-          f"(平均 {t_total/n_steps*1000:.2f} ms/步)")
-
-    # 保存数据
-    logger.save(os.path.join(RESULT_DIR, 'sim_normal.npz'))
-
-    # 可视化
-    if show_plot:
-        plot_results(logger.to_arrays())
-
-    return logger
+    if traj_type == 'lissajous':
+        return LissajousTrajectory(Ts=Ts)
+    elif traj_type == 'circular':
+        return CircularTrajectory(Ts=Ts)
+    elif traj_type in ('spiral', 'random_waypoint', 'square'):
+        family_seeds = {'spiral': 0, 'random_waypoint': 500, 'square': 1500}
+        base = family_seeds.get(traj_type, 0)
+        for s in range(2000):
+            traj = RandomizedTrajectory(Ts=Ts, seed=base + s)
+            if traj.family == traj_type:
+                return traj
+        raise RuntimeError(f'无法创建 {traj_type} 轨迹')
+    else:
+        raise ValueError(f"Unknown trajectory type: {traj_type}")
 
 
 # ============================================================================
-# 结果可视化
+# 核心仿真
 # ============================================================================
 
-def plot_results(data: dict):
-    """绘制仿真结果四联图
-    
-    图1: 2D轨迹对比 (参考 vs 实际)
-    图2: 跟踪误差时序 (x_e, y_e, theta_e)
-    图3: 控制指令时序 (v, w 对比)
-    图4: EKF 新息时序
-    """
-    t = data['t']
-    Ur = data['Upsilon_r']       # (N, 3)
-    TrueState = data['true_state']  # (N, 3)
-    Upsilon_hat = data['Upsilon_hat']  # (N, 3)
-    X_err = data['X_error']      # (N, 3)
-    u_cmd = data['u_cmd']        # (N, 2)
-    u_a = data['u_a']            # (N, 2)
-    ekf_res = data['ekf_innovation']  # (N, 3)
-
-    fig, axes = plt.subplots(2, 2, figsize=(14, 10))
-    fig.suptitle('WMR Lissajous Trajectory Tracking (Normal)', fontsize=14, fontweight='bold')
-
-    # ---- 图1: 2D轨迹 ----
-    ax1 = axes[0, 0]
-    ax1.plot(Ur[:, 0], Ur[:, 1], 'k--', linewidth=1.5, label='Reference (8-shape)')
-    ax1.plot(TrueState[:, 0], TrueState[:, 1], 'b-', linewidth=1.2, label='Actual')
-    ax1.plot(TrueState[0, 0], TrueState[0, 1], 'go', markersize=8, label='Start')
-    ax1.plot(TrueState[-1, 0], TrueState[-1, 1], 'r*', markersize=10, label='End')
-    ax1.set_xlabel('X [m]')
-    ax1.set_ylabel('Y [m]')
-    ax1.set_title('2D Trajectory Tracking')
-    ax1.axis('equal')
-    ax1.legend(loc='best')
-    ax1.grid(True, alpha=0.3)
-
-    # ---- 图2: 跟踪误差 ----
-    ax2 = axes[0, 1]
-    ax2.plot(t, X_err[:, 0], 'r-', linewidth=1.2, label='x_e')
-    ax2.plot(t, X_err[:, 1], 'g-', linewidth=1.2, label='y_e')
-    ax2.plot(t, X_err[:, 2], 'b-', linewidth=1.2, label='theta_e')
-    ax2.axhline(y=0, color='k', linestyle=':', alpha=0.5)
-    ax2.set_xlabel('Time [s]')
-    ax2.set_ylabel('Tracking Error')
-    ax2.set_title('Tracking Error Time Series')
-    ax2.legend(loc='best')
-    ax2.grid(True, alpha=0.3)
-
-    # ---- 图3: 控制指令 ----
-    ax3 = axes[1, 0]
-    ax3.plot(t, u_cmd[:, 0], 'b-', linewidth=1.2, label='v_cmd')
-    ax3.plot(t, u_cmd[:, 1], 'r-', linewidth=1.2, label='w_cmd')
-    ax3.axhline(y=0.6, color='b', linestyle=':', alpha=0.4, label='v_max')
-    ax3.axhline(y=-0.6, color='b', linestyle=':', alpha=0.4)
-    ax3.set_xlabel('Time [s]')
-    ax3.set_ylabel('Control Command')
-    ax3.set_title('NMPC Control Commands')
-    ax3.legend(loc='best')
-    ax3.grid(True, alpha=0.3)
-
-    # ---- 图4: EKF 新息 ----
-    ax4 = axes[1, 1]
-    ax4.plot(t, ekf_res[:, 0], 'r-', linewidth=1.0, alpha=0.7, label='res_x')
-    ax4.plot(t, ekf_res[:, 1], 'g-', linewidth=1.0, alpha=0.7, label='res_y')
-    ax4.plot(t, ekf_res[:, 2], 'b-', linewidth=1.0, alpha=0.7, label='res_theta')
-    ax4.axhline(y=0, color='k', linestyle=':', alpha=0.5)
-    ax4.set_xlabel('Time [s]')
-    ax4.set_ylabel('Innovation (新息)')
-    ax4.set_title('EKF Innovation')
-    ax4.legend(loc='best')
-    ax4.grid(True, alpha=0.3)
-
-    plt.tight_layout()
-    save_path = os.path.join(RESULT_DIR, 'sim_normal.png')
-    plt.savefig(save_path, dpi=150, bbox_inches='tight')
-    print(f"[PLOT] 图表已保存: {save_path}")
-    plt.show()
-
-
-# ============================================================================
-# 定量评估
-# ============================================================================
-
-def print_metrics(data: dict):
-    """输出仿真结果的关键定量指标"""
-    X_err = data['X_error']
-    u_cmd = data['u_cmd']
-    u_a = data['u_a']
-
-    # 位置误差统计
-    pos_err = np.sqrt(X_err[:, 0]**2 + X_err[:, 1]**2)
-    print("\n========== 定量评估指标 ==========")
-    print(f"位置误差 RMS:        {np.sqrt(np.mean(pos_err**2)):.4f} m")
-    print(f"位置误差 Max:        {np.max(pos_err):.4f} m")
-    print(f"位置误差稳态 Mean:   {np.mean(pos_err[-200:]):.4f} m "
-          f"(最后200步)")
-    print(f"角度误差 RMS:        {np.sqrt(np.mean(X_err[:, 2]**2)):.4f} rad")
-    print(f"线速度 RMS:          {np.sqrt(np.mean(u_cmd[:, 0]**2)):.4f} m/s")
-    print(f"角速度 RMS:          {np.sqrt(np.mean(u_cmd[:, 1]**2)):.4f} rad/s")
-    print(f"控制饱和率 (v):      {np.mean(np.abs(u_cmd[:, 0]) >= 0.59)*100:.1f}%")
-    print(f"控制饱和率 (w):      {np.mean(np.abs(u_cmd[:, 1]) >= 2.89)*100:.1f}%")
-    print("====================================\n")
-
-
-# ============================================================================
-# 五族轨迹无攻击跟踪对比
-# ============================================================================
-
-def run_single_track(traj, robot, sensor, ekf, ctrl, nmpc_params, Ts, n_steps):
-    """用给定的轨迹生成器执行一次无攻击闭环仿真
+def run_simulation(attack_type: str = 'A4',
+                   use_detector: bool = True,
+                   trajectory_type: str = 'lissajous',
+                   seed: int = 42,
+                   attack_onset: float = None,
+                   model_path: str = None,
+                   norm_path: str = None,
+                   show_progress: bool = True) -> dict:
+    """运行单次闭环仿真
 
     Args:
-        traj: 轨迹生成器 (必须有 step(t) 和 generate_sequence(t, N) 方法)
-        robot, sensor, ekf, ctrl: 仿真组件
-        nmpc_params: NMPC 参数
-        Ts: 采样时间
-        n_steps: 总步数
+        attack_type:     攻击类型 'A0'~'A8' (A0=无攻击)
+        use_detector:    True=CFMDetectorBackend, False=y_meas 直接入 EKF
+        trajectory_type: 轨迹类型 lissajous/circular/spiral/random_waypoint/square
+        seed:            随机种子
+        attack_onset:    攻击起始时间 [s] (None=随机[5,30]s, A0=永不攻击)
+        model_path:      CFM 模型权重路径
+        norm_path:       归一化参数路径
 
     Returns:
         data: 包含所有时序信号的字典
     """
+    # ---- 初始化 ----
+    wmr_params = WMRParams()
+    Ts = wmr_params.Ts
+    n_steps = SIM_STEPS  # 700
+
+    # 轨迹
+    traj = _create_trajectory(trajectory_type, Ts, seed)
+
+    # 攻击起始时间
+    if attack_onset is None:
+        rng = np.random.RandomState(seed)
+        attack_onset = float(rng.uniform(ATTACK_ONSET_MIN, ATTACK_ONSET_MAX))
+    if attack_type == 'A0':
+        attack_onset = SIM_TIME + 1.0  # 永不攻击
+
+    robot = WMRKinematics(wmr_params)
+    sensor = SensorSimulator()
+    ekf = EKFEstimator(wmr_params)
+    ctrl = NMPCController(NMPCParams())
+    ctrl.load_or_build()
+
+    attacker = SensorAttack(attack_type=attack_type,
+                            onset_time=attack_onset, seed=seed)
+
+    # 检测器
+    detector = None
+    if use_detector:
+        detector = CFMDetectorBackend(model_path=model_path, norm_path=norm_path)
+
+    # ---- 重置 ----
+    traj.reset()
+    robot.reset()
+    ekf.reset()
+    ctrl.reset()
+    attacker.reset()
+    if detector is not None:
+        detector.reset()
+    np.random.seed(seed)
+
+    # ---- 仿真循环 ----
+    data = defaultdict(list)
+    u_cmd = np.zeros(2)
+
+    for step in range(n_steps):
+        t = step * Ts
+
+        # 1. 参考轨迹
+        Upsilon_r, u_r = traj.step(t)
+        Ur_seq = traj.generate_sequence(t, NMPCParams().N)
+
+        # 2. 传感器测量 (含攻击)
+        true_state = robot.state.copy()
+        noise = sensor.noise_std * np.random.randn(3)
+        y_clean = true_state + noise
+        y_meas = attacker.inject(t, y_clean)
+        attack_signal = y_meas - y_clean
+
+        # 3. 检测器处理
+        if detector is None:
+            y_ekf = y_meas.copy()
+            det_class = 'A0'
+            det_conf = 0.0
+            det_attack_est = np.zeros(3)
+        else:
+            result = detector.detect(y_meas)
+            y_ekf = result.y_recovered
+            det_class = result.attack_class
+            det_conf = result.confidence
+            det_attack_est = result.attack_estimate
+
+        # 4. EKF 状态估计
+        Upsilon_hat, ekf_innovation = ekf.step(y_ekf, u_cmd)
+
+        # 5. 通知检测器 EKF 状态
+        if detector is not None:
+            detector.set_ekf_state(Upsilon_hat)
+
+        # 6. 跟踪误差
+        X_error = WMRKinematics.compute_error(Upsilon_r, Upsilon_hat)
+
+        # 7. NMPC 控制
+        u_cmd = ctrl.solve(X_error, Ur_seq)
+
+        # 8. 通知检测器控制指令
+        if detector is not None:
+            detector.set_control(u_cmd)
+
+        # 9. 限幅
+        u_a = WMRKinematics.clamp_control(u_cmd)
+
+        # 10. 机器人状态更新
+        robot.step(u_a)
+
+        # 11. 记录
+        data['t'].append(t)
+        data['Upsilon_r'].append(Upsilon_r.copy())
+        data['true_state'].append(true_state.copy())
+        data['y_meas'].append(y_meas.copy())
+        data['y_ekf'].append(y_ekf.copy())
+        data['attack_signal'].append(attack_signal.copy())
+        data['Upsilon_hat'].append(Upsilon_hat.copy())
+        data['ekf_innovation'].append(ekf_innovation.copy())
+        data['X_error'].append(X_error.copy())
+        data['u_cmd'].append(u_cmd.copy())
+        data['u_a'].append(u_a.copy())
+        data['det_class'].append(det_class)
+        data['det_conf'].append(det_conf)
+        data['det_attack_est'].append(det_attack_est.copy())
+        data['attack_active'].append(1.0 if (t >= attack_onset and attack_type != 'A0') else 0.0)
+
+        # 进度
+        if show_progress and (step % 200 == 0 or step == n_steps - 1):
+            pos_err = np.linalg.norm(X_error[:2])
+            det_str = 'CFM' if use_detector else 'NONE'
+            print(f"  [{det_str:3s}] t={t:5.1f}s | "
+                  f"|e_xy|={pos_err:.4f}m | "
+                  f"det={det_class} conf={det_conf:.2f}", flush=True)
+
+    # 转数组
+    result = {}
+    for k, v in data.items():
+        try:
+            result[k] = np.array(v, dtype=float)
+        except ValueError:
+            result[k] = np.array(v, dtype=object)
+
+    result['Ts'] = Ts
+    result['attack_type'] = attack_type
+    result['use_detector'] = use_detector
+    result['trajectory_type'] = trajectory_type
+    result['attack_onset'] = attack_onset
+    return result
+
+
+# ============================================================================
+# 指标计算
+# ============================================================================
+
+def compute_metrics(data: dict) -> dict:
+    """从仿真数据计算定量指标"""
+    onset_idx = _get_onset_idx(data)
+    X_err = data['X_error']
+    pos_err = np.sqrt(X_err[:, 0] ** 2 + X_err[:, 1] ** 2)
+    ang_err = np.abs(X_err[:, 2])
+
+    steady_start = max(int(5.0 / data['Ts']), 100)
+    steady_end = onset_idx
+
+    post_pos = pos_err[onset_idx:] if onset_idx < len(pos_err) else pos_err[-100:]
+
+    return {
+        'attack_type': data['attack_type'],
+        'trajectory_type': data.get('trajectory_type', 'lissajous'),
+        'attack_onset': float(data.get('attack_onset', ATTACK_ONSET_DEFAULT)),
+        'steady_pos_rmse': float(np.sqrt(np.mean(pos_err[steady_start:steady_end] ** 2)))
+                          if steady_end > steady_start else 0.0,
+        'post_pos_rmse': float(np.sqrt(np.mean(post_pos ** 2))) if len(post_pos) > 0 else 0.0,
+        'post_pos_max': float(np.max(post_pos)) if len(post_pos) > 0 else 0.0,
+        'post_ang_rmse': float(np.sqrt(np.mean(ang_err[onset_idx:] ** 2)))
+                        if onset_idx < len(ang_err) else 0.0,
+        'use_detector': data.get('use_detector', True),
+    }
+
+
+def compute_detector_metrics(data: dict) -> dict:
+    """计算检测器 DL 指标"""
+    onset_idx = _get_onset_idx(data)
+    attack_type = data['attack_type']
+    det_classes = data['det_class']
+    det_confs = data['det_conf']
+
+    post_classes = det_classes[onset_idx:]
+    post_confs = det_confs[onset_idx:]
+
+    if len(post_classes) == 0:
+        return {'detection_accuracy': 0.0, 'mean_confidence': 0.0,
+                'detection_latency_steps': 999, 'detection_latency_sec': 99.0,
+                'false_alarm_rate': 0.0, 'recovery_rmse': 0.0}
+
+    correct = sum(1 for c in post_classes if str(c) == attack_type)
+    accuracy = correct / len(post_classes)
+    mean_conf = np.mean([float(c) for c in post_confs])
+
+    latency_steps = len(post_classes)
+    for i, c in enumerate(post_classes):
+        if str(c) == attack_type and i < len(post_confs) and float(post_confs[i]) > 0.5:
+            latency_steps = i
+            break
+
+    pre_start = 100
+    pre_classes = det_classes[pre_start:onset_idx]
+    if len(pre_classes) > 0:
+        false_alarms = sum(1 for c in pre_classes if str(c) != 'A0')
+        far = false_alarms / len(pre_classes)
+    else:
+        far = 0.0
+
+    y_ekf_arr = data['y_ekf'][onset_idx:]
+    true_arr = data['true_state'][onset_idx:]
+    recovery_rmse = float(np.sqrt(np.mean(np.sum((y_ekf_arr - true_arr) ** 2, axis=1))))
+
+    return {
+        'detection_accuracy': accuracy,
+        'mean_confidence': mean_conf,
+        'detection_latency_steps': latency_steps,
+        'detection_latency_sec': latency_steps * data['Ts'],
+        'false_alarm_rate': far,
+        'recovery_rmse': recovery_rmse,
+    }
+
+
+# ============================================================================
+# 可视化
+# ============================================================================
+
+def plot_results(data: dict, save_path: str = None):
+    """绘制单次仿真结果 (四联图)"""
+    onset_idx = _get_onset_idx(data)
+    attack_onset_time = onset_idx * data['Ts']
+    t = data['t']
+    atk_type = data.get('attack_type', 'A0')
+    use_det = data.get('use_detector', True)
+    det_label = 'CFMDetector' if use_det else 'No Detector'
+
+    fig, axes = plt.subplots(2, 2, figsize=(15, 11))
+    fig.suptitle(f'Attack {atk_type} ({ATTACK_NAMES.get(atk_type, "")}) — {det_label}',
+                 fontsize=14, fontweight='bold')
+
+    # Panel 1: 2D 轨迹
+    ax = axes[0, 0]
+    ref = data['Upsilon_r']
+    ax.plot(ref[:, 0], ref[:, 1], 'k--', linewidth=1.5, alpha=0.5, label='Reference')
+    Upsilon_hat = data['Upsilon_hat']
+    ax.plot(Upsilon_hat[:, 0], Upsilon_hat[:, 1], '#9467bd', linewidth=1.2, alpha=0.8,
+            label=f'EKF Estimate ({det_label})')
+    ax.scatter(ref[onset_idx, 0], ref[onset_idx, 1],
+               c='red', s=80, marker='x', zorder=5, linewidths=2, label='Attack Onset')
+    ax.set_xlabel('X [m]'); ax.set_ylabel('Y [m]')
+    ax.set_title('2D Trajectory (Estimated States)')
+    ax.legend(fontsize=7); ax.axis('equal'); ax.grid(True, alpha=0.3)
+
+    # Panel 2: 位置误差
+    ax = axes[0, 1]
+    X_err = data['X_error']
+    pos_err = np.sqrt(X_err[:, 0] ** 2 + X_err[:, 1] ** 2)
+    ax.plot(t, pos_err, '#9467bd', linewidth=1.3, alpha=0.85)
+    ax.axvline(x=attack_onset_time, color='red', linestyle='--', linewidth=1.5, alpha=0.7,
+               label='Attack Onset')
+    post_rmse = np.sqrt(np.mean(pos_err[onset_idx:] ** 2))
+    ax.text(0.02, 0.95, f'Post-Attack RMSE: {post_rmse:.4f}m',
+            transform=ax.transAxes, fontsize=10, va='top',
+            bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
+    ax.set_xlabel('Time [s]'); ax.set_ylabel('Position Error [m]')
+    ax.set_title(r'Tracking Error $\|e_{xy}\|$')
+    ax.legend(fontsize=7); ax.grid(True, alpha=0.3)
+
+    # Panel 3: EKF 新息
+    ax = axes[1, 0]
+    ekf_norm = np.linalg.norm(data['ekf_innovation'], axis=1)
+    ax.plot(t, ekf_norm, '#9467bd', linewidth=1.0, alpha=0.8)
+    ax.axvline(x=attack_onset_time, color='red', linestyle='--', linewidth=1.5, alpha=0.7)
+    ax.set_xlabel('Time [s]'); ax.set_ylabel('Innovation Norm')
+    ax.set_title('EKF Innovation')
+    ax.grid(True, alpha=0.3)
+
+    # Panel 4: 检测器输出
+    ax = axes[1, 1]
+    det_classes = data['det_class']
+    det_confs = data['det_conf']
+    # 绘制分类结果颜色条
+    cls_map = {f'A{i}': i for i in range(9)}
+    cls_ints = np.array([cls_map.get(str(c), 0) for c in det_classes])
+    ax.fill_between(t, 0, cls_ints, alpha=0.3, color='#9467bd')
+    ax2 = ax.twinx()
+    ax2.plot(t, det_confs, 'b-', linewidth=1.0, alpha=0.7, label='Confidence')
+    ax2.set_ylim(0, 1.05)
+    ax2.set_ylabel('Confidence')
+    ax2.axhline(y=0.5, color='gray', linestyle=':', alpha=0.5)
+    ax.set_xlabel('Time [s]')
+    ax.set_ylabel('Detected Class')
+    ax.set_yticks(range(9))
+    ax.set_yticklabels([f'A{i}' for i in range(9)])
+    ax.set_title('Detector Output (Class + Confidence)')
+    ax.grid(True, alpha=0.3)
+
+    plt.tight_layout()
+    if save_path is None:
+        fname = f'sim_{atk_type}_{data.get("trajectory_type", "lissajous")}.png'
+        save_path = os.path.join(RESULT_DIR, fname)
+    fig.savefig(save_path, dpi=150, bbox_inches='tight')
+    plt.close(fig)
+    print(f"  [Plot] {save_path}")
+    return save_path
+
+
+def plot_summary(all_metrics: list):
+    """批量运行汇总图: 所有攻击类型的 RMSE + 检测准确率"""
+    df = pd.DataFrame(all_metrics)
+    attacks = sorted(df['attack_type'].unique())
+    x = np.arange(len(attacks))
+
+    fig, axes = plt.subplots(1, 2, figsize=(14, 5.5))
+    fig.suptitle('CFMDetector — All Attack Types Summary', fontsize=14, fontweight='bold')
+
+    # Panel 1: Post-Attack RMSE
+    ax = axes[0]
+    rmse_vals = [df[df['attack_type'] == a]['post_pos_rmse'].values[0]
+                 if len(df[df['attack_type'] == a]) else 0 for a in attacks]
+    colors = ['#4CAF50' if v < 0.05 else '#FF9800' if v < 0.2 else '#F44336' for v in rmse_vals]
+    bars = ax.bar(x, rmse_vals, color=colors, alpha=0.85)
+    for bar, val in zip(bars, rmse_vals):
+        ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 0.002,
+                f'{val:.4f}', ha='center', fontsize=8, fontweight='bold')
+    ax.set_xticks(x); ax.set_xticklabels(attacks)
+    ax.set_ylabel('Position RMSE [m]')
+    ax.set_title('Post-Attack Position RMSE')
+    ax.grid(True, alpha=0.3, axis='y')
+
+    # Panel 2: Detection Accuracy (if available)
+    ax = axes[1]
+    if 'detection_accuracy' in df.columns:
+        acc_vals = [df[df['attack_type'] == a]['detection_accuracy'].values[0]
+                    if len(df[df['attack_type'] == a]) else 0 for a in attacks]
+        acc_pct = [v * 100 for v in acc_vals]
+        colors_acc = ['#4CAF50' if v >= 70 else '#FF9800' if v >= 40 else '#F44336' for v in acc_pct]
+        bars = ax.bar(x, acc_pct, color=colors_acc, alpha=0.85)
+        for bar, val in zip(bars, acc_pct):
+            ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 1,
+                    f'{val:.1f}%', ha='center', fontsize=8, fontweight='bold')
+        ax.set_ylim(0, 105)
+        ax.set_ylabel('Accuracy [%]')
+    else:
+        ax.text(0.5, 0.5, 'No detector metrics available', ha='center', va='center',
+                transform=ax.transAxes, fontsize=12)
+    ax.set_xticks(x); ax.set_xticklabels(attacks)
+    ax.set_title('Detection Accuracy')
+    ax.grid(True, alpha=0.3, axis='y')
+
+    plt.tight_layout()
+    filepath = os.path.join(RESULT_DIR, 'sim_summary.png')
+    fig.savefig(filepath, dpi=150, bbox_inches='tight')
+    plt.close(fig)
+    print(f"  [Plot] {filepath}")
+    return filepath
+
+
+# ============================================================================
+# 五族轨迹无攻击对比 (保留自旧 simulate.py)
+# ============================================================================
+
+def run_single_track(traj, robot, sensor, ekf, ctrl, nmpc_params, Ts, n_steps):
+    """用给定的轨迹生成器执行一次无攻击闭环仿真"""
     data = defaultdict(list)
     u_cmd = np.zeros(2)
 
@@ -335,7 +506,15 @@ def plot_all_trajectories():
     n_steps = SIM_STEPS
     nmpc_params = NMPCParams()
 
-    # 五族轨迹的名称、颜色、生成器
+    def _force_family(family: str, ts: float):
+        family_seeds = {'spiral': 0, 'random_waypoint': 500, 'square': 1500}
+        base = family_seeds.get(family, 0)
+        for s in range(2000):
+            traj = RandomizedTrajectory(Ts=ts, seed=base + s)
+            if traj.family == family:
+                return traj
+        raise RuntimeError(f'无法创建 {family} 轨迹')
+
     TRAJ_CONFIGS = [
         ('Lissajous',       '#2196F3', lambda: LissajousTrajectory(Ts=Ts)),
         ('Circular',        '#4CAF50', lambda: CircularTrajectory(Ts=Ts)),
@@ -349,7 +528,6 @@ def plot_all_trajectories():
     all_rms = {}
 
     for idx, (name, color, factory) in enumerate(TRAJ_CONFIGS):
-        # 初始化组件
         robot = WMRKinematics(wmr_params)
         sensor = SensorSimulator()
         ekf = EKFEstimator(wmr_params)
@@ -357,10 +535,7 @@ def plot_all_trajectories():
         ctrl.load_or_build()
         traj = factory()
 
-        traj.reset()
-        robot.reset()
-        ekf.reset()
-        ctrl.reset()
+        traj.reset(); robot.reset(); ekf.reset(); ctrl.reset()
         np.random.seed(42)
 
         print(f"[{idx+1}/5] 仿真 {name} ...", end='', flush=True)
@@ -369,8 +544,8 @@ def plot_all_trajectories():
         Ur = data['Upsilon_r']
         TrueState = data['true_state']
         X_err = data['X_error']
-        pos_err = np.sqrt(X_err[:, 0]**2 + X_err[:, 1]**2)
-        rms_xy = np.sqrt(np.mean(pos_err**2))
+        pos_err = np.sqrt(X_err[:, 0] ** 2 + X_err[:, 1] ** 2)
+        rms_xy = np.sqrt(np.mean(pos_err ** 2))
         all_rms[name] = rms_xy
 
         ax = axes_flat[idx]
@@ -378,27 +553,24 @@ def plot_all_trajectories():
         ax.plot(TrueState[:, 0], TrueState[:, 1], color=color, linewidth=1.4, label='Track')
         ax.plot(TrueState[0, 0], TrueState[0, 1], 'go', markersize=6)
         ax.plot(TrueState[-1, 0], TrueState[-1, 1], 'r*', markersize=8)
-        # 空间边界框
         b = wmr_params.pos_bound
         ax.plot([-b, b, b, -b, -b], [-b, -b, b, b, -b], 'gray', linewidth=0.8, alpha=0.4, linestyle=':')
-        ax.set_xlim(-b-0.3, b+0.3); ax.set_ylim(-b-0.3, b+0.3)
+        ax.set_xlim(-b - 0.3, b + 0.3); ax.set_ylim(-b - 0.3, b + 0.3)
         ax.set_xlabel('X [m]'); ax.set_ylabel('Y [m]')
-        ax.set_title(f'{name}  (RMS$_ xy$={rms_xy:.4f} m)', fontsize=12, fontweight='bold', color=color)
-        ax.set_aspect('equal')
-        ax.legend(loc='upper right', fontsize=8)
-        ax.grid(True, alpha=0.25)
+        ax.set_title(f'{name}  (RMS$_{{xy}}$={rms_xy:.4f} m)', fontsize=12, fontweight='bold', color=color)
+        ax.set_aspect('equal'); ax.legend(loc='upper right', fontsize=8); ax.grid(True, alpha=0.25)
         print(f' RMS_xy={rms_xy:.4f}m')
 
-    # 第6个子图: 汇总柱状图
+    # 汇总柱状图
     ax6 = axes_flat[5]
     names = list(all_rms.keys())
     values = list(all_rms.values())
     colors_bar = [cfg[1] for cfg in TRAJ_CONFIGS]
     bars = ax6.bar(names, values, color=colors_bar, edgecolor='white', linewidth=1.2)
     for bar, val in zip(bars, values):
-        ax6.text(bar.get_x() + bar.get_width()/2., bar.get_height() + 0.001,
+        ax6.text(bar.get_x() + bar.get_width() / 2., bar.get_height() + 0.001,
                  f'{val:.4f}', ha='center', va='bottom', fontsize=10, fontweight='bold')
-    ax6.set_ylabel('Position RMS$_ xy$ [m]')
+    ax6.set_ylabel('Position RMS$_{xy}$ [m]')
     ax6.set_title('Tracking Error Comparison', fontsize=13, fontweight='bold')
     ax6.grid(True, alpha=0.3, axis='y')
     ax6.set_ylim(0, max(values) * 1.25)
@@ -409,27 +581,201 @@ def plot_all_trajectories():
     plt.show()
 
 
-def _force_family(family: str, Ts: float):
-    """创建一个指定族的 RandomizedTrajectory"""
-    from generate_dataset import RandomizedTrajectory
-    _BASE = {'spiral': 0, 'random_waypoint': 500, 'square': 1500}
-    base = _BASE.get(family, 0)
-    for s in range(2000):
-        traj = RandomizedTrajectory(Ts=Ts, seed=base + s)
-        if traj.family == family:
-            return traj
-    raise RuntimeError(f'无法创建 {family} 轨迹')
+# ============================================================================
+# 批量运行
+# ============================================================================
+
+def run_batch(attack_types: list = None,
+              trajectory_type: str = 'lissajous',
+              seed: int = 42,
+              use_detector: bool = True,
+              randomize_onset: bool = True,
+              do_plot: bool = True,
+              model_path: str = None,
+              norm_path: str = None):
+    """批量运行所有攻击类型的仿真"""
+    if attack_types is None:
+        attack_types = ALL_ATTACK_TYPES
+
+    all_metrics = []
+    rng = np.random.RandomState(seed)
+
+    for atk in attack_types:
+        if randomize_onset and atk != 'A0':
+            attack_onset = float(rng.uniform(ATTACK_ONSET_MIN, ATTACK_ONSET_MAX))
+        elif atk == 'A0':
+            attack_onset = SIM_TIME + 1.0
+        else:
+            attack_onset = ATTACK_ONSET_DEFAULT
+
+        print(f"\n{'#'*60}")
+        print(f"# Attack: {atk} ({ATTACK_NAMES[atk]}) @ onset={attack_onset:.1f}s")
+        print(f"{'#'*60}")
+
+        data = run_simulation(
+            attack_type=atk, use_detector=use_detector,
+            trajectory_type=trajectory_type, seed=seed,
+            attack_onset=attack_onset,
+            model_path=model_path, norm_path=norm_path
+        )
+
+        # 保存 NPZ
+        det_str = 'cfm' if use_detector else 'none'
+        fname = f'sim_{atk}_{trajectory_type}_{det_str}.npz'
+        save_dict = {}
+        for k, v in data.items():
+            if isinstance(v, np.ndarray):
+                save_dict[k] = v
+            elif isinstance(v, str):
+                save_dict[k] = np.array(v)
+        np.savez_compressed(os.path.join(RESULT_DIR, fname), **save_dict)
+
+        # 指标
+        metrics = compute_metrics(data)
+        if use_detector:
+            metrics.update(compute_detector_metrics(data))
+        all_metrics.append(metrics)
+
+        print(f"  Post-Attack RMSE: {metrics['post_pos_rmse']:.4f}m", end='')
+        if use_detector and 'detection_accuracy' in metrics:
+            print(f" | Det Acc: {metrics['detection_accuracy']:.1%}", end='')
+        print()
+
+        if do_plot:
+            plot_results(data)
+
+    # 保存指标 CSV
+    if all_metrics:
+        df = pd.DataFrame(all_metrics)
+        csv_path = os.path.join(RESULT_DIR, 'sim_metrics.csv')
+        df.to_csv(csv_path, index=False)
+        print(f"\n  [CSV] {csv_path}")
+
+    # 汇总图
+    if do_plot and all_metrics:
+        plot_summary(all_metrics)
+
+    return all_metrics
 
 
 # ============================================================================
-# 主入口
+# 命令行入口
 # ============================================================================
+
+def main():
+    parser = argparse.ArgumentParser(
+        description='WMR Closed-Loop Simulation with CFM Detector')
+
+    parser.add_argument('--attack', type=str, default='A4',
+                        help='Attack type A0-A8 (default: A4)')
+    parser.add_argument('--all', action='store_true',
+                        help='Run all 9 attack types')
+    parser.add_argument('--no-detector', action='store_true',
+                        help='Disable CFM detector (direct y_meas to EKF)')
+    parser.add_argument('--trajectory', type=str, default='lissajous',
+                        choices=TRAJECTORY_FAMILIES,
+                        help='Reference trajectory type (default: lissajous)')
+    parser.add_argument('--compare', action='store_true',
+                        help='Five-family no-attack tracking comparison')
+    parser.add_argument('--no-plot', action='store_true',
+                        help='Skip plotting')
+    parser.add_argument('--seed', type=int, default=42,
+                        help='Random seed (default: 42)')
+    parser.add_argument('--no-randomize-onset', action='store_true',
+                        help='Use fixed onset (15s) instead of randomized [5,30]s')
+    parser.add_argument('--model-path', type=str, default=None,
+                        help='CFM model weights path')
+    parser.add_argument('--norm-path', type=str, default=None,
+                        help='Normalizer params path')
+
+    args = parser.parse_args()
+
+    use_detector = not args.no_detector
+    randomize_onset = not args.no_randomize_onset
+
+    print("=" * 60)
+    print("WMR Closed-Loop Simulation")
+    print("=" * 60)
+    print(f"  Sim Time: {SIM_TIME}s")
+    print(f"  Trajectory: {args.trajectory}")
+    print(f"  Detector: {'CFM' if use_detector else 'None (baseline)'}")
+    print(f"  Seed: {args.seed}")
+
+    # 五族轨迹对比
+    if args.compare:
+        print(f"  Mode: COMPARE (5-family no-attack)")
+        plot_all_trajectories()
+        return
+
+    # 批量模式
+    if args.all:
+        print(f"  Mode: BATCH (all attacks)")
+        print(f"  Attack Onset: {'randomized [5,30]s' if randomize_onset else f'{ATTACK_ONSET_DEFAULT}s (fixed)'}")
+        run_batch(trajectory_type=args.trajectory, seed=args.seed,
+                  use_detector=use_detector, randomize_onset=randomize_onset,
+                  do_plot=not args.no_plot,
+                  model_path=args.model_path, norm_path=args.norm_path)
+        return
+
+    # 单次模式
+    print(f"  Mode: SINGLE (attack={args.attack})")
+
+    if randomize_onset and args.attack != 'A0':
+        rng = np.random.RandomState(args.seed)
+        attack_onset = float(rng.uniform(ATTACK_ONSET_MIN, ATTACK_ONSET_MAX))
+        print(f"  Attack Onset: {attack_onset:.1f}s (randomized)")
+    elif args.attack == 'A0':
+        attack_onset = SIM_TIME + 1.0
+        print(f"  Attack Onset: never (A0)")
+    else:
+        attack_onset = ATTACK_ONSET_DEFAULT
+        print(f"  Attack Onset: {attack_onset}s (fixed)")
+
+    data = run_simulation(
+        attack_type=args.attack, use_detector=use_detector,
+        trajectory_type=args.trajectory, seed=args.seed,
+        attack_onset=attack_onset,
+        model_path=args.model_path, norm_path=args.norm_path
+    )
+
+    # 指标
+    onset_idx = _get_onset_idx(data)
+    X_err = data['X_error']
+    pos_err = np.sqrt(X_err[onset_idx:, 0] ** 2 + X_err[onset_idx:, 1] ** 2)
+    rmse = np.sqrt(np.mean(pos_err ** 2))
+    max_err = np.max(pos_err)
+
+    print(f"\n{'='*60}")
+    print("RESULTS SUMMARY")
+    print(f"{'='*60}")
+    print(f"  Detector: {'CFM' if use_detector else 'None'}")
+    print(f"  Post-attack RMSE: {rmse:.4f}m, Max: {max_err:.4f}m")
+
+    if use_detector:
+        det_m = compute_detector_metrics(data)
+        print(f"  Detection Acc: {det_m['detection_accuracy']:.1%}, "
+              f"Latency: {det_m['detection_latency_sec']:.2f}s, "
+              f"Recovery RMSE: {det_m['recovery_rmse']:.4f}m")
+
+    # 保存 NPZ
+    det_str = 'cfm' if use_detector else 'none'
+    fname = f'sim_{args.attack}_{args.trajectory}_{det_str}.npz'
+    save_dict = {}
+    for k, v in data.items():
+        if isinstance(v, np.ndarray):
+            save_dict[k] = v
+        elif isinstance(v, str):
+            save_dict[k] = np.array(v)
+    np.savez_compressed(os.path.join(RESULT_DIR, fname), **save_dict)
+    print(f"  NPZ saved: {fname}")
+
+    if not args.no_plot and not args.all:
+        plot_results(data)
+
+    print(f"\n{'='*60}")
+    print("Done.")
+    print(f"{'='*60}")
+
 
 if __name__ == "__main__":
-    show = '--no-plot' not in sys.argv
-
-    if '--compare' in sys.argv:
-        plot_all_trajectories()
-    else:
-        logger = run_simulation(show_plot=show)
-        print_metrics(logger.to_arrays())
+    main()

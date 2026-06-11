@@ -52,7 +52,7 @@ from model import (WMRParams, WMRKinematics, EKFEstimator, SensorSimulator,
                    SIM_TIME, SIM_STEPS)
 from controller import NMPCController, NMPCParams
 from attack import SensorAttack, AttackConfig
-from detector import create_detector
+from cfm_backend import CFMDetectorBackend
 
 # ============================================================================
 # 全局常量
@@ -165,7 +165,7 @@ class SimulationWorker(threading.Thread):
                  traj_family: str, traj_seed: int,
                  attack_type: str, attack_onset: float,
                  attack_duration: float, sim_time: float,
-                 detector_tier: str = 'none'):
+                 use_detector: bool = True):
         super().__init__(daemon=True)
         self._q = result_queue
         self._traj_family = traj_family
@@ -174,7 +174,7 @@ class SimulationWorker(threading.Thread):
         self._attack_onset = attack_onset
         self._attack_duration = attack_duration
         self._sim_time = sim_time
-        self._detector_tier = detector_tier
+        self._use_detector = use_detector
 
     def run(self):
         try:
@@ -221,23 +221,18 @@ class SimulationWorker(threading.Thread):
         np.random.seed(self._traj_seed)
 
         # ---- 检测器 ----
-        detector_tier = self._detector_tier
-        model_dir = os.path.join(PROJECT_ROOT, 'models')
-        norm_dir = os.path.join(PROJECT_ROOT, 'dataset_win', 'config', 'normalizer.npz')
+        use_detector = self._use_detector
+        model_dir = os.path.join(PROJECT_ROOT, 'detector', 'models')
+        norm_dir = os.path.join(PROJECT_ROOT, 'dataset_win', 'normalizer.npz')
         cfm_model = os.path.join(model_dir, 'cfm_cls_best.pt')
 
-        if detector_tier == 'cfm' and not os.path.exists(cfm_model):
+        if use_detector and not os.path.exists(cfm_model):
             self._q.put(('warning', f'CFM模型未找到: {cfm_model}\n回退为无检测器'))
-            detector_tier = 'none'
+            use_detector = False
 
-        if detector_tier == 'cfm':
-            model_p = cfm_model
-        else:
-            model_p = None
-
-        detector = create_detector(
-            detector_tier, attack_type=self._attack_type, seed=self._traj_seed,
-            model_path=model_p, norm_path=norm_dir)
+        detector = None
+        if use_detector:
+            detector = CFMDetectorBackend(model_path=cfm_model, norm_path=norm_dir)
         if detector is not None:
             detector.reset()
 
@@ -360,7 +355,7 @@ class SimulationWorker(threading.Thread):
         data['sim_time'] = self._sim_time
         data['seed'] = self._traj_seed
         data['elapsed'] = elapsed_total
-        data['detector_tier'] = detector_tier
+        data['use_detector'] = detector is not None
 
         # 计算攻击后 RMSE
         onset_idx = int(round(self._attack_onset / Ts)) if self._attack_onset < self._sim_time else n_steps
@@ -480,12 +475,10 @@ class ControlPanel(ttk.Frame):
         # 检测器选择
         ttk.Label(self._frame_attack, text='检测器:').grid(
             row=1, column=0, padx=5, pady=3, sticky='w')
-        self._detector_var = tk.StringVar(value='cfm')
-        detector_choices = ['none  — 无检测器',
-                            'cfm  — CFMDetector (PINN-Flow)', 'oracle  — Oracle (理论上界)']
-        self._detector_combo = ttk.Combobox(self._frame_attack, textvariable=self._detector_var,
-                                             values=detector_choices, state='readonly', width=35)
-        self._detector_combo.grid(row=1, column=1, padx=5, pady=3, sticky='w')
+        self._use_detector_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(self._frame_attack, text='启用 CFMDetector (PINN-Flow)',
+                        variable=self._use_detector_var).grid(
+            row=1, column=1, padx=5, pady=3, sticky='w')
 
         row += 1
 
@@ -702,8 +695,8 @@ class ControlPanel(ttk.Frame):
     def get_sim_time(self) -> float:
         return self._simtime_var.get()
 
-    def get_detector_tier(self) -> str:
-        return self._detector_var.get().split('  — ')[0].strip()
+    def get_detector_enabled(self) -> bool:
+        return self._use_detector_var.get()
 
     def set_progress(self, step: int, total: int, t: float, elapsed: float):
         self._progress['maximum'] = total
@@ -806,6 +799,10 @@ class InteractiveApp(tk.Tk):
         self._toolbar = NavigationToolbar2Tk(self._canvas, toolbar_frame)
         self._toolbar.update()
 
+        # 保存当前视图按钮
+        ttk.Button(toolbar_frame, text='💾 保存全景图',
+                   command=self._save_current_figure).pack(side='right', padx=10)
+
         # 通道选择按钮 (用于 measurement 子图)
         self._ch_frame = ttk.Frame(self)
         self._ch_frame.pack(side='bottom', fill='x', padx=5, pady=2)
@@ -866,7 +863,7 @@ class InteractiveApp(tk.Tk):
         self._detail_var.set('仿真运行中...')
 
         # 启动后台线程
-        detector_tier = self._panel.get_detector_tier()
+        use_detector = self._panel.get_detector_enabled()
         self._worker_queue = queue.Queue()
         self._worker = SimulationWorker(
             self._worker_queue,
@@ -876,7 +873,7 @@ class InteractiveApp(tk.Tk):
             attack_onset=attack_onset,
             attack_duration=attack_duration,
             sim_time=sim_time,
-            detector_tier=detector_tier,
+            use_detector=use_detector,
         )
         self._worker.start()
         self.after(100, self._poll_worker)
@@ -906,13 +903,14 @@ class InteractiveApp(tk.Tk):
                     self._panel.enable_slider(self._n_steps)
                     self._update_cursor(0)
                     atk = data.get('attack_type_label', 'A0')
-                    det_tier = data.get('detector_tier', 'none')
+                    use_det = data.get('use_detector', False)
+                    det_label = 'CFM' if use_det else 'None'
                     rmse = data.get('pos_rmse', 0)
                     self._detail_var.set(
-                        f'仿真完成 | 攻击={atk} | 检测器={det_tier} | RMSE={rmse:.4f}m | '
+                        f'仿真完成 | 攻击={atk} | 检测器={det_label} | RMSE={rmse:.4f}m | '
                         f'用时={data["elapsed"]:.1f}s | 拖拽滑块回放')
                     self._panel._status_var.set(
-                        f'仿真完成 | {atk} | det={det_tier} | pos_rmse={rmse:.4f}m | 总用时={data["elapsed"]:.1f}s')
+                        f'仿真完成 | {atk} | det={det_label} | pos_rmse={rmse:.4f}m | 总用时={data["elapsed"]:.1f}s')
 
                 elif msg_type == 'warning':
                     _, warning_msg = msg
@@ -987,6 +985,27 @@ class InteractiveApp(tk.Tk):
             self._redraw_measurement_subplot()
             k = self._panel._time_var.get()
             self._update_cursor(k)
+
+    # ==================================================================
+    # 保存图片
+    # ==================================================================
+
+    def _save_current_figure(self):
+        """保存当前全部 6 个面板的全景图"""
+        from tkinter import filedialog
+        if self._sim_data is None:
+            messagebox.showinfo('提示', '请先运行仿真再保存图片')
+            return
+        filepath = filedialog.asksaveasfilename(
+            defaultextension='.png',
+            filetypes=[('PNG 图片', '*.png'), ('PDF', '*.pdf'), ('SVG', '*.svg'), ('全部', '*.*')],
+            initialdir=PROJECT_ROOT,
+            title='保存仿真结果全景图'
+        )
+        if filepath:
+            self._fig.savefig(filepath, dpi=150, bbox_inches='tight')
+            self._detail_var.set(f'图片已保存: {os.path.basename(filepath)}')
+            print(f'[Save] {filepath}')
 
     # ==================================================================
     # 绘图
@@ -1114,7 +1133,7 @@ class InteractiveApp(tk.Tk):
         ax.plot(t_arr, data['attack_signal'][:, 1], 'g--', lw=0.7, alpha=0.6, label='a_y')
         ax.plot(t_arr, data['attack_signal'][:, 2], 'b--', lw=0.7, alpha=0.6, label='a_θ')
         # 检测器估计覆盖层
-        if data.get('detector_tier', 'none') != 'none':
+        if data.get('use_detector', False):
             det_a_norm = np.linalg.norm(data['det_attack_est'], axis=1)
             ax.plot(t_arr, det_a_norm, color='cyan', lw=1.2, alpha=0.8, ls='-.',
                     label='||â_det(k)||')

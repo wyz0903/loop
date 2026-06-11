@@ -6,10 +6,14 @@ plot_attack_demo.py — 临时脚本: 一条 Lissajous 轨迹遭遇 8 种攻击�
 """
 
 import os
+import sys
 import numpy as np
 import matplotlib.pyplot as plt
 import matplotlib as mpl
 from collections import defaultdict
+
+# 添加项目根目录到 Python 路径
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..'))
 
 from model import (WMRParams, WMRKinematics, EKFEstimator, SensorSimulator,
                    SIM_STEPS, SIM_TIME)

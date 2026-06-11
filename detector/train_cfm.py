@@ -58,7 +58,7 @@ ATTACK_NAMES_CN = {
 # ============================================================================
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-DATA_DIR = os.path.join(SCRIPT_DIR, 'dataset_win', 'config')
+DATA_DIR = os.path.join(SCRIPT_DIR, '..', 'dataset_win')
 MODEL_DIR = os.path.join(SCRIPT_DIR, 'models')
 os.makedirs(MODEL_DIR, exist_ok=True)
 
@@ -89,6 +89,8 @@ class PreprocessedDataset(Dataset):
         self.X = np.load(os.path.join(data_dir, f'X_{split}.npy'), mmap_mode='r')
         self.cls_labels = np.load(os.path.join(data_dir, f'Y_{split}_cls.npy'), mmap_mode='r')
         self.atk_labels = np.load(os.path.join(data_dir, f'Y_{split}_atk.npy'), mmap_mode='r')
+        # y_meas 保持物理单位，仅用于物理损失计算，不经过模型
+        self.y_meas = np.load(os.path.join(data_dir, f'Y_meas_{split}.npy'), mmap_mode='r')
 
         # A0 降采样: 仅训练集
         self._active_indices = np.arange(len(self.cls_labels))
@@ -125,11 +127,12 @@ class PreprocessedDataset(Dataset):
     def __len__(self) -> int:
         return len(self._active_indices)
 
-    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         real_idx = self._active_indices[idx]
         return (torch.from_numpy(self.X[real_idx]),
                 torch.tensor(self.cls_labels[real_idx], dtype=torch.long),
-                torch.from_numpy(self.atk_labels[real_idx]))
+                torch.from_numpy(self.atk_labels[real_idx]),
+                torch.from_numpy(self.y_meas[real_idx]))
 
 # ============================================================================
 # 训练超参数
@@ -162,6 +165,7 @@ def pinn_flow_loss(model: CFMDetector,
                    x_norm: torch.Tensor,
                    cls_label: torch.Tensor,
                    atk_target: torch.Tensor,
+                   y_meas_phys: torch.Tensor,
                    normalizer: dict,
                    lambda_fm: float = LAMBDA_FM,
                    lambda_phys: float = LAMBDA_PHYS,
@@ -170,16 +174,15 @@ def pinn_flow_loss(model: CFMDetector,
                    trace_R: float = TRACE_R) -> Tuple[torch.Tensor, dict]:
     """PINN-Flow 联合损失。
 
-    物理残差计算需要物理单位。我们将归一化的 innovation/u_cmd 去归一化后,
-    使用 innovation(物理单位) 作为 y_meas 的代理。
-
-    近似合理性: r_phys_exact − r_phys_approx = O(Ts²), 对正则化损失足够。
+    物理残差通过 y_rec = y_meas − â 恢复绝对位姿, 再检查运动学一致性:
+      r[k] = y_rec[k+1] − kinematic_step(y_rec[k], u_cmd[k])
 
     Args:
-        x_norm:     (B, W, 5) 归一化输入 [innov_norm(3) | u_cmd_norm(2)]
-        cls_label:  (B,)      攻击类别标签
-        atk_target: (B, W, 3) 真实攻击信号 (物理单位)
-        normalizer: dict 含 'feat_median'(3,), 'feat_iqr'(3,), 'cmd_max'(2,)
+        x_norm:       (B, W, 5) 归一化输入 [innov_norm(3) | u_cmd_norm(2)]
+        cls_label:    (B,)      攻击类别标签
+        atk_target:   (B, W, 3) 真实攻击信号 (物理单位)
+        y_meas_phys:  (B, W, 3) 原始传感器测量 (物理单位, 绝对位姿)
+        normalizer:   dict 含 'cmd_max'(2,)
 
     Returns:
         loss_total, metrics, cls_logits
@@ -187,19 +190,11 @@ def pinn_flow_loss(model: CFMDetector,
     B = x_norm.shape[0]
     W = x_norm.shape[1]
 
-    # ---- 去归一化 (用于物理损失) ----
-    feat_median = normalizer['feat_median']  # (3,) numpy
-    feat_iqr = normalizer['feat_iqr']        # (3,) numpy
-    cmd_max = normalizer['cmd_max']          # (2,) numpy
-
-    # 转为 tensor
-    if not isinstance(feat_median, torch.Tensor):
-        feat_median = torch.from_numpy(feat_median).float().to(x_norm.device)
-        feat_iqr = torch.from_numpy(feat_iqr).float().to(x_norm.device)
+    # ---- u_cmd 去归一化 (用于物理损失) ----
+    cmd_max = normalizer['cmd_max']  # (2,) numpy
+    if not isinstance(cmd_max, torch.Tensor):
         cmd_max = torch.from_numpy(cmd_max).float().to(x_norm.device)
 
-    # innovation_phys = innov_norm * IQR + median
-    innov_phys = x_norm[:, :, :3] * feat_iqr.view(1, 1, 3) + feat_median.view(1, 1, 3)
     # u_cmd_phys = u_cmd_norm * cmd_max
     u_cmd_phys = x_norm[:, :, 3:5] * cmd_max.view(1, 1, 2)
 
@@ -227,8 +222,8 @@ def pinn_flow_loss(model: CFMDetector,
     loss_fm = (loss_fm_per_sample * fm_weight).mean()
 
     # ---- 4. PINN 物理正则化 ----
-    # y_rec = innov_phys − x_t  (x_t 是流样本, 物理单位)
-    y_rec_t = innov_phys - x_t                            # (B, W, 3)
+    # y_rec = y_meas − x_t  (恢复绝对位姿, x_t 是流匹配攻击估计)
+    y_rec_t = y_meas_phys - x_t                           # (B, W, 3)
     r_phys = compute_physics_residual(y_rec_t, u_cmd_phys) # (B, W−1, 3)
     phys_mse_per_sample = (r_phys ** 2).mean(dim=[1, 2])   # (B,)
 
@@ -260,17 +255,18 @@ def train_epoch(model, dataloader, optimizer, scheduler, device,
     total_loss = total_cls = total_fm = total_phys = 0.0
     correct = total = 0
 
-    for x, cls_label, atk_seq in dataloader:
+    for x, cls_label, atk_seq, y_meas in dataloader:
         x = x.to(device, non_blocking=True)
         cls_label = cls_label.to(device, non_blocking=True)
         atk_seq = atk_seq.to(device, non_blocking=True)
+        y_meas = y_meas.to(device, non_blocking=True)
 
         optimizer.zero_grad(set_to_none=True)
 
         if scaler is not None:
             with torch.amp.autocast('cuda'):
                 loss, metrics, cls_logits = pinn_flow_loss(
-                    model, x, cls_label, atk_seq, normalizer,
+                    model, x, cls_label, atk_seq, y_meas, normalizer,
                     lambda_fm=lambda_fm, lambda_phys=lambda_phys)
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
@@ -280,7 +276,7 @@ def train_epoch(model, dataloader, optimizer, scheduler, device,
             scheduler.step()
         else:
             loss, metrics, cls_logits = pinn_flow_loss(
-                model, x, cls_label, atk_seq, normalizer,
+                model, x, cls_label, atk_seq, y_meas, normalizer,
                 lambda_fm=lambda_fm, lambda_phys=lambda_phys)
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=GRAD_CLIP)
@@ -311,10 +307,11 @@ def evaluate(model, dataloader, device, normalizer,
     class_total = defaultdict(int)
     recon_mae_by_class = defaultdict(list)
 
-    for x, cls_label, atk_seq in dataloader:
+    for x, cls_label, atk_seq, y_meas in dataloader:
         x = x.to(device, non_blocking=True)
         cls_label = cls_label.to(device, non_blocking=True)
         atk_seq = atk_seq.to(device, non_blocking=True)
+        y_meas = y_meas.to(device, non_blocking=True)
 
         B, W, _ = x.shape
 
@@ -332,13 +329,10 @@ def evaluate(model, dataloader, device, normalizer,
         v_pred = model.flow_head(t, x_t, features)
         loss_fm = F.mse_loss(v_pred, v_target)
 
-        # 物理损失 (评估时也计算, 使用去归一化的 innovation)
-        feat_median = torch.from_numpy(normalizer['feat_median']).float().to(device)
-        feat_iqr = torch.from_numpy(normalizer['feat_iqr']).float().to(device)
+        # 物理损失: y_rec = y_meas − x_t (恢复绝对位姿)
         cmd_max = torch.from_numpy(normalizer['cmd_max']).float().to(device)
-        innov_phys = x[:, :, :3] * feat_iqr.view(1, 1, 3) + feat_median.view(1, 1, 3)
         u_cmd_phys = x[:, :, 3:5] * cmd_max.view(1, 1, 2)
-        y_rec_t = innov_phys - x_t
+        y_rec_t = y_meas - x_t
         r_phys = compute_physics_residual(y_rec_t, u_cmd_phys)
         phys_mse = (r_phys ** 2).mean()
         loss_phys = F.relu(phys_mse - KAPPA * TRACE_R)
@@ -451,6 +445,8 @@ def main():
     parser = argparse.ArgumentParser(description='PINN-Flow CFMDetector 训练')
     parser.add_argument('--data-dir', type=str, default=DATA_DIR)
     parser.add_argument('--epochs', type=int, default=NUM_EPOCHS)
+    parser.add_argument('--patience', type=int, default=EARLY_STOP_PATIENCE,
+                        help=f'早停 patience (默认 {EARLY_STOP_PATIENCE})')
     parser.add_argument('--batch-size', type=int, default=BATCH_SIZE)
     parser.add_argument('--lr', type=float, default=LEARNING_RATE)
     parser.add_argument('--lambda-fm', type=float, default=LAMBDA_FM)
@@ -520,7 +516,7 @@ def main():
                             prefetch_factor=PREFETCH_FACTOR)
 
     # ---- 模型 ----
-    sample_x, _, _ = train_dataset[0]
+    sample_x, _, _, _ = train_dataset[0]
     in_channels = sample_x.shape[1]
     window_size = sample_x.shape[0]
 
@@ -622,8 +618,8 @@ def main():
               f"FM={val_fm:.4f} Phys={val_phys:.4f} | "
               f"ODE_MAE={val_recon_mae:.4f} | no_imp={epochs_no_improve}{marker}")
 
-        if epochs_no_improve >= EARLY_STOP_PATIENCE:
-            print(f"\n早停: {EARLY_STOP_PATIENCE} epochs 未改善, epoch {epoch}")
+        if epochs_no_improve >= args.patience:
+            print(f"\n早停: {args.patience} epochs 未改善, epoch {epoch}")
             break
 
     # ---- 保存 ----

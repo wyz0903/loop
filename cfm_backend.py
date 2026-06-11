@@ -1,6 +1,6 @@
 """
-detector/cfm_backend.py — CFMDetector 推理后端
-================================================
+cfm_backend.py — CFMDetector 推理后端
+======================================
 即插即用检测器, 使用 PINN-Flow 条件流匹配模型。
 
 后处理策略 (精简高效):
@@ -8,6 +8,8 @@ detector/cfm_backend.py — CFMDetector 推理后端
   2. 置信度阈值: confidence < 0.5 → 直通不恢复
 
 公用 API:
+  - CFMDetectorBackend — 推理后端主类
+  - DetectionResult — 检测结果数据结构
   - detect(y_meas) → DetectionResult
   - set_control(u_cmd)
   - set_ekf_state(ekf_state)
@@ -15,16 +17,51 @@ detector/cfm_backend.py — CFMDetector 推理后端
 """
 
 import os
-import sys
+import time
 import numpy as np
+from dataclasses import dataclass, field
 from collections import deque
+from typing import Dict
 
 import torch
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
-# 向后兼容导入
-from detector.backend import DetectionResult, STATE_DIM, TS, ALPHA, NN_WINDOW_SIZE
+# ============================================================================
+# 模块常量
+# ============================================================================
+
+STATE_DIM = 3             # 传感器测量维度 [x, y, theta]
+TS = 0.05                 # 采样周期 [s]
+ALPHA = 0.17              # 前端偏置距离 [m] (与 model.py 同步)
+NN_WINDOW_SIZE = 100      # 神经网络输入窗口大小 [步]
+
+
+# ============================================================================
+# 检测结果数据结构
+# ============================================================================
+
+@dataclass
+class DetectionResult:
+    """单步检测器的完整输出
+
+    Attributes:
+        attack_class:   攻击类别标签 'A0'~'A8'
+        confidence:     分类置信度 [0, 1]
+        y_recovered:    恢复后的传感器信号 (3,) — 输入 EKF
+        attack_estimate: 估计的攻击分量 (3,) — y_meas - y_recovered
+        features:        附加信息字典
+    """
+    attack_class: str
+    confidence: float
+    y_recovered: np.ndarray
+    attack_estimate: np.ndarray
+    features: Dict[str, float] = field(default_factory=dict)
+
+    def __repr__(self) -> str:
+        return (f"DetectionResult(class={self.attack_class}, "
+                f"conf={self.confidence:.3f}, "
+                f"|a_est|={np.linalg.norm(self.attack_estimate):.4f})")
 
 
 # ============================================================================
@@ -61,9 +98,9 @@ class CFMDetectorBackend:
             ode_steps:   ODE 求解器步数 (默认 10)
         """
         if model_path is None:
-            model_path = os.path.join(SCRIPT_DIR, '..', 'models', 'cfm_cls_best.pt')
+            model_path = os.path.join(SCRIPT_DIR, 'detector', 'models', 'cfm_cls_best.pt')
         if norm_path is None:
-            norm_path = os.path.join(SCRIPT_DIR, '..', 'dataset_win', 'config', 'normalizer.npz')
+            norm_path = os.path.join(SCRIPT_DIR, 'dataset_win', 'normalizer.npz')
 
         self.window_size = window_size
         if ode_steps is not None:
@@ -145,11 +182,10 @@ class CFMDetectorBackend:
             )
 
         # 5. NN 推理
-        import time as _time
-        t0 = _time.time()
+        t0 = time.time()
         attack_class, confidence, nn_attack_est = self._nn_infer()
         self._inference_count += 1
-        self._total_inference_time += _time.time() - t0
+        self._total_inference_time += time.time() - t0
 
         # 6. 恢复
         y_recovered, attack_estimate = self._recover(
@@ -348,64 +384,3 @@ class CFMDetectorBackend:
         # 默认: 减法恢复 (统一处理 A0-A4, A6-A8)
         y_rec = y_meas - nn_attack_est
         return y_rec, nn_attack_est.copy()
-
-
-# ============================================================================
-# 自测
-# ============================================================================
-
-if __name__ == "__main__":
-    print("=" * 60)
-    print("CFMDetectorBackend 自测")
-    print("=" * 60)
-
-    # 使用随机权重测试 (无已训练模型)
-    # 创建临时模型权重
-    import tempfile
-    from detector.cfm_detector import CFMDetector
-
-    model = CFMDetector()
-    tmp_dir = tempfile.mkdtemp()
-    model_path = os.path.join(tmp_dir, 'cfm_cls_best.pt')
-    config_path = os.path.join(tmp_dir, 'cfm_cls_config.npz')
-    torch.save(model.state_dict(), model_path)
-    np.savez(config_path,
-             in_channels=5, window_size=100, d_model=128,
-             num_classes=9, num_transformer_layers=4, num_heads=8,
-             dim_feedforward=512, num_flow_blocks=4,
-             dim_feedforward_flow=192, dropout=0.1,
-             model_type='cfm')
-
-    # 需要 normalizer.npz — 使用 dataset_win 路径或创建虚拟
-    import tempfile
-    norm_path = os.path.join(tmp_dir, 'normalizer.npz')
-    np.savez(norm_path, feat_median=np.zeros(3), feat_iqr=np.ones(3)*0.05,
-             cmd_max=np.array([0.3, 1.76]))
-
-    detector = CFMDetectorBackend(
-        model_path=model_path, norm_path=norm_path, device='cpu')
-
-    detector.set_control(np.array([0.1, 0.0]))
-
-    # 模拟传感器数据
-    y_meas = np.array([0.15, 0.22, 0.05])
-
-    # 窗口未就绪时 → 直通
-    result = detector.detect(y_meas)
-    print(f"窗口未就绪: class={result.attack_class}, "
-          f"conf={result.confidence:.3f}, readiness={result.features.get('readiness', '?')}")
-
-    # 填充窗口
-    for _ in range(detector.window_size + 5):
-        y_meas += np.array([0.01, 0.008, 0.002]) * np.random.randn(3)
-        result = detector.detect(y_meas)
-        detector.set_control(np.array([0.1, 0.05 * np.sin(_ * 0.05)]))
-
-    print(f"窗口就绪: class={result.attack_class}, "
-          f"conf={result.confidence:.3f}, "
-          f"|a_est|={np.linalg.norm(result.attack_estimate):.4f}")
-
-    # 清洗
-    import shutil
-    shutil.rmtree(tmp_dir, ignore_errors=True)
-    print("\n自测通过!")

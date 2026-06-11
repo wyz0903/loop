@@ -55,7 +55,8 @@ plt.rcParams['axes.unicode_minus'] = False
 
 # 项目路径
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-sys.path.insert(0, SCRIPT_DIR)
+sys.path.insert(0, os.path.join(SCRIPT_DIR, '..'))  # 项目根目录 (导入 simulate, model 等)
+sys.path.insert(0, SCRIPT_DIR)  # detector/ 目录
 
 # 攻击类型定义 (与项目一致)
 ALL_ATTACK_TYPES = ['A0', 'A1', 'A2', 'A3', 'A4', 'A5', 'A6', 'A7', 'A8']
@@ -78,7 +79,7 @@ def parse_args():
     parser.add_argument('--model-path', type=str, default=None,
                         help='模型权重路径')
     parser.add_argument('--norm-path', type=str,
-                        default=os.path.join(SCRIPT_DIR, 'dataset_win', 'config', 'normalizer.npz'),
+                        default=os.path.join(SCRIPT_DIR, '..', 'dataset_win', 'normalizer.npz'),
                         help='归一化参数路径')
     parser.add_argument('--output-dir', type=str, default=None,
                         help='输出根目录 (默认: eval/{model_name}/)')
@@ -88,10 +89,10 @@ def parse_args():
                         choices=['simulate', 'from_npz', 'validation'],
                         help='评估模式')
     parser.add_argument('--npz-dir', type=str,
-                        default=os.path.join(SCRIPT_DIR, 'results'),
+                        default=os.path.join(SCRIPT_DIR, '..', 'results'),
                         help='NPZ 文件目录 (from_npz 模式)')
     parser.add_argument('--data-dir', type=str,
-                        default=os.path.join(SCRIPT_DIR, 'dataset_win', 'config'),
+                        default=os.path.join(SCRIPT_DIR, '..', 'dataset_win'),
                         help='预处理数据目录 (validation 模式)')
     parser.add_argument('--attack-types', type=str, default=None,
                         help='攻击类型列表, 逗号分隔 (默认: 全部9种)')
@@ -127,35 +128,33 @@ def build_eval_dirs(output_root: str) -> dict:
 def run_simulations(model_path: str, norm_path: str, npz_dir: str,
                     attack_types: list, trajectory: str, seed: int):
     """运行闭环仿真, 保存 NPZ 到 npz_dir。"""
-    import simulate_detector as sd
+    import simulate
     os.makedirs(npz_dir, exist_ok=True)
 
-    print(f"\n运行闭环仿真: {len(attack_types)} 种攻击 × cfm 层级")
+    print(f"\n运行闭环仿真: {len(attack_types)} 种攻击 × CFM")
     print(f"  轨迹: {trajectory}, seed: {seed}")
     print(f"  输出: {npz_dir}")
 
     for atk_idx, atk in enumerate(attack_types):
         print(f"  [{atk_idx+1}/{len(attack_types)}] {atk} ({ATTACK_NAMES_CN[atk]}) ...", end=' ', flush=True)
         try:
-            # run_comparison 返回 {tier: data_dict}, 但不保存 NPZ
-            results = sd.run_comparison(
+            data = simulate.run_simulation(
                 attack_type=atk,
                 trajectory_type=trajectory,
-                tiers=['cfm'],
+                use_detector=True,
                 seed=seed,
                 model_path=model_path,
                 norm_path=norm_path,
             )
-            # 手动保存 NPZ
-            for tier, data in results.items():
-                fname = f'sim_det_{atk}_{tier}_{trajectory}.npz'
-                save_dict = {}
-                for k, v in data.items():
-                    if isinstance(v, np.ndarray):
-                        save_dict[k] = v
-                    elif isinstance(v, (str, int, float)):
-                        save_dict[k] = np.array(v)
-                np.savez_compressed(os.path.join(npz_dir, fname), **save_dict)
+            # 保存 NPZ
+            fname = f'sim_{atk}_{trajectory}_cfm.npz'
+            save_dict = {}
+            for k, v in data.items():
+                if isinstance(v, np.ndarray):
+                    save_dict[k] = v
+                elif isinstance(v, (str, int, float)):
+                    save_dict[k] = np.array(v)
+            np.savez_compressed(os.path.join(npz_dir, fname), **save_dict)
             print("OK")
         except Exception as e:
             print(f"FAILED: {e}")
@@ -169,7 +168,7 @@ def run_simulations(model_path: str, norm_path: str, npz_dir: str,
 # NPZ 加载
 # ============================================================================
 
-def load_npz_files(npz_dir: str, tier: str = 'cfm') -> dict:
+def load_npz_files(npz_dir: str) -> dict:
     """扫描 NPZ 文件, 按攻击类型组织。Returns: {attack_type: [npz_data_dict, ...]}"""
     data = defaultdict(list)
     if not os.path.isdir(npz_dir):
@@ -179,13 +178,11 @@ def load_npz_files(npz_dir: str, tier: str = 'cfm') -> dict:
     for fname in sorted(os.listdir(npz_dir)):
         if not fname.endswith('.npz'):
             continue
-        # 文件名格式: sim_det_{ATK}_{TIER}_{TRAJ}.npz
+        # 文件名格式: sim_{ATK}_{TRAJ}_cfm.npz
         parts = fname.replace('.npz', '').split('_')
-        if len(parts) < 4:
+        if len(parts) < 3:
             continue
-        file_atk, file_tier = parts[2], parts[3]
-        if file_tier != tier:
-            continue
+        file_atk = parts[1]
         if file_atk not in ALL_ATTACK_TYPES:
             continue
         fpath = os.path.join(npz_dir, fname)
@@ -710,8 +707,8 @@ def run_validation_eval(model_path: str, norm_path: str, data_dir: str,
                         output_dir: str, dirs: dict):
     """在验证集上运行 CFMDetector 推理, 生成混淆矩阵和分类报告。"""
     import torch
-    from train_cfm import PreprocessedDataset, ALL_ATTACK_TYPES as ATK, ATTACK_NAMES_CN as ANC
-    from detector.cfm_detector import CFMDetector
+    from .train_cfm import PreprocessedDataset, ALL_ATTACK_TYPES as ATK, ATTACK_NAMES_CN as ANC
+    from .cfm_detector import CFMDetector
 
     print(f"\nValidation 模式: 验证集推理")
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -745,7 +742,7 @@ def run_validation_eval(model_path: str, norm_path: str, data_dir: str,
 
     y_true_all, y_pred_all = [], []
     with torch.no_grad():
-        for x, cls_label, _ in val_loader:
+        for x, cls_label, _, _ in val_loader:
             x = x.to(device)
             features = model.encode(x)
             logits = model.classify(features)
