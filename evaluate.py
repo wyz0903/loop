@@ -40,6 +40,7 @@ import numpy as np
 import pandas as pd
 from collections import defaultdict
 from pathlib import Path
+from datetime import datetime
 
 import matplotlib
 matplotlib.use('Agg')
@@ -796,7 +797,9 @@ def main():
     args = parse_args()
 
     # 确定输出目录
-    output_root = args.output_dir or os.path.join(SCRIPT_DIR, 'eval', args.model_name)
+    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+    output_root = args.output_dir or os.path.join(
+        SCRIPT_DIR, 'eval', f'{args.model_name}_{timestamp}')
     dirs = build_eval_dirs(output_root)
 
     print("=" * 60)
