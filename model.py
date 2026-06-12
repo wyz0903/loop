@@ -41,16 +41,22 @@ class WMRParams:
 # 2. 参考轨迹生成器 — 8字形 Lissajous + 圆形
 # ============================================================================
 
-def _rk4_unicycle(x: float, y: float, theta: float, v: float, w: float, Ts: float):
-    """单轮模型 RK4 积分（理想参考系统运动学，论文 Eq.10）
+def _rk4_front_axle(x: float, y: float, theta: float, v: float, w: float, Ts: float,
+                     alpha: float = 0.17):
+    """前端偏置运动学 RK4 积分（与 WMRKinematics 一致，论文 Eq.1-2）
 
-    注：参考轨迹采用纯单轮模型（无前端偏移 α），与机器人前端位姿运动学
-    (WMRKinematics, 含 α) 存在模型失配。该失配由 NMPC 误差动力学中的
-    G(X) 矩阵显式包含 α 项进行补偿（论文 Eq.10）。
+    运动学: ẋ = v·cos(θ) − α·w·sin(θ)
+            ẏ = v·sin(θ) + α·w·cos(θ)
+            θ̇ = w
+
+    参考轨迹与机器人使用同一运动学模型，确保参考轨迹物理可行，
+    NMPC 可在无扰动条件下将跟踪误差驱动至零。
     """
     h = Ts
     def _f(_x, _y, _t):
-        return (v * np.cos(_t), v * np.sin(_t), w)
+        return (v * np.cos(_t) - alpha * w * np.sin(_t),
+                v * np.sin(_t) + alpha * w * np.cos(_t),
+                w)
     k1x, k1y, k1t = _f(x, y, theta)
     k2x, k2y, k2t = _f(x + h/2*k1x, y + h/2*k1y, theta + h/2*k1t)
     k3x, k3y, k3t = _f(x + h/2*k2x, y + h/2*k2y, theta + h/2*k2t)
@@ -70,8 +76,8 @@ class LissajousTrajectory:
       w_freq   : 角速度交变频率 [rad/s]
       w_amp    : 角速度幅值 = 2.4048 * w_freq
 
-    生成的参考位姿满足理想参考系统运动学 (论文 Eq.10):
-      d(Upsilon_r)/dt = [cos(theta_r) 0; sin(theta_r) 0; 0 1] * u_r
+    使用前端偏置运动学 (与 WMRKinematics 一致) 生成参考轨迹，
+    保证参考轨迹对机器人物理可行。
     """
 
     def __init__(self, Ts: float = 0.05, pos_bound: float = 2.5):
@@ -97,7 +103,7 @@ class LissajousTrajectory:
             t_i = i * self.Ts
             v_r = self.v_const
             w_r = self.w_amp * np.cos(self.w_freq * t_i)
-            x, y, theta = _rk4_unicycle(x, y, theta, v_r, w_r, self.Ts)
+            x, y, theta = _rk4_front_axle(x, y, theta, v_r, w_r, self.Ts)
             x_min, x_max = min(x_min, x), max(x_max, x)
             y_min, y_max = min(y_min, y), max(y_max, y)
         cx = -(x_min + x_max) / 2.0
@@ -125,8 +131,8 @@ class LissajousTrajectory:
         w_r = self.w_amp * np.cos(self.w_freq * t)
         u_r = np.array([v_r, w_r])
 
-        # RK4 积分 (纯单轮参考模型，与前端位姿 WMRKinematics 的失配由 NMPC 补偿)
-        self._x_r, self._y_r, self._theta_r = _rk4_unicycle(
+        # RK4 积分 (前端偏置运动学，与 WMRKinematics 一致)
+        self._x_r, self._y_r, self._theta_r = _rk4_front_axle(
             self._x_r, self._y_r, self._theta_r, v_r, w_r, self.Ts)
 
         Upsilon_r = np.array([self._x_r, self._y_r, self._theta_r])
@@ -158,8 +164,8 @@ class CircularTrajectory:
       w_r : 恒定角速度 [rad/s]
       R   : 圆半径 = |v_r/w_r|
 
-    生成的参考位姿满足理想参考系统运动学 (论文 Eq.10):
-      d(Upsilon_r)/dt = [cos(theta_r) 0; sin(theta_r) 0; 0 1] * u_r
+    使用前端偏置运动学 (与 WMRKinematics 一致) 生成参考轨迹，
+    保证参考轨迹对机器人物理可行。
     """
 
     def __init__(self, Ts: float = 0.05, pos_bound: float = 2.5):
@@ -181,7 +187,7 @@ class CircularTrajectory:
         y_min, y_max = 0.0, 0.0
         v_r, w_r = self.v_const, self.w_const
         for i in range(SIM_STEPS):
-            x, y, theta = _rk4_unicycle(x, y, theta, v_r, w_r, self.Ts)
+            x, y, theta = _rk4_front_axle(x, y, theta, v_r, w_r, self.Ts)
             x_min, x_max = min(x_min, x), max(x_max, x)
             y_min, y_max = min(y_min, y), max(y_max, y)
         cx = -(x_min + x_max) / 2.0
@@ -205,8 +211,8 @@ class CircularTrajectory:
         w_r = self.w_const
         u_r = np.array([v_r, w_r])
 
-        # RK4 积分 (纯单轮参考模型，与前端位姿 WMRKinematics 的失配由 NMPC 补偿)
-        self._x_r, self._y_r, self._theta_r = _rk4_unicycle(
+        # RK4 积分 (前端偏置运动学，与 WMRKinematics 一致)
+        self._x_r, self._y_r, self._theta_r = _rk4_front_axle(
             self._x_r, self._y_r, self._theta_r, v_r, w_r, self.Ts)
 
         Upsilon_r = np.array([self._x_r, self._y_r, self._theta_r])

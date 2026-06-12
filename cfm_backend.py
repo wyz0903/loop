@@ -389,21 +389,26 @@ class CFMDetectorBackend:
                  X_pred: np.ndarray) -> tuple:
         """统一恢复策略。
 
-        后处理规则 (仅 2 条):
+        后处理规则 (仅 3 条):
           1. 置信度 < 阈值 → 直通
-          2. A5 (重放, 非加性) → 死推算
+          2. A0 (正常) → 直通 (无需恢复, 避免注入 NN 估计误差)
+          3. A5 (重放, 非加性) → 死推算
 
-        其余所有攻击类型: y_rec = y_meas − â
+        其余攻击类型 (A1-A4, A6-A8): y_rec = y_meas − â
         (无混合系数, 无分类特定路由, 无削波, 无偏移补偿)
         """
         # 规则 1: 低置信度 → 直通
         if confidence < self.CONFIDENCE_THRESHOLD:
             return y_meas.copy(), np.zeros(3)
 
-        # 规则 2: A5 重放攻击 → 死推算 (非加性攻击)
+        # 规则 2: A0 正常 → 直通 (无需恢复, 避免注入 NN 估计误差)
+        if attack_class == 'A0':
+            return y_meas.copy(), np.zeros(3)
+
+        # 规则 3: A5 重放攻击 → 死推算 (非加性攻击)
         if self.A5_DEAD_RECKON and attack_class == 'A5':
             return X_pred.copy(), np.zeros(3)
 
-        # 默认: 减法恢复 (统一处理 A0-A4, A6-A8)
+        # 默认: 减法恢复 (统一处理 A1-A4, A6-A8)
         y_rec = y_meas - nn_attack_est
         return y_rec, nn_attack_est.copy()

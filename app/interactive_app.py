@@ -205,13 +205,15 @@ class SimulationWorker(threading.Thread):
                                 onset_time=self._attack_onset,
                                 config=atk_cfg, seed=self._traj_seed)
 
-        # ---- 重置 ----
+        # ---- 重置 (初始偏移与 simulate.py 一致) ----
         traj.reset()
+        _INIT_POS_MAX = 0.15
+        _INIT_HEADING_MAX = 0.2
         perturb_rng = np.random.RandomState(self._traj_seed)
         init_state = np.array([
-            traj._x_r + perturb_rng.uniform(-0.3, 0.3),
-            traj._y_r + perturb_rng.uniform(-0.3, 0.3),
-            traj._theta_r + perturb_rng.uniform(-0.2, 0.2),
+            traj._x_r + perturb_rng.uniform(0.0, _INIT_POS_MAX) * perturb_rng.choice([-1, 1]),
+            traj._y_r + perturb_rng.uniform(0.0, _INIT_POS_MAX) * perturb_rng.choice([-1, 1]),
+            traj._theta_r + perturb_rng.uniform(0.0, _INIT_HEADING_MAX) * perturb_rng.choice([-1, 1]),
         ])
         robot.reset(init_state)
         ctrl.reset()
@@ -570,11 +572,11 @@ class ControlPanel(ttk.Frame):
             return
 
         for i, (name, default, vmin, vmax, step, unit) in enumerate(params[family]):
-            col_start = (i % 3) * 2
-            row_off = i // 3
+            col_start = (i % 2) * 3
+            row_off = i // 2
 
             ttk.Label(self._param_frame, text=f'{name}:').grid(
-                row=row_off, column=col_start, padx=(15 if i == 0 else 5, 2), pady=2, sticky='w')
+                row=row_off, column=col_start, padx=(15 if i == 0 else 8, 2), pady=3, sticky='w')
 
             if name == 'w_amp':
                 # 自动计算
@@ -727,7 +729,7 @@ class InteractiveApp(tk.Tk):
         super().__init__()
 
         self.title('WMR Sensor Attack Research — Interactive Explorer')
-        self.geometry('1800x1050')
+        self.geometry('1800x1080')
         self.minsize(1280, 800)
 
         # 状态
@@ -767,19 +769,27 @@ class InteractiveApp(tk.Tk):
         self._panel.pack(side='top', fill='x', padx=5, pady=5)
 
     def _build_figure(self):
-        """创建 matplotlib Figure 并嵌入 tkinter"""
-        self._fig = Figure(figsize=(17.5, 12.5), dpi=110)
-        gs = GridSpec(3, 2, figure=self._fig, hspace=0.35, wspace=0.28,
-                      left=0.06, right=0.98, top=0.96, bottom=0.06)
+        """创建 matplotlib Figure 并嵌入 tkinter
 
+        布局: 左侧大图 (2D轨迹, 占全部5行) + 右侧5行时间序列竖列
+        每个子图均可单独保存为图片文件。
+        """
+        self._fig = Figure(figsize=(18, 6.8), dpi=100)
+        gs = GridSpec(5, 2, figure=self._fig, hspace=0.78, wspace=0.22,
+                      left=0.05, right=0.98, top=0.97, bottom=0.05,
+                      width_ratios=[1.5, 1.0])
+
+        # 左侧: 2D 轨迹大图 (占据全部5行)
         self._axes = {
-            'trajectory': self._fig.add_subplot(gs[0, 0]),    # 2D 轨迹
-            'tracking_error': self._fig.add_subplot(gs[0, 1]), # 跟踪误差
-            'control': self._fig.add_subplot(gs[1, 0]),        # 控制指令
-            'innovation': self._fig.add_subplot(gs[1, 1]),     # 恢复信号 vs 测量
-            'attack': self._fig.add_subplot(gs[2, 0]),         # 攻击信号
-            'measurement': self._fig.add_subplot(gs[2, 1]),    # 测量 vs 真值 vs 估计
+            'trajectory': self._fig.add_subplot(gs[:, 0]),
         }
+
+        # 右侧: 5 个时间序列子图 (竖列)
+        self._axes['tracking_error'] = self._fig.add_subplot(gs[0, 1])
+        self._axes['control'] = self._fig.add_subplot(gs[1, 1])
+        self._axes['innovation'] = self._fig.add_subplot(gs[2, 1])
+        self._axes['attack'] = self._fig.add_subplot(gs[3, 1])
+        self._axes['measurement'] = self._fig.add_subplot(gs[4, 1])
 
         # ---- Canvas ----
         self._canvas = FigureCanvasTkAgg(self._fig, master=self)
@@ -792,11 +802,28 @@ class InteractiveApp(tk.Tk):
         self._toolbar = NavigationToolbar2Tk(self._canvas, toolbar_frame)
         self._toolbar.update()
 
-        # 保存当前视图按钮
+        # 保存全景图按钮
         ttk.Button(toolbar_frame, text='💾 保存全景图',
                    command=self._save_current_figure).pack(side='right', padx=10)
 
-        # 通道选择按钮 (用于 measurement 子图)
+        # ---- 单个子图保存按钮 ----
+        save_frame = ttk.LabelFrame(self, text='保存单个子图 (独立图片文件)')
+        save_frame.pack(side='bottom', fill='x', padx=5, pady=2)
+
+        _PLOT_SAVE_KEYS = [
+            ('trajectory',      '2D 轨迹'),
+            ('tracking_error',  '跟踪误差'),
+            ('control',         '控制指令'),
+            ('innovation',      '检测器攻击估计'),
+            ('attack',          '攻击信号'),
+            ('measurement',     '测量对比'),
+        ]
+        for key, name in _PLOT_SAVE_KEYS:
+            btn = ttk.Button(save_frame, text=f'💾 {name}',
+                             command=lambda k=key: self._save_single_plot(k))
+            btn.pack(side='left', padx=3, pady=2)
+
+        # ---- 通道选择 (用于 measurement 子图) ----
         self._ch_frame = ttk.Frame(self)
         self._ch_frame.pack(side='bottom', fill='x', padx=5, pady=2)
         ttk.Label(self._ch_frame, text='测量对比通道:').pack(side='left', padx=5)
@@ -1001,6 +1028,162 @@ class InteractiveApp(tk.Tk):
             print(f'[Save] {filepath}')
 
     # ==================================================================
+    # 单个子图独立保存
+    # ==================================================================
+
+    _PLOT_KEYS_ZH = {
+        'trajectory': '2D轨迹', 'tracking_error': '跟踪误差',
+        'control': '控制指令', 'innovation': '检测器攻击估计',
+        'attack': '攻击信号', 'measurement': '测量对比',
+    }
+
+    def _save_single_plot(self, plot_key: str):
+        """保存单个子图为独立图片文件 (论文级质量)"""
+        from tkinter import filedialog
+        if self._sim_data is None:
+            messagebox.showinfo('提示', '请先运行仿真再保存图片')
+            return
+
+        data = self._sim_data
+        atk_type = data.get('attack_type_label', 'A0')
+        name_zh = self._PLOT_KEYS_ZH.get(plot_key, plot_key)
+
+        # 根据子图类型选择 figsize
+        if plot_key == 'trajectory':
+            fig, ax = plt.subplots(figsize=(7, 6.5))
+        else:
+            fig, ax = plt.subplots(figsize=(10, 3.2))
+
+        # 绘制
+        draw_func = {
+            'trajectory':      self._save_plot_trajectory,
+            'tracking_error':  self._save_plot_tracking_error,
+            'control':         self._save_plot_control,
+            'innovation':      self._save_plot_innovation,
+            'attack':          self._save_plot_attack,
+            'measurement':     self._save_plot_measurement,
+        }.get(plot_key)
+        if draw_func:
+            draw_func(ax, data)
+
+        # 标题 (含攻击类型)
+        atk_name = ATTACK_NAMES.get(atk_type, atk_type)
+        fig.suptitle(f'{name_zh}  —  {atk_type} {atk_name}', fontsize=12, fontweight='bold', y=0.98)
+
+        # 保存对话框
+        default_name = f'{plot_key}_{atk_type}.png'
+        filepath = filedialog.asksaveasfilename(
+            defaultextension='.png',
+            initialfile=default_name,
+            filetypes=[('PNG 图片', '*.png'), ('PDF', '*.pdf'), ('SVG', '*.svg')],
+            initialdir=PROJECT_ROOT,
+            title=f'保存子图: {name_zh}'
+        )
+        if filepath:
+            fig.savefig(filepath, dpi=150, bbox_inches='tight')
+            self._detail_var.set(f'子图已保存: {os.path.basename(filepath)}')
+
+        plt.close(fig)
+
+    # ---- 独立子图绘制函数 (论文用, 不含游标和交互元素) ----
+
+    @staticmethod
+    def _save_plot_trajectory(ax, data):
+        """2D 轨迹图 (独立)"""
+        ax.plot(data['Upsilon_r'][:, 0], data['Upsilon_r'][:, 1],
+                'b--', lw=1.2, alpha=0.7, label='Reference')
+        ax.plot(data['true_state'][:, 0], data['true_state'][:, 1],
+                'gray', lw=1.0, alpha=0.8, label='Actual')
+        ax.scatter(*data['true_state'][0, :2], c='green', marker='o', s=60, zorder=5, label='Start')
+        ax.scatter(*data['true_state'][-1, :2], c='red', marker='*', s=80, zorder=5, label='End')
+        pb = 2.5
+        ax.plot([-pb, pb, pb, -pb, -pb], [-pb, -pb, pb, pb, -pb],
+                'gray', lw=0.8, ls='--', alpha=0.5)
+        ax.set_xlim(-pb - 0.3, pb + 0.3)
+        ax.set_ylim(-pb - 0.3, pb + 0.3)
+        ax.set_xlabel('x [m]'); ax.set_ylabel('y [m]')
+        ax.set_title('2D Trajectory', fontweight='bold')
+        ax.legend(loc='upper right', fontsize=8)
+        ax.grid(True, alpha=0.3)
+        ax.set_aspect('equal')
+
+    @staticmethod
+    def _save_plot_tracking_error(ax, data):
+        """跟踪误差图 (独立)"""
+        t_arr = data['t']
+        ax.plot(t_arr, data['X_error'][:, 0], 'r-', lw=1.0, label=r'$x_e$ [m]')
+        ax.plot(t_arr, data['X_error'][:, 1], 'g-', lw=1.0, label=r'$y_e$ [m]')
+        ax.plot(t_arr, data['X_error'][:, 2], 'b-', lw=1.0, label=r'$\theta_e$ [rad]')
+        ax.axhline(0, color='gray', lw=0.5, ls='--')
+        ax.set_xlim(0, data['sim_time'])
+        ax.set_xlabel('Time [s]'); ax.set_ylabel('Error')
+        ax.set_title('Tracking Error (Body Frame)', fontweight='bold')
+        ax.legend(loc='upper right', fontsize=8, ncol=3)
+        ax.grid(True, alpha=0.3)
+
+    @staticmethod
+    def _save_plot_control(ax, data):
+        """控制指令图 (独立)"""
+        t_arr = data['t']
+        ax.plot(t_arr, data['u_cmd'][:, 0], 'b-', lw=1.0, label=r'$v$ [m/s]')
+        ax.plot(t_arr, data['u_cmd'][:, 1], 'r-', lw=1.0, label=r'$\omega$ [rad/s]')
+        ax.axhline(0.3, color='blue', lw=0.5, ls='--', alpha=0.4)
+        ax.axhline(-0.3, color='blue', lw=0.5, ls='--', alpha=0.4)
+        ax.axhline(1.76, color='red', lw=0.5, ls='--', alpha=0.4)
+        ax.axhline(-1.76, color='red', lw=0.5, ls='--', alpha=0.4)
+        ax.set_xlim(0, data['sim_time'])
+        ax.set_xlabel('Time [s]'); ax.set_ylabel('Control')
+        ax.set_title('NMPC Control Commands', fontweight='bold')
+        ax.legend(loc='upper right', fontsize=8)
+        ax.grid(True, alpha=0.3)
+
+    @staticmethod
+    def _save_plot_innovation(ax, data):
+        """检测器攻击估计图 (独立)"""
+        t_arr = data['t']
+        det_a_norm = np.linalg.norm(data['det_attack_est'], axis=1)
+        ax.plot(t_arr, det_a_norm, '#d62728', lw=1.2, alpha=0.9, label=r'$\|\hat{a}_{\mathrm{det}}\|$')
+        ax.axhline(0.01, color='gray', lw=0.5, ls='--', alpha=0.5)
+        ax.set_xlim(0, data['sim_time'])
+        ax.set_xlabel('Time [s]'); ax.set_ylabel(r'$\|\hat{a}\|$ [m/rad]')
+        ax.set_title('Detected Attack Signal', fontweight='bold')
+        ax.legend(loc='upper right', fontsize=8)
+        ax.grid(True, alpha=0.3)
+
+    @staticmethod
+    def _save_plot_attack(ax, data):
+        """攻击信号图 (独立)"""
+        t_arr = data['t']
+        atk_norm = np.linalg.norm(data['attack_signal'], axis=1)
+        ax.plot(t_arr, atk_norm, 'k-', lw=1.5, alpha=0.9, label=r'$\|a(k)\|$')
+        ax.plot(t_arr, data['attack_signal'][:, 0], 'r--', lw=0.7, alpha=0.5, label=r'$a_x$')
+        ax.plot(t_arr, data['attack_signal'][:, 1], 'g--', lw=0.7, alpha=0.5, label=r'$a_y$')
+        ax.plot(t_arr, data['attack_signal'][:, 2], 'b--', lw=0.7, alpha=0.5, label=r'$a_\theta$')
+        # 检测器估计覆盖
+        if data.get('use_detector', False):
+            det_a_norm = np.linalg.norm(data['det_attack_est'], axis=1)
+            ax.plot(t_arr, det_a_norm, color='cyan', lw=1.2, alpha=0.8, ls='-.',
+                    label=r'$\|\hat{a}_{\mathrm{det}}(k)\|$')
+        ax.set_xlim(0, data['sim_time'])
+        ax.set_xlabel('Time [s]'); ax.set_ylabel('Attack [m/rad]')
+        ax.set_title('Attack Signal (Ground Truth + Detector Estimate)', fontweight='bold')
+        ax.legend(loc='upper right', fontsize=7)
+        ax.grid(True, alpha=0.3)
+
+    @staticmethod
+    def _save_plot_measurement(ax, data):
+        """测量对比图 (独立, 默认 X 通道)"""
+        t_arr = data['t']
+        ax.plot(t_arr, data['true_state'][:, 0], 'k-', lw=1.0, label='True x')
+        ax.plot(t_arr, data['y_meas'][:, 0], 'r-', lw=0.8, alpha=0.7, label='Measured x')
+        ax.plot(t_arr, data['Upsilon_hat'][:, 0], 'b--', lw=1.0, alpha=0.8, label='Est. x')
+        ax.set_xlim(0, data['sim_time'])
+        ax.set_xlabel('Time [s]'); ax.set_ylabel('x [m]')
+        ax.set_title('Measurement vs True vs Estimate (X channel)', fontweight='bold')
+        ax.legend(loc='upper right', fontsize=8)
+        ax.grid(True, alpha=0.3)
+
+    # ==================================================================
     # 绘图
     # ==================================================================
 
@@ -1174,7 +1357,7 @@ class InteractiveApp(tk.Tk):
         ax.legend(loc='upper right', fontsize=7)
 
         # 重建游标线
-        if hasattr(self, '_cursor_lines') and len(self._cursor_lines) >= 6:
+        if hasattr(self, '_cursor_lines') and len(self._cursor_lines) >= 5:
             old = self._cursor_lines.pop()  # 移除旧的
             old.remove() if old else None
         cursor, = ax.plot([0, 0], ax.get_ylim(), 'k--', lw=1.2, alpha=0.7)

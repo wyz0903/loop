@@ -38,12 +38,18 @@ from cfm_backend import CFMDetectorBackend
 # 全局配置
 # ============================================================================
 
-SIM_TIME = 35.0
+# 仿真总时长与步数严格对齐 model.SIM_STEPS，避免标签与实际不一致
+SIM_TIME = SIM_STEPS * WMRParams().Ts   # = 1000 * 0.05 = 50.0 s
 ATTACK_ONSET_DEFAULT = 15.0
 ATTACK_ONSET_MIN = 5.0
 ATTACK_ONSET_MAX = 30.0
 RESULT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'results')
 os.makedirs(RESULT_DIR, exist_ok=True)
+
+# 机器人初始位姿偏移范围 (世界坐标系, 用于检验 NMPC 收敛能力)
+# 每次仿真在 [0, max] 内均匀随机采样，符号随机正负; 全零时机器人严格从起点出发
+INIT_POS_MAX = 0.15        # 位置偏移最大幅值 [m] (每个轴独立 U(0, max) × 随机符号)
+INIT_HEADING_MAX = 0.2     # 朝向偏移最大幅值 [rad] (U(0, max) × 随机符号)
 
 ALL_ATTACK_TYPES = ['A0', 'A1', 'A2', 'A3', 'A4', 'A5', 'A6', 'A7', 'A8']
 ATTACK_NAMES = {
@@ -58,6 +64,16 @@ TRAJECTORY_FAMILIES = ['lissajous', 'circular', 'spiral', 'random_waypoint', 'sq
 # ============================================================================
 # 辅助函数
 # ============================================================================
+
+def _has_attack(data: dict) -> bool:
+    """该次仿真是否存在真实攻击 (A0 或攻击从未触发时返回 False)"""
+    if str(data.get('attack_type', 'A0')) == 'A0':
+        return False
+    active = data.get('attack_active', None)
+    if active is not None and hasattr(active, 'max'):
+        return bool(active.max() > 0.5)
+    return True
+
 
 def _get_onset_idx(data: dict) -> int:
     """从仿真数据中获取攻击起始索引 (考虑窗口填充期)"""
@@ -149,7 +165,13 @@ def run_simulation(attack_type: str = 'A4',
 
     # ---- 重置 ----
     traj.reset()
-    robot.reset()
+    # 机器人初始位姿 = 参考轨迹起点 + 随机偏移 (检验 NMPC 收敛能力)
+    init_rng = np.random.RandomState(seed)
+    init_state = np.array([traj._x_r, traj._y_r, traj._theta_r])
+    init_state[0] += init_rng.uniform(0.0, INIT_POS_MAX) * init_rng.choice([-1, 1])
+    init_state[1] += init_rng.uniform(0.0, INIT_POS_MAX) * init_rng.choice([-1, 1])
+    init_state[2] += init_rng.uniform(0.0, INIT_HEADING_MAX) * init_rng.choice([-1, 1])
+    robot.reset(init_state)
     ctrl.reset()
     attacker.reset()
     if detector is not None:
@@ -328,75 +350,134 @@ def compute_detector_metrics(data: dict) -> dict:
 # ============================================================================
 
 def plot_results(data: dict, save_path: str = None):
-    """绘制单次仿真结果 (四联图)"""
-    onset_idx = _get_onset_idx(data)
-    attack_onset_time = onset_idx * data['Ts']
+    """绘制单次仿真结果 (2x2 面板, IEEE 论文标准)
+
+    自适应布局:
+      - 上排 (恒定): 2D 轨迹 + 位置跟踪误差
+      - 下排 (含检测器): 攻击估计 + 检测器输出
+      - 下排 (无检测器): 分轴跟踪误差 + NMPC 控制指令
+    A0 / 无攻击场景不绘制任何攻击起始标记。
+    """
     t = data['t']
+    Ts = data['Ts']
     atk_type = data.get('attack_type', 'A0')
     use_det = data.get('use_detector', True)
     det_label = 'CFMDetector' if use_det else 'No Detector'
+    has_attack = _has_attack(data)
+    onset_idx = _get_onset_idx(data) if has_attack else None
+    onset_time = onset_idx * Ts if has_attack else None
 
-    fig, axes = plt.subplots(2, 2, figsize=(15, 11))
-    fig.suptitle(f'Attack {atk_type} ({ATTACK_NAMES.get(atk_type, "")}) — {det_label}',
-                 fontsize=14, fontweight='bold')
-
-    # Panel 1: 2D 轨迹
-    ax = axes[0, 0]
     ref = data['Upsilon_r']
-    ax.plot(ref[:, 0], ref[:, 1], 'k--', linewidth=1.5, alpha=0.5, label='Reference')
-    Upsilon_hat = data['Upsilon_hat']
-    ax.plot(Upsilon_hat[:, 0], Upsilon_hat[:, 1], '#9467bd', linewidth=1.2, alpha=0.8,
-            label=f'State Estimate ({det_label})')
-    ax.scatter(ref[onset_idx, 0], ref[onset_idx, 1],
-               c='red', s=80, marker='x', zorder=5, linewidths=2, label='Attack Onset')
-    ax.set_xlabel('X [m]'); ax.set_ylabel('Y [m]')
-    ax.set_title('2D Trajectory (Estimated States)')
-    ax.legend(fontsize=7); ax.axis('equal'); ax.grid(True, alpha=0.3)
-
-    # Panel 2: 位置误差
-    ax = axes[0, 1]
+    true_state = data['true_state']
+    est = data['Upsilon_hat']
     X_err = data['X_error']
     pos_err = np.sqrt(X_err[:, 0] ** 2 + X_err[:, 1] ** 2)
-    ax.plot(t, pos_err, '#9467bd', linewidth=1.3, alpha=0.85)
-    ax.axvline(x=attack_onset_time, color='red', linestyle='--', linewidth=1.5, alpha=0.7,
-               label='Attack Onset')
-    post_rmse = np.sqrt(np.mean(pos_err[onset_idx:] ** 2))
-    ax.text(0.02, 0.95, f'Post-Attack RMSE: {post_rmse:.4f}m',
-            transform=ax.transAxes, fontsize=10, va='top',
-            bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
-    ax.set_xlabel('Time [s]'); ax.set_ylabel('Position Error [m]')
+    b = WMRParams().pos_bound
+
+    fig, axes = plt.subplots(2, 2, figsize=(14, 11))
+    fig.suptitle(f'WMR Closed-Loop Tracking — Attack {atk_type} '
+                 f'({ATTACK_NAMES.get(atk_type, "")}) — {det_label}',
+                 fontsize=14, fontweight='bold')
+
+    # ---- Panel 1: 2D 轨迹 ----
+    ax = axes[0, 0]
+    ax.plot(ref[:, 0], ref[:, 1], 'k--', linewidth=1.5, alpha=0.6, label='Reference')
+    ax.plot(true_state[:, 0], true_state[:, 1], color='#1f77b4', linewidth=1.6,
+            alpha=0.9, label='Robot (actual)')
+    if use_det:
+        ax.plot(est[:, 0], est[:, 1], color='#9467bd', linewidth=1.0, alpha=0.6,
+                label='Estimate (recovered)')
+    # 起点 / 终点标记
+    ax.scatter(true_state[0, 0], true_state[0, 1], c='#2ca02c', s=110, marker='o',
+               zorder=6, edgecolors='white', linewidths=1.3, label='Start')
+    ax.scatter(true_state[-1, 0], true_state[-1, 1], c='#d62728', s=200, marker='*',
+               zorder=6, edgecolors='white', linewidths=1.0, label='End')
+    if has_attack:
+        ax.scatter(true_state[onset_idx, 0], true_state[onset_idx, 1], c='red', s=120,
+                   marker='X', zorder=7, edgecolors='white', linewidths=1.0,
+                   label='Attack onset')
+    # 空间安全边界
+    ax.plot([-b, b, b, -b, -b], [-b, -b, b, b, -b], color='gray',
+            linewidth=0.8, linestyle=':', alpha=0.5)
+    ax.set_xlabel('X [m]'); ax.set_ylabel('Y [m]')
+    ax.set_title('2D Trajectory')
+    ax.legend(fontsize=7, loc='best'); ax.set_aspect('equal'); ax.grid(True, alpha=0.3)
+
+    # ---- Panel 2: 位置跟踪误差 ----
+    ax = axes[0, 1]
+    ax.plot(t, pos_err, color='#1f77b4', linewidth=1.3, alpha=0.9)
+    if has_attack:
+        ax.axvline(x=onset_time, color='red', linestyle='--', linewidth=1.5,
+                   alpha=0.7, label='Attack onset')
+        ax.legend(fontsize=8)
+        rmse = np.sqrt(np.mean(pos_err[onset_idx:] ** 2))
+        box_txt = f'Post-attack RMSE: {rmse:.4f} m'
+    else:
+        steady = max(int(5.0 / Ts), 100)
+        rmse = np.sqrt(np.mean(pos_err[steady:] ** 2))
+        box_txt = f'Steady-state RMSE: {rmse:.4f} m'
+    ax.text(0.02, 0.95, box_txt, transform=ax.transAxes, fontsize=9, va='top',
+            bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.6))
+    ax.set_xlabel('Time [s]'); ax.set_ylabel('Position error [m]')
     ax.set_title(r'Tracking Error $\|e_{xy}\|$')
-    ax.legend(fontsize=7); ax.grid(True, alpha=0.3)
-
-    # Panel 3: 检测器攻击估计
-    ax = axes[1, 0]
-    atk_norm = np.linalg.norm(data['det_attack_est'], axis=1)
-    ax.plot(t, atk_norm, '#d62728', linewidth=1.0, alpha=0.8)
-    ax.axvline(x=attack_onset_time, color='red', linestyle='--', linewidth=1.5, alpha=0.7)
-    ax.axhline(y=0.01, color='gray', linestyle=':', alpha=0.5)
-    ax.set_xlabel('Time [s]'); ax.set_ylabel('||Attack Est.||')
-    ax.set_title('Detected Attack Signal')
     ax.grid(True, alpha=0.3)
 
-    # Panel 4: 检测器输出
-    ax = axes[1, 1]
-    det_classes = data['det_class']
-    det_confs = data['det_conf']
-    # 绘制分类结果颜色条
-    cls_map = {f'A{i}': i for i in range(9)}
-    cls_ints = np.array([cls_map.get(str(c), 0) for c in det_classes])
-    ax.fill_between(t, 0, cls_ints, alpha=0.3, color='#9467bd')
-    ax2 = ax.twinx()
-    ax2.plot(t, det_confs, 'b-', linewidth=1.0, alpha=0.7, label='Confidence')
-    ax2.set_ylim(0, 1.05)
-    ax2.set_ylabel('Confidence')
-    ax2.axhline(y=0.5, color='gray', linestyle=':', alpha=0.5)
-    ax.set_xlabel('Time [s]')
-    ax.set_ylabel('Detected Class')
-    ax.set_yticks(range(9))
-    ax.set_yticklabels([f'A{i}' for i in range(9)])
-    ax.set_title('Detector Output (Class + Confidence)')
-    ax.grid(True, alpha=0.3)
+    if use_det:
+        # ---- Panel 3: 检测器攻击估计 ----
+        ax = axes[1, 0]
+        atk_norm = np.linalg.norm(data['det_attack_est'], axis=1)
+        ax.plot(t, atk_norm, color='#d62728', linewidth=1.0, alpha=0.85)
+        if has_attack:
+            ax.axvline(x=onset_time, color='red', linestyle='--', linewidth=1.5, alpha=0.7)
+        ax.set_xlabel('Time [s]'); ax.set_ylabel(r'$\|\hat{a}\|$')
+        ax.set_title('Detected Attack Signal')
+        ax.grid(True, alpha=0.3)
+
+        # ---- Panel 4: 检测器输出 ----
+        ax = axes[1, 1]
+        det_classes = data['det_class']
+        det_confs = data['det_conf']
+        cls_ints = np.array([int(str(c)[1:]) if str(c).startswith('A') else 0
+                             for c in det_classes])
+        ax.fill_between(t, 0, cls_ints, alpha=0.3, color='#9467bd', step='post')
+        ax.set_ylim(-0.5, 8.5); ax.set_yticks(range(9))
+        ax.set_yticklabels([f'A{i}' for i in range(9)])
+        if has_attack:
+            ax.axvline(x=onset_time, color='red', linestyle='--', linewidth=1.5, alpha=0.7)
+        ax2 = ax.twinx()
+        ax2.plot(t, det_confs, color='#1f77b4', linewidth=1.0, alpha=0.7)
+        ax2.axhline(y=0.5, color='gray', linestyle=':', alpha=0.5)
+        ax2.set_ylim(0, 1.05); ax2.set_ylabel('Confidence')
+        ax.set_xlabel('Time [s]'); ax.set_ylabel('Detected class')
+        ax.set_title('Detector Output (Class + Confidence)')
+        ax.grid(True, alpha=0.3)
+    else:
+        # ---- Panel 3: 分轴跟踪误差 (本体坐标系) ----
+        ax = axes[1, 0]
+        ax.plot(t, X_err[:, 0], color='#1f77b4', linewidth=1.1, label=r'$x_e$')
+        ax.plot(t, X_err[:, 1], color='#ff7f0e', linewidth=1.1, label=r'$y_e$')
+        ax.plot(t, X_err[:, 2], color='#2ca02c', linewidth=1.1, alpha=0.85,
+                label=r'$\theta_e$')
+        ax.axhline(y=0.0, color='gray', linewidth=0.6, alpha=0.5)
+        if has_attack:
+            ax.axvline(x=onset_time, color='red', linestyle='--', linewidth=1.5, alpha=0.7)
+        ax.set_xlabel('Time [s]'); ax.set_ylabel('Error')
+        ax.set_title('Per-Axis Tracking Error (body frame)')
+        ax.legend(fontsize=8, ncol=3); ax.grid(True, alpha=0.3)
+
+        # ---- Panel 4: NMPC 控制指令 ----
+        ax = axes[1, 1]
+        u = data['u_a']
+        ax.plot(t, u[:, 0], color='#1f77b4', linewidth=1.1, label=r'$v$ [m/s]')
+        ax.plot(t, u[:, 1], color='#ff7f0e', linewidth=1.1, label=r'$\omega$ [rad/s]')
+        for lim, c in [(0.3, '#1f77b4'), (1.76, '#ff7f0e')]:
+            ax.axhline(y=lim, color=c, linestyle=':', linewidth=0.8, alpha=0.5)
+            ax.axhline(y=-lim, color=c, linestyle=':', linewidth=0.8, alpha=0.5)
+        if has_attack:
+            ax.axvline(x=onset_time, color='red', linestyle='--', linewidth=1.5, alpha=0.7)
+        ax.set_xlabel('Time [s]'); ax.set_ylabel('Control input')
+        ax.set_title('NMPC Control Commands')
+        ax.legend(fontsize=8, ncol=2); ax.grid(True, alpha=0.3)
 
     plt.tight_layout()
     if save_path is None:
@@ -527,7 +608,14 @@ def plot_all_trajectories():
         ctrl.load_or_build()
         traj = factory()
 
-        traj.reset(); robot.reset(); ctrl.reset()
+        traj.reset()
+        # 机器人初始位姿 = 参考轨迹起点 + 随机偏移
+        init_rng = np.random.RandomState(42 + idx)
+        init_state = np.array([traj._x_r, traj._y_r, traj._theta_r])
+        init_state[0] += init_rng.uniform(0.0, INIT_POS_MAX) * init_rng.choice([-1, 1])
+        init_state[1] += init_rng.uniform(0.0, INIT_POS_MAX) * init_rng.choice([-1, 1])
+        init_state[2] += init_rng.uniform(0.0, INIT_HEADING_MAX) * init_rng.choice([-1, 1])
+        robot.reset(init_state); ctrl.reset()
         np.random.seed(42)
 
         print(f"[{idx+1}/5] 仿真 {name} ...", end='', flush=True)
@@ -731,17 +819,23 @@ def main():
     )
 
     # 指标
-    onset_idx = _get_onset_idx(data)
     X_err = data['X_error']
-    pos_err = np.sqrt(X_err[onset_idx:, 0] ** 2 + X_err[onset_idx:, 1] ** 2)
-    rmse = np.sqrt(np.mean(pos_err ** 2))
-    max_err = np.max(pos_err)
+    if _has_attack(data):
+        onset_idx = _get_onset_idx(data)
+        seg = np.sqrt(X_err[onset_idx:, 0] ** 2 + X_err[onset_idx:, 1] ** 2)
+        rmse_label = 'Post-attack RMSE'
+    else:
+        steady = max(int(5.0 / data['Ts']), 100)
+        seg = np.sqrt(X_err[steady:, 0] ** 2 + X_err[steady:, 1] ** 2)
+        rmse_label = 'Steady-state RMSE'
+    rmse = np.sqrt(np.mean(seg ** 2))
+    max_err = np.max(seg)
 
     print(f"\n{'='*60}")
     print("RESULTS SUMMARY")
     print(f"{'='*60}")
     print(f"  Detector: {'CFM' if use_detector else 'None'}")
-    print(f"  Post-attack RMSE: {rmse:.4f}m, Max: {max_err:.4f}m")
+    print(f"  {rmse_label}: {rmse:.4f}m, Max: {max_err:.4f}m")
 
     if use_detector:
         det_m = compute_detector_metrics(data)

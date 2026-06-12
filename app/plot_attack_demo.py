@@ -19,7 +19,7 @@ from model import (WMRParams, WMRKinematics, SensorSimulator,
                    SIM_STEPS, SIM_TIME)
 from controller import NMPCController, NMPCParams
 from attack import SensorAttack, AttackConfig
-from generate_dataset import (RandomizedTrajectory, _rk4_unicycle,
+from generate_dataset import (RandomizedTrajectory, _rk4_front_axle,
                               _internal_kinematic_step, ATTACK_NAMES)
 
 # ---- IEEE 标准字体 ----

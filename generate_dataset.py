@@ -70,15 +70,20 @@ def _internal_kinematic_step(state: np.ndarray, u_cmd: np.ndarray) -> np.ndarray
     return state + _TS * np.array([dx, dy, w])
 
 
-def _rk4_unicycle(x: float, y: float, theta: float, v: float, w: float, Ts: float):
-    """单轮模型 RK4 积分 (参考轨迹用，精确无漂移)
+def _rk4_front_axle(x: float, y: float, theta: float, v: float, w: float, Ts: float,
+                     alpha: float = 0.17):
+    """前端偏置运动学 RK4 积分 (与 WMRKinematics 一致)
 
-    运动学: ẋ = v·cos(θ),  ẏ = v·sin(θ),  θ̇ = w
+    运动学: ẋ = v·cos(θ) − α·w·sin(θ),  ẏ = v·sin(θ) + α·w·cos(θ),  θ̇ = w
+
+    参考轨迹与机器人使用同一运动学模型，确保参考轨迹物理可行。
     """
     h = Ts
 
     def _f(_x, _y, _t):
-        return (v * np.cos(_t), v * np.sin(_t), w)
+        return (v * np.cos(_t) - alpha * w * np.sin(_t),
+                v * np.sin(_t) + alpha * w * np.cos(_t),
+                w)
 
     k1x, k1y, k1t = _f(x, y, theta)
     k2x, k2y, k2t = _f(x + h/2*k1x, y + h/2*k1y, theta + h/2*k1t)
@@ -253,7 +258,7 @@ class RandomizedTrajectory:
             y_min, y_max = 0.0, 0.0
             for step_idx in range(n_steps):
                 u_r = self._gen_func(step_idx * self.Ts)
-                x, y, theta = _rk4_unicycle(x, y, theta, u_r[0], u_r[1], self.Ts)
+                x, y, theta = _rk4_front_axle(x, y, theta, u_r[0], u_r[1], self.Ts)
                 x_min, x_max = min(x_min, x), max(x_max, x)
                 y_min, y_max = min(y_min, y), max(y_max, y)
             # 居中偏移量 (使轨迹 bounding box 中心对齐原点)
@@ -379,8 +384,8 @@ class RandomizedTrajectory:
         """
         u_r = self._gen_func(t)
 
-        # RK4 积分 (纯单轮参考模型，与前端位姿 WMRKinematics 的失配由 NMPC 补偿)
-        self._x_r, self._y_r, self._theta_r = _rk4_unicycle(
+        # RK4 积分 (前端偏置运动学，与 WMRKinematics 一致)
+        self._x_r, self._y_r, self._theta_r = _rk4_front_axle(
             self._x_r, self._y_r, self._theta_r,
             u_r[0], u_r[1], self.Ts)
 
