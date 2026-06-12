@@ -265,7 +265,7 @@ class CFMDetectorBackend:
     # ------------------------------------------------------------------
 
     def _load_model(self, model_path: str):
-        """加载训练好的 CFMDetector。"""
+        """加载训练好的 CFMDetector (v1/v2 兼容)。"""
         from detector.cfm_detector import CFMDetector
 
         # 尝试加载配置
@@ -274,18 +274,47 @@ class CFMDetectorBackend:
         if os.path.exists(config_path):
             cfg = dict(np.load(config_path, allow_pickle=True))
 
-        model = CFMDetector(
-            in_channels=int(cfg.get('in_channels', 5)),
-            window_size=int(cfg.get('window_size', self.window_size)),
-            d_model=int(cfg.get('d_model', 128)),
-            num_classes=int(cfg.get('num_classes', 9)),
-            num_transformer_layers=int(cfg.get('num_transformer_layers', 4)),
-            num_heads=int(cfg.get('num_heads', 8)),
-            dim_feedforward=int(cfg.get('dim_feedforward', 512)),
-            num_flow_blocks=int(cfg.get('num_flow_blocks', 4)),
-            dim_feedforward_flow=int(cfg.get('dim_feedforward_flow', 192)),
-            dropout=float(cfg.get('dropout', 0.1)),
-        )
+        # 检测模型版本
+        model_type = str(cfg.get('model_type', 'cfm'))
+        if model_type == 'cfm':
+            # v1 旧模型: Transformer 骨干, 无正交分裂器
+            model = CFMDetector(
+                in_channels=int(cfg.get('in_channels', 5)),
+                window_size=int(cfg.get('window_size', self.window_size)),
+                d_model=int(cfg.get('d_model', 128)),
+                num_classes=int(cfg.get('num_classes', 9)),
+                backbone_type='transformer',
+                d_cls=int(cfg.get('d_model', 128)),   # 无分裂 → 恒等
+                d_fm=int(cfg.get('d_model', 128)),
+                num_transformer_layers=int(cfg.get('num_transformer_layers', 4)),
+                num_heads=int(cfg.get('num_heads', 8)),
+                dim_feedforward=int(cfg.get('dim_feedforward', 512)),
+                num_flow_blocks=int(cfg.get('num_flow_blocks', 4)),
+                dim_feedforward_flow=int(cfg.get('dim_feedforward_flow', 192)),
+                dropout=float(cfg.get('dropout', 0.1)),
+            )
+        else:
+            # v2 新模型: 从配置读取骨干和子空间参数
+            backbone_type = str(cfg.get('backbone_type', 'causal_conv'))
+            dilations_raw = cfg.get('dilations', None)
+            dilations = list(dilations_raw) if dilations_raw is not None else None
+            model = CFMDetector(
+                in_channels=int(cfg.get('in_channels', 5)),
+                window_size=int(cfg.get('window_size', self.window_size)),
+                d_model=int(cfg.get('d_model', 128)),
+                num_classes=int(cfg.get('num_classes', 9)),
+                backbone_type=backbone_type,
+                dilations=dilations,
+                conv_kernel_size=int(cfg.get('conv_kernel_size', 3)),
+                d_cls=int(cfg.get('d_cls', 64)),
+                d_fm=int(cfg.get('d_fm', 64)),
+                num_transformer_layers=int(cfg.get('num_transformer_layers', 4)),
+                num_heads=int(cfg.get('num_heads', 8)),
+                dim_feedforward=int(cfg.get('dim_feedforward', 512)),
+                num_flow_blocks=int(cfg.get('num_flow_blocks', 4)),
+                dim_feedforward_flow=int(cfg.get('dim_feedforward_flow', 192)),
+                dropout=float(cfg.get('dropout', 0.1)),
+            )
 
         if os.path.exists(model_path):
             state_dict = torch.load(model_path, map_location=self._device,

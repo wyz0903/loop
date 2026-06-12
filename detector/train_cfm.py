@@ -1,20 +1,23 @@
 """
-train_cfm.py — PINN-Flow 攻击检测器训练脚本
-==============================================
-使用物理信息流匹配损失训练 CFMDetector。
+train_cfm.py — PINN-Flow 攻击检测器训练脚本 (v2)
+==================================================
+使用物理信息流匹配损失 + 正交正则化训练 CFMDetector。
 
 核心创新:
-  L = L_cls + λ_fm·L_fm + λ_phys·L_phys
+  L = L_cls + λ_fm·L_fm + λ_phys·L_phys + λ_ortho·L_ortho
 
   其中:
-    L_cls  = CrossEntropy (分类)
-    L_fm   = MSE(v_θ, v_target)  (OT 流匹配)
-    L_phys = max(0, mean(||r_phys||²) − κ·Tr(R))  (运动学 ODE 约束)
+    L_cls   = CrossEntropy (分类)
+    L_fm    = MSE(v_θ, v_target)  (OT 流匹配)
+    L_phys  = max(0, mean(||r_phys||²) − κ·Tr(R))  (运动学 ODE 约束)
+    L_ortho = ||W_cls @ W_fm^T||_F^2  (分类/流匹配子空间正交约束)
 
 用法:
-  python train_cfm.py                          # 默认训练
+  python train_cfm.py                          # 默认训练 (因果卷积 + 正交子空间)
+  python train_cfm.py --backbone transformer   # 旧架构 (Transformer 骨干)
   python train_cfm.py --eval-only models/cfm_cls_best.pt
   python train_cfm.py --lambda-phys 0          # 消融: 无物理正则化
+  python train_cfm.py --lambda-ortho 0         # 消融: 无正交约束
 """
 
 import os
@@ -40,7 +43,9 @@ warnings.filterwarnings('ignore', message='.*non-writable tensor.*')
 from detector.cfm_detector import (CFMDetector, compute_physics_residual,
                                     D_MODEL, NUM_TRANSFORMER_LAYERS, NUM_HEADS,
                                     DIM_FEEDFORWARD, NUM_FLOW_BLOCKS,
-                                    DIM_FEEDFORWARD_FLOW, DROPOUT, TRACE_R)
+                                    DIM_FEEDFORWARD_FLOW, DROPOUT, TRACE_R,
+                                    D_CLS, D_FM, LAMBDA_ORTHO,
+                                    DILATIONS, CONV_KERNEL_SIZE)
 
 # ============================================================================
 # 攻击类型常量（全局统一定义）
@@ -171,8 +176,9 @@ def pinn_flow_loss(model: CFMDetector,
                    lambda_phys: float = LAMBDA_PHYS,
                    kappa: float = KAPPA,
                    a0_fm_weight: float = A0_FM_WEIGHT,
-                   trace_R: float = TRACE_R) -> Tuple[torch.Tensor, dict]:
-    """PINN-Flow 联合损失。
+                   trace_R: float = TRACE_R,
+                   lambda_ortho: float = LAMBDA_ORTHO) -> Tuple[torch.Tensor, dict]:
+    """PINN-Flow 联合损失 (v2: 正交子空间 + 因果卷积)。
 
     物理残差通过 y_rec = y_meas − â 恢复绝对位姿, 再检查运动学一致性:
       r[k] = y_rec[k+1] − kinematic_step(y_rec[k], u_cmd[k])
@@ -205,13 +211,14 @@ def pinn_flow_loss(model: CFMDetector,
     cls_logits = model.classify(features)
     loss_cls = F.cross_entropy(cls_logits, cls_label, label_smoothing=LABEL_SMOOTHING)
 
-    # ---- 3. 流匹配损失 (OT 路径, 在攻击信号空间) ----
+    # ---- 3. 流匹配损失 (OT 路径, 在流匹配子空间中) ----
+    fm_features = model.get_fm_features(features)
     x_0 = torch.randn(B, W, 3, device=x_norm.device)
     t = torch.rand(B, device=x_norm.device)
     t_expanded = t.view(B, 1, 1)
     x_t = (1 - t_expanded) * x_0 + t_expanded * atk_target
     v_target = atk_target - x_0
-    v_pred = model.flow_head(t, x_t, features)
+    v_pred = model.flow_head(t, x_t, fm_features)
 
     loss_fm_per_sample = F.mse_loss(v_pred, v_target, reduction='none').mean(dim=[1, 2])
 
@@ -231,14 +238,22 @@ def pinn_flow_loss(model: CFMDetector,
     loss_phys_per_sample = F.relu(phys_mse_per_sample - kappa * trace_R)
     loss_phys = loss_phys_per_sample.mean()
 
+    # ---- 5. 正交正则化 ----
+    if lambda_ortho > 0 and model.splitter is not None:
+        loss_ortho = model.compute_ortho_loss()
+    else:
+        loss_ortho = torch.tensor(0.0, device=x_norm.device)
+
     # ---- 总损失 ----
-    loss_total = loss_cls + lambda_fm * loss_fm + lambda_phys * loss_phys
+    loss_total = (loss_cls + lambda_fm * loss_fm + lambda_phys * loss_phys
+                  + lambda_ortho * loss_ortho)
 
     metrics = {
         'loss_cls': loss_cls.item(),
         'loss_fm': loss_fm.item(),
         'loss_phys': loss_phys.item(),
         'phys_mse': phys_mse_per_sample.mean().item(),
+        'loss_ortho': loss_ortho.item() if isinstance(loss_ortho, torch.Tensor) else loss_ortho,
     }
     return loss_total, metrics, cls_logits
 
@@ -320,13 +335,14 @@ def evaluate(model, dataloader, device, normalizer,
         loss_cls = F.cross_entropy(cls_logits, cls_label,
                                     label_smoothing=LABEL_SMOOTHING)
 
-        # FM 损失
+        # FM 损失 (使用流匹配子空间特征)
+        fm_features = model.get_fm_features(features)
         x_0 = torch.randn(B, W, 3, device=device)
         t = torch.rand(B, device=device)
         t_expanded = t.view(B, 1, 1)
         x_t = (1 - t_expanded) * x_0 + t_expanded * atk_seq
         v_target = atk_seq - x_0
-        v_pred = model.flow_head(t, x_t, features)
+        v_pred = model.flow_head(t, x_t, fm_features)
         loss_fm = F.mse_loss(v_pred, v_target)
 
         # 物理损失: y_rec = y_meas − x_t (恢复绝对位姿)
@@ -337,7 +353,14 @@ def evaluate(model, dataloader, device, normalizer,
         phys_mse = (r_phys ** 2).mean()
         loss_phys = F.relu(phys_mse - KAPPA * TRACE_R)
 
-        loss = loss_cls + lambda_fm * loss_fm + lambda_phys * loss_phys
+        # 正交正则化
+        if model.splitter is not None:
+            loss_ortho = model.compute_ortho_loss()
+        else:
+            loss_ortho = torch.tensor(0.0, device=device)
+
+        loss = (loss_cls + lambda_fm * loss_fm + lambda_phys * loss_phys
+                + LAMBDA_ORTHO * loss_ortho)
 
         total_loss += loss.item() * B
         total_cls += loss_cls.item() * B
@@ -452,6 +475,17 @@ def main():
     parser.add_argument('--lambda-fm', type=float, default=LAMBDA_FM)
     parser.add_argument('--lambda-phys', type=float, default=LAMBDA_PHYS)
     parser.add_argument('--d-model', type=int, default=D_MODEL)
+    parser.add_argument('--backbone', type=str, default='causal_conv',
+                        choices=['causal_conv', 'transformer'],
+                        help='骨干网络类型 (默认 causal_conv)')
+    parser.add_argument('--d-cls', type=int, default=D_CLS,
+                        help=f'分类子空间维度 (默认 {D_CLS})')
+    parser.add_argument('--d-fm', type=int, default=D_FM,
+                        help=f'流匹配子空间维度 (默认 {D_FM})')
+    parser.add_argument('--lambda-ortho', type=float, default=LAMBDA_ORTHO,
+                        help=f'正交正则化权重 (默认 {LAMBDA_ORTHO})')
+    parser.add_argument('--conv-kernel-size', type=int, default=CONV_KERNEL_SIZE,
+                        help=f'因果卷积核大小 (默认 {CONV_KERNEL_SIZE})')
     parser.add_argument('--transformer-layers', type=int, default=NUM_TRANSFORMER_LAYERS)
     parser.add_argument('--heads', type=int, default=NUM_HEADS)
     parser.add_argument('--flow-blocks', type=int, default=NUM_FLOW_BLOCKS)
@@ -487,7 +521,14 @@ def main():
         print(f"  GPU:          {gpu_name} ({gpu_mem:.0f}GB)")
     print(f"  AMP:          {USE_AMP}")
     print(f"  d_model:      {args.d_model}")
-    print(f"  Transformer:  {args.transformer_layers}L × {args.heads}H")
+    print(f"  Backbone:     {args.backbone}")
+    if args.backbone == 'causal_conv':
+        print(f"    dilations:    {DILATIONS}")
+        print(f"    kernel_size:  {args.conv_kernel_size}")
+        print(f"    d_cls/d_fm:   {args.d_cls}/{args.d_fm}")
+        print(f"    λ_ortho:      {args.lambda_ortho}")
+    else:
+        print(f"  Transformer:  {args.transformer_layers}L × {args.heads}H")
     print(f"  Flow blocks:  {args.flow_blocks}")
     print(f"  λ_fm:         {args.lambda_fm}")
     print(f"  λ_phys:       {args.lambda_phys}")
@@ -523,6 +564,11 @@ def main():
     model = CFMDetector(
         in_channels=in_channels, window_size=window_size,
         d_model=args.d_model, num_classes=len(ALL_ATTACK_TYPES),
+        backbone_type=args.backbone,
+        dilations=DILATIONS,
+        conv_kernel_size=args.conv_kernel_size,
+        d_cls=args.d_cls,
+        d_fm=args.d_fm,
         num_transformer_layers=args.transformer_layers,
         num_heads=args.heads,
         dim_feedforward=DIM_FEEDFORWARD,
@@ -629,13 +675,19 @@ def main():
     config = {
         'in_channels': in_channels, 'window_size': window_size,
         'd_model': args.d_model, 'num_classes': len(ALL_ATTACK_TYPES),
+        'backbone_type': args.backbone,
+        'dilations': DILATIONS,
+        'conv_kernel_size': args.conv_kernel_size,
+        'd_cls': args.d_cls,
+        'd_fm': args.d_fm,
+        'lambda_ortho': args.lambda_ortho,
         'num_transformer_layers': args.transformer_layers,
         'num_heads': args.heads,
         'dim_feedforward': DIM_FEEDFORWARD,
         'num_flow_blocks': args.flow_blocks,
         'dim_feedforward_flow': DIM_FEEDFORWARD_FLOW,
         'dropout': args.dropout,
-        'model_type': 'cfm',
+        'model_type': 'cfm_v2',
     }
     np.savez(os.path.join(MODEL_DIR, 'cfm_cls_config.npz'),
              **{k: np.array(v) if isinstance(v, list) else v
