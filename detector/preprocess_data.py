@@ -7,7 +7,7 @@ preprocess_data.py — 密集滑动窗口 + 归一化 + .npy 缓存
   - 窗口大小: 100 步 (5 秒 @ Ts=0.05)
   - 步长 stride=1: 密集采样最大化样本量
   - RobustScaler + 物理归一化: 特征通道用 (x−median)/IQR, u_cmd 用物理上限
-  - 输入通道: ekf_innovation(3) + u_cmd(2) = 5 通道
+  - 输入通道: internal_innovation(3) + u_cmd(2) = 5 通道
   - 抗泄漏: 同一 .npz 文件的所有窗口始终整体进入同一划分
   - IID 分层划分: 按轨迹族分层抽样, 确保 train/val/test 同分布
 

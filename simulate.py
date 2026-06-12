@@ -28,7 +28,7 @@ plt.rcParams['font.sans-serif'] = ['Microsoft YaHei', 'SimHei']
 plt.rcParams['font.size'] = 10
 plt.rcParams['axes.unicode_minus'] = False
 
-from model import (WMRParams, WMRKinematics, EKFEstimator, SensorSimulator,
+from model import (WMRParams, WMRKinematics, SensorSimulator,
                    LissajousTrajectory, CircularTrajectory, SIM_STEPS)
 from controller import NMPCController, NMPCParams
 from attack import SensorAttack, AttackConfig
@@ -109,7 +109,7 @@ def run_simulation(attack_type: str = 'A4',
 
     Args:
         attack_type:     攻击类型 'A0'~'A8' (A0=无攻击)
-        use_detector:    True=CFMDetectorBackend, False=y_meas 直接入 EKF
+        use_detector:    True=CFMDetectorBackend, False=y_meas 直送 NMPC
         trajectory_type: 轨迹类型 lissajous/circular/spiral/random_waypoint/square
         seed:            随机种子
         attack_onset:    攻击起始时间 [s] (None=随机[5,30]s, A0=永不攻击)
@@ -136,7 +136,6 @@ def run_simulation(attack_type: str = 'A4',
 
     robot = WMRKinematics(wmr_params)
     sensor = SensorSimulator()
-    ekf = EKFEstimator(wmr_params)
     ctrl = NMPCController(NMPCParams())
     ctrl.load_or_build()
 
@@ -151,7 +150,6 @@ def run_simulation(attack_type: str = 'A4',
     # ---- 重置 ----
     traj.reset()
     robot.reset()
-    ekf.reset()
     ctrl.reset()
     attacker.reset()
     if detector is not None:
@@ -178,49 +176,44 @@ def run_simulation(attack_type: str = 'A4',
 
         # 3. 检测器处理
         if detector is None:
-            y_ekf = y_meas.copy()
+            y_rec = y_meas.copy()
             det_class = 'A0'
             det_conf = 0.0
             det_attack_est = np.zeros(3)
         else:
             result = detector.detect(y_meas)
-            y_ekf = result.y_recovered
+            y_rec = result.y_recovered
             det_class = result.attack_class
             det_conf = result.confidence
             det_attack_est = result.attack_estimate
 
-        # 4. EKF 状态估计
-        Upsilon_hat, ekf_innovation = ekf.step(y_ekf, u_cmd)
+        # 4. 状态估计 = 恢复后的测量 (替代 EKF)
+        # y_rec 直接作为位姿估计，送入 NMPC
 
-        # 5. 通知检测器 EKF 状态
-        if detector is not None:
-            detector.set_ekf_state(Upsilon_hat)
+        # 5. 跟踪误差
+        X_error = WMRKinematics.compute_error(Upsilon_r, y_rec)
 
-        # 6. 跟踪误差
-        X_error = WMRKinematics.compute_error(Upsilon_r, Upsilon_hat)
-
-        # 7. NMPC 控制
+        # 6. NMPC 控制
         u_cmd = ctrl.solve(X_error, Ur_seq)
 
-        # 8. 通知检测器控制指令
+        # 7. 通知检测器控制指令
         if detector is not None:
             detector.set_control(u_cmd)
 
-        # 9. 限幅
+        # 8. 限幅
         u_a = WMRKinematics.clamp_control(u_cmd)
 
-        # 10. 机器人状态更新
+        # 9. 机器人状态更新
         robot.step(u_a)
 
-        # 11. 记录
+        # 10. 记录
         data['t'].append(t)
         data['Upsilon_r'].append(Upsilon_r.copy())
         data['true_state'].append(true_state.copy())
         data['y_meas'].append(y_meas.copy())
-        data['y_ekf'].append(y_ekf.copy())
+        data['y_rec'].append(y_rec.copy())
         data['attack_signal'].append(attack_signal.copy())
-        data['Upsilon_hat'].append(Upsilon_hat.copy())
-        data['ekf_innovation'].append(ekf_innovation.copy())
+        data['Upsilon_hat'].append(y_rec.copy())
         data['X_error'].append(X_error.copy())
         data['u_cmd'].append(u_cmd.copy())
         data['u_a'].append(u_a.copy())
@@ -316,9 +309,9 @@ def compute_detector_metrics(data: dict) -> dict:
     else:
         far = 0.0
 
-    y_ekf_arr = data['y_ekf'][onset_idx:]
+    y_rec_arr = data['y_rec'][onset_idx:]
     true_arr = data['true_state'][onset_idx:]
-    recovery_rmse = float(np.sqrt(np.mean(np.sum((y_ekf_arr - true_arr) ** 2, axis=1))))
+    recovery_rmse = float(np.sqrt(np.mean(np.sum((y_rec_arr - true_arr) ** 2, axis=1))))
 
     return {
         'detection_accuracy': accuracy,
@@ -353,7 +346,7 @@ def plot_results(data: dict, save_path: str = None):
     ax.plot(ref[:, 0], ref[:, 1], 'k--', linewidth=1.5, alpha=0.5, label='Reference')
     Upsilon_hat = data['Upsilon_hat']
     ax.plot(Upsilon_hat[:, 0], Upsilon_hat[:, 1], '#9467bd', linewidth=1.2, alpha=0.8,
-            label=f'EKF Estimate ({det_label})')
+            label=f'State Estimate ({det_label})')
     ax.scatter(ref[onset_idx, 0], ref[onset_idx, 1],
                c='red', s=80, marker='x', zorder=5, linewidths=2, label='Attack Onset')
     ax.set_xlabel('X [m]'); ax.set_ylabel('Y [m]')
@@ -375,13 +368,14 @@ def plot_results(data: dict, save_path: str = None):
     ax.set_title(r'Tracking Error $\|e_{xy}\|$')
     ax.legend(fontsize=7); ax.grid(True, alpha=0.3)
 
-    # Panel 3: EKF 新息
+    # Panel 3: 检测器攻击估计
     ax = axes[1, 0]
-    ekf_norm = np.linalg.norm(data['ekf_innovation'], axis=1)
-    ax.plot(t, ekf_norm, '#9467bd', linewidth=1.0, alpha=0.8)
+    atk_norm = np.linalg.norm(data['det_attack_est'], axis=1)
+    ax.plot(t, atk_norm, '#d62728', linewidth=1.0, alpha=0.8)
     ax.axvline(x=attack_onset_time, color='red', linestyle='--', linewidth=1.5, alpha=0.7)
-    ax.set_xlabel('Time [s]'); ax.set_ylabel('Innovation Norm')
-    ax.set_title('EKF Innovation')
+    ax.axhline(y=0.01, color='gray', linestyle=':', alpha=0.5)
+    ax.set_xlabel('Time [s]'); ax.set_ylabel('||Attack Est.||')
+    ax.set_title('Detected Attack Signal')
     ax.grid(True, alpha=0.3)
 
     # Panel 4: 检测器输出
@@ -469,8 +463,8 @@ def plot_summary(all_metrics: list):
 # 五族轨迹无攻击对比 (保留自旧 simulate.py)
 # ============================================================================
 
-def run_single_track(traj, robot, sensor, ekf, ctrl, nmpc_params, Ts, n_steps):
-    """用给定的轨迹生成器执行一次无攻击闭环仿真"""
+def run_single_track(traj, robot, sensor, ctrl, nmpc_params, Ts, n_steps):
+    """用给定的轨迹生成器执行一次无攻击闭环仿真。y_meas 直接作为位姿估计送入 NMPC。"""
     data = defaultdict(list)
     u_cmd = np.zeros(2)
 
@@ -481,8 +475,7 @@ def run_single_track(traj, robot, sensor, ekf, ctrl, nmpc_params, Ts, n_steps):
 
         true_state = robot.state.copy()
         y_meas = sensor.measure(true_state)
-        Upsilon_hat, ekf_innovation = ekf.step(y_meas, u_cmd)
-        X_error = WMRKinematics.compute_error(Upsilon_r, Upsilon_hat)
+        X_error = WMRKinematics.compute_error(Upsilon_r, y_meas)
         u_cmd = ctrl.solve(X_error, Ur_seq)
         u_a = WMRKinematics.clamp_control(u_cmd)
         robot.step(u_a)
@@ -490,7 +483,7 @@ def run_single_track(traj, robot, sensor, ekf, ctrl, nmpc_params, Ts, n_steps):
         data['t'].append(t)
         data['Upsilon_r'].append(Upsilon_r.copy())
         data['true_state'].append(true_state.copy())
-        data['Upsilon_hat'].append(Upsilon_hat.copy())
+        data['Upsilon_hat'].append(y_meas.copy())
         data['X_error'].append(X_error.copy())
         data['u_cmd'].append(u_cmd.copy())
 
@@ -530,16 +523,15 @@ def plot_all_trajectories():
     for idx, (name, color, factory) in enumerate(TRAJ_CONFIGS):
         robot = WMRKinematics(wmr_params)
         sensor = SensorSimulator()
-        ekf = EKFEstimator(wmr_params)
         ctrl = NMPCController(nmpc_params)
         ctrl.load_or_build()
         traj = factory()
 
-        traj.reset(); robot.reset(); ekf.reset(); ctrl.reset()
+        traj.reset(); robot.reset(); ctrl.reset()
         np.random.seed(42)
 
         print(f"[{idx+1}/5] 仿真 {name} ...", end='', flush=True)
-        data = run_single_track(traj, robot, sensor, ekf, ctrl, nmpc_params, Ts, n_steps)
+        data = run_single_track(traj, robot, sensor, ctrl, nmpc_params, Ts, n_steps)
 
         Ur = data['Upsilon_r']
         TrueState = data['true_state']
@@ -671,7 +663,7 @@ def main():
     parser.add_argument('--all', action='store_true',
                         help='Run all 9 attack types')
     parser.add_argument('--no-detector', action='store_true',
-                        help='Disable CFM detector (direct y_meas to EKF)')
+                        help='Disable CFM detector (direct y_meas to NMPC)')
     parser.add_argument('--trajectory', type=str, default='lissajous',
                         choices=TRAJECTORY_FAMILIES,
                         help='Reference trajectory type (default: lissajous)')

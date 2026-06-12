@@ -1,5 +1,5 @@
-"""
-model.py -- WMR Kinematic Model, Reference Trajectories, EKF Estimator
+﻿"""
+model.py -- WMR Kinematic Model, Reference Trajectories, Sensor Simulator
 ==========================================================================
 基于两轮差速轮式移动机器人(WMR)前端位姿(head posture)运动学。
 物理参数来源：TurtleBot4 安全模式
@@ -405,142 +405,19 @@ class WMRKinematics:
 
 
 # ============================================================================
-# 4. 扩展卡尔曼滤波器 (EKF)
+# 4. 传感器模拟器
 # ============================================================================
 
-class EKFEstimator:
-    """扩展卡尔曼滤波器用于状态估计
-
-    参考：配置文档 Section 2.7 (Sensor 子系统)
-
-    预测步使用 u_cmd (控制器发出指令)，而非 u_a (实际执行指令)。
-    这在受攻击时产生新息，是DR-Net检测的关键特征来源。
-
-    参数 (低噪声设置)：
-      Q = diag([5e-4, 5e-4, 5e-4])  : 过程噪声协方差
-      R = diag([0.008,0.008,0.002])  : 量测噪声协方差 (≈ 传感器噪声方差)
-    """
-
-    def __init__(self, params: WMRParams):
-        self.p = params
-        # 协方差矩阵 (信任模型 > 信任传感器)
-        # 小 Q → 模型预测可靠，EKF 更依赖预测而非测量
-        # 大 R → 传感器噪声大，卡尔曼增益小，滤波更平滑
-        # 低噪声设置：传感器噪声降低后，R 相应减小
-        self.Q = np.diag([5e-4, 5e-4, 5e-4])
-        self.R = np.diag([0.008, 0.008, 0.002])
-        self.H = np.eye(3)  # 直接测量全状态
-        self.X_hat = None   # 估计状态
-        self.P = None       # 误差协方差
-        self._kinematics = WMRKinematics(params)  # 用于雅可比计算
-
-    def reset(self, init_guess: np.ndarray = None):
-        """初始化/重置 EKF
-        
-        Args:
-            init_guess: 初始位姿猜测，默认 [0, 0.1, 0]
-        """
-        if init_guess is None:
-            self.X_hat = np.array([0.0, 0.1, 0.0])
-        else:
-            self.X_hat = init_guess.copy()
-        self.P = np.eye(3) * 0.1
-
-    def predict(self, u_cmd: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
-        """EKF 预测步 (论文 Eq.17-18)
-        
-        使用控制器下发的合法指令 u_cmd 进行预测。
-        若执行器被攻击，实际 u_a != u_cmd，预测将偏离真实值。
-        
-        Args:
-            u_cmd: 控制器发出的指令 [v, w]
-            
-        Returns:
-            X_pred: 先验状态估计
-            P_pred: 先验协方差
-        """
-        theta = self.X_hat[2]
-        Fh = self._kinematics.input_matrix(theta)
-        X_pred = self.X_hat + self.p.Ts * (Fh @ u_cmd)
-
-        # 状态转移雅可比 J (配置文档 Section 2.7)
-        v, w = u_cmd
-        J = np.array([
-            [1.0, 0.0, self.p.Ts * (-v * np.sin(theta)
-                                     - w * self.p.alpha * np.cos(theta))],
-            [0.0, 1.0, self.p.Ts * ( v * np.cos(theta)
-                                     - w * self.p.alpha * np.sin(theta))],
-            [0.0, 0.0, 1.0]
-        ])
-        P_pred = J @ self.P @ J.T + self.Q
-
-        return X_pred, P_pred
-
-    def update(self, y_meas: np.ndarray, X_pred: np.ndarray,
-               P_pred: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
-        """EKF 更新步 (论文 Eq.19-21)
-        
-        Args:
-            y_meas:  传感器含噪测量值 [x, y, theta]
-            X_pred:  先验状态估计
-            P_pred:  先验协方差
-            
-        Returns:
-            X_post:   后验状态估计 (即输出 Upsilon_hat)
-            residual: 新息 r = y_meas - H·X_pred (可用于攻击检测)
-        """
-        # 卡尔曼增益 (solve 比 inv 更数值稳定)
-        S = self.H @ P_pred @ self.H.T + self.R
-        K = P_pred @ self.H.T @ np.linalg.inv(S)
-
-        # 新息
-        innovation = y_meas - self.H @ X_pred
-        innovation[2] = np.arctan2(np.sin(innovation[2]),
-                                   np.cos(innovation[2]))
-
-        # 后验更新 (Joseph形式协方差更新，保证对称半正定)
-        self.X_hat = X_pred + K @ innovation
-        I_KH = np.eye(3) - K @ self.H
-        self.P = I_KH @ P_pred @ I_KH.T + K @ self.R @ K.T
-        self.P = 0.5 * (self.P + self.P.T)  # 强制对称性
-        # 角度归一化
-        self.X_hat[2] = np.arctan2(np.sin(self.X_hat[2]),
-                                    np.cos(self.X_hat[2]))
-
-        return self.X_hat.copy(), innovation.copy()
-
-    def step(self, y_meas: np.ndarray,
-             u_cmd: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
-        """完整的 EKF 预测-更新循环
-        
-        Args:
-            y_meas: 传感器含噪测量值
-            u_cmd:  控制器下发的合法指令
-            
-        Returns:
-            X_hat (Upsilon_hat): 估计状态
-            residual:            新息 (DR-Net 关键输入特征)
-        """
-        X_pred, P_pred = self.predict(u_cmd)
-        X_hat, residual = self.update(y_meas, X_pred, P_pred)
-        return X_hat, residual
-
-
-# ============================================================================
-# 5. 传感器模拟器
-# ============================================================================
 
 class SensorSimulator:
-    """传感器模拟器：在真实状态上叠加高斯噪声
+    """传感器模拟器：在真实状态上叠加高斯噪声（可选）
 
-    噪声参数 (降低后的低噪声设置):
-      sigma_x = sigma_y = 0.008 m
-      sigma_theta = 0.004 rad
+    噪声参数: 默认关闭 (无噪声)，可通过 noise_std 显式开启。
     """
 
     def __init__(self, noise_std: np.ndarray = None):
         if noise_std is None:
-            self.noise_std = np.array([0.008, 0.008, 0.004])
+            self.noise_std = np.array([0.0, 0.0, 0.0])
         else:
             self.noise_std = noise_std
 
@@ -674,7 +551,6 @@ if __name__ == "__main__":
         params = WMRParams()
         traj = ReferenceTrajectory(Ts=params.Ts)
         robot = WMRKinematics(params)
-        ekf = EKFEstimator(params)
         sensor = SensorSimulator()
 
         robot.reset()
@@ -687,11 +563,9 @@ if __name__ == "__main__":
         Ur, ur = traj.step(1.0)
         print(f"t=1.0s 参考位姿: {Ur}, 指令: {ur}")
 
-        ekf.reset()
         true_state = robot.state
         y_meas = sensor.measure(true_state)
-        X_hat, res = ekf.step(y_meas, u)
-        print(f"EKF估计: {X_hat}, 新息: {res}")
+        print(f"传感器测量: {y_meas}")
 
         X_err = WMRKinematics.compute_error(Ur, robot.state)
         print(f"跟踪误差: {X_err}")

@@ -437,7 +437,7 @@ def plot_trajectory_comparison(npz_data: dict, attack_type: str, save_path: str)
     # ---- 面板 1: 2D 轨迹 ----
     ax1.plot(Upsilon_r[:n, 0], Upsilon_r[:n, 1], 'k--', lw=1.0, alpha=0.6, label='Reference')
     ax1.plot(Upsilon_hat[:n, 0], Upsilon_hat[:n, 1], '#2ca02c', lw=1.2, alpha=0.8,
-             label='EKF Estimate')
+             label='State Estimate')
     ax1.plot(true_state[:n, 0], true_state[:n, 1], '#1f77b4', lw=0.8, alpha=0.7,
              label='True State')
     # 攻击起始标记
@@ -720,46 +720,17 @@ def run_validation_eval(model_path: str, norm_path: str, data_dir: str,
     if os.path.exists(config_path):
         cfg = dict(np.load(config_path, allow_pickle=True))
 
-    # 检测模型版本, 兼容 v1/v2
-    model_type = str(cfg.get('model_type', 'cfm'))
-    d_model_cfg = int(cfg.get('d_model', 128))
-    if model_type == 'cfm':
-        # v1 旧模型: Transformer 骨干, 无正交分裂器
-        model = CFMDetector(
-            in_channels=int(cfg.get('in_channels', 5)),
-            window_size=int(cfg.get('window_size', 100)),
-            d_model=d_model_cfg,
-            num_classes=int(cfg.get('num_classes', 9)),
-            backbone_type='transformer',
-            d_cls=d_model_cfg, d_fm=d_model_cfg,
-            num_transformer_layers=int(cfg.get('num_transformer_layers', 4)),
-            num_heads=int(cfg.get('num_heads', 8)),
-            dim_feedforward=int(cfg.get('dim_feedforward', 512)),
-            num_flow_blocks=int(cfg.get('num_flow_blocks', 4)),
-            dropout=float(cfg.get('dropout', 0.1)),
-        ).to(device)
-    else:
-        # v2 新模型: 从配置读取
-        backbone_type = str(cfg.get('backbone_type', 'causal_conv'))
-        dilations_raw = cfg.get('dilations', None)
-        dilations = list(dilations_raw) if dilations_raw is not None else None
-        model = CFMDetector(
-            in_channels=int(cfg.get('in_channels', 5)),
-            window_size=int(cfg.get('window_size', 100)),
-            d_model=d_model_cfg,
-            num_classes=int(cfg.get('num_classes', 9)),
-            backbone_type=backbone_type,
-            dilations=dilations,
-            conv_kernel_size=int(cfg.get('conv_kernel_size', 3)),
-            d_cls=int(cfg.get('d_cls', 64)),
-            d_fm=int(cfg.get('d_fm', 64)),
-            num_transformer_layers=int(cfg.get('num_transformer_layers', 4)),
-            num_heads=int(cfg.get('num_heads', 8)),
-            dim_feedforward=int(cfg.get('dim_feedforward', 512)),
-            num_flow_blocks=int(cfg.get('num_flow_blocks', 4)),
-            dim_feedforward_flow=int(cfg.get('dim_feedforward_flow', 192)),
-            dropout=float(cfg.get('dropout', 0.1)),
-        ).to(device)
+    model = CFMDetector(
+        in_channels=int(cfg.get('in_channels', 5)),
+        window_size=int(cfg.get('window_size', 100)),
+        d_model=int(cfg.get('d_model', 128)),
+        num_classes=int(cfg.get('num_classes', 9)),
+        num_transformer_layers=int(cfg.get('num_transformer_layers', 4)),
+        num_heads=int(cfg.get('num_heads', 8)),
+        dim_feedforward=int(cfg.get('dim_feedforward', 512)),
+        num_flow_blocks=int(cfg.get('num_flow_blocks', 4)),
+        dropout=float(cfg.get('dropout', 0.1)),
+    ).to(device)
     state = torch.load(model_path, map_location=device, weights_only=True)
     model.load_state_dict(state, strict=False)
     model.eval()

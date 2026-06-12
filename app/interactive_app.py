@@ -48,7 +48,7 @@ import tkinter as tk
 from tkinter import ttk, messagebox
 
 # ---- 项目模块 ----
-from model import (WMRParams, WMRKinematics, EKFEstimator, SensorSimulator,
+from model import (WMRParams, WMRKinematics, SensorSimulator,
                    SIM_TIME, SIM_STEPS)
 from controller import NMPCController, NMPCParams
 from attack import SensorAttack, AttackConfig
@@ -197,7 +197,6 @@ class SimulationWorker(threading.Thread):
         wmr_params = WMRParams()
         robot = WMRKinematics(wmr_params)
         sensor = SensorSimulator()
-        ekf = EKFEstimator(wmr_params)
         ctrl = NMPCController(NMPCParams())
         ctrl.load_or_build()
 
@@ -215,7 +214,6 @@ class SimulationWorker(threading.Thread):
             traj._theta_r + perturb_rng.uniform(-0.2, 0.2),
         ])
         robot.reset(init_state)
-        ekf.reset(init_state)
         ctrl.reset()
         attacker.reset()
         np.random.seed(self._traj_seed)
@@ -247,7 +245,6 @@ class SimulationWorker(threading.Thread):
             'Upsilon_r': np.zeros((n_steps, 3), dtype=np.float32),
             'u_r': np.zeros((n_steps, 2), dtype=np.float32),
             'Upsilon_hat': np.zeros((n_steps, 3), dtype=np.float32),
-            'ekf_innovation': np.zeros((n_steps, 3), dtype=np.float32),
             'X_error': np.zeros((n_steps, 3), dtype=np.float32),
             'u_cmd': np.zeros((n_steps, 2), dtype=np.float32),
             'u_a': np.zeros((n_steps, 2), dtype=np.float32),
@@ -280,36 +277,33 @@ class SimulationWorker(threading.Thread):
 
             # 3. 内部运动学新息
             X_pred_internal = _internal_kinematic_step(internal_state, u_cmd)
-            internal_state = X_pred_internal.copy()
+            internal_state = y_meas.copy()  # 锚定到当前测量
 
             # ---- 检测器 ----
             if detector is None:
-                y_ekf = y_meas.copy()
+                y_rec = y_meas.copy()
                 det_class = 'A0'
                 det_conf = 0.0
                 det_attack_est = np.zeros(3)
             else:
                 detector.set_control(u_cmd)
                 result = detector.detect(y_meas)
-                y_ekf = result.y_recovered.copy()
+                y_rec = result.y_recovered.copy()
                 det_class = result.attack_class
                 det_conf = result.confidence
                 det_attack_est = result.attack_estimate.copy()
+                # 重校准: 锚定内部运动学状态到恢复测量
+                internal_state = y_rec.copy()
 
-            # 4. EKF
-            Upsilon_hat, ekf_innovation = ekf.step(y_ekf, u_cmd)
-
-            # 回传 EKF 状态给检测器
-            if detector is not None:
-                detector.set_ekf_state(Upsilon_hat)
+            # 4. 状态估计 = 恢复后的测量
 
             # 4.5 周期性重校准
             if t < self._attack_onset and step - _last_recalib_step >= _recalib_interval:
-                internal_state = Upsilon_hat.copy()
+                internal_state = y_rec.copy()
                 _last_recalib_step = step
 
             # 5. 跟踪误差
-            X_error = WMRKinematics.compute_error(Upsilon_r, Upsilon_hat)
+            X_error = WMRKinematics.compute_error(Upsilon_r, y_rec)
 
             # 6. NMPC 控制
             u_cmd = ctrl.solve(X_error, Ur_seq)
@@ -322,13 +316,12 @@ class SimulationWorker(threading.Thread):
             data['t'][step] = t
             data['true_state'][step] = true_state
             data['y_meas'][step] = y_meas
-            data['y_rec'][step] = y_ekf
+            data['y_rec'][step] = y_rec
             data['attack_signal'][step] = attack_signal
             data['sensor_noise'][step] = noise
             data['Upsilon_r'][step] = Upsilon_r
             data['u_r'][step] = u_r
-            data['Upsilon_hat'][step] = Upsilon_hat
-            data['ekf_innovation'][step] = ekf_innovation
+            data['Upsilon_hat'][step] = y_rec
             data['X_error'][step] = X_error
             data['u_cmd'][step] = u_cmd
             data['u_a'][step] = u_a
@@ -783,7 +776,7 @@ class InteractiveApp(tk.Tk):
             'trajectory': self._fig.add_subplot(gs[0, 0]),    # 2D 轨迹
             'tracking_error': self._fig.add_subplot(gs[0, 1]), # 跟踪误差
             'control': self._fig.add_subplot(gs[1, 0]),        # 控制指令
-            'innovation': self._fig.add_subplot(gs[1, 1]),     # EKF 新息
+            'innovation': self._fig.add_subplot(gs[1, 1]),     # 恢复信号 vs 测量
             'attack': self._fig.add_subplot(gs[2, 0]),         # 攻击信号
             'measurement': self._fig.add_subplot(gs[2, 1]),    # 测量 vs 真值 vs 估计
         }
@@ -1115,13 +1108,12 @@ class InteractiveApp(tk.Tk):
         ax.axhline(-1.76, color='red', lw=0.5, ls='--', alpha=0.4)
         ax.legend(loc='upper right', fontsize=7)
 
-        # ---- (1,1) EKF 新息 ----
-        ax = setup_time_axis(self._axes['innovation'], 'EKF Innovation',
-                             'Innovation [m], [rad]')
-        ax.plot(t_arr, data['ekf_innovation'][:, 0], 'r-', lw=0.8, alpha=0.8, label='res_x')
-        ax.plot(t_arr, data['ekf_innovation'][:, 1], 'g-', lw=0.8, alpha=0.8, label='res_y')
-        ax.plot(t_arr, data['ekf_innovation'][:, 2], 'b-', lw=0.8, alpha=0.8, label='res_θ')
-        ax.axhline(0, color='gray', lw=0.5, ls='--')
+        # ---- (1,1) 检测器攻击估计 ----
+        ax = setup_time_axis(self._axes['innovation'], 'Detected Attack',
+                             '||Attack Est.|| [m]')
+        det_a_norm_2 = np.linalg.norm(data['det_attack_est'], axis=1)
+        ax.plot(t_arr, det_a_norm_2, '#d62728', lw=1.2, alpha=0.9, label='||â_det||')
+        ax.axhline(0.01, color='gray', lw=0.5, ls='--', alpha=0.5)
         ax.legend(loc='upper right', fontsize=7)
 
         # ---- (2,0) 攻击信号 ----
@@ -1147,7 +1139,7 @@ class InteractiveApp(tk.Tk):
                              f'{ch_names[ch]} [m/rad]')
         ax.plot(t_arr, data['true_state'][:, ch], 'k-', lw=1.0, label='True')
         ax.plot(t_arr, data['y_meas'][:, ch], 'r-', lw=0.8, alpha=0.7, label='Measured')
-        ax.plot(t_arr, data['Upsilon_hat'][:, ch], 'b--', lw=1.0, alpha=0.8, label='EKF Est.')
+        ax.plot(t_arr, data['Upsilon_hat'][:, ch], 'b--', lw=1.0, alpha=0.8, label='State Est.')
         ax.legend(loc='upper right', fontsize=7)
 
         self._fig.tight_layout()
@@ -1178,7 +1170,7 @@ class InteractiveApp(tk.Tk):
 
         ax.plot(t_arr, data['true_state'][:, ch], 'k-', lw=1.0, label='True')
         ax.plot(t_arr, data['y_meas'][:, ch], 'r-', lw=0.8, alpha=0.7, label='Measured')
-        ax.plot(t_arr, data['Upsilon_hat'][:, ch], 'b--', lw=1.0, alpha=0.8, label='EKF Est.')
+        ax.plot(t_arr, data['Upsilon_hat'][:, ch], 'b--', lw=1.0, alpha=0.8, label='State Est.')
         ax.legend(loc='upper right', fontsize=7)
 
         # 重建游标线

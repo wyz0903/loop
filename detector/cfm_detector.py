@@ -16,9 +16,9 @@ detector/cfm_detector.py — PINN-Flow: 物理信息流匹配攻击检测器
           → ODE Solver (Euler 10步) → â (B,100,3)
 
 物理正则化 (PINN):
-  L_phys = max(0, mean(||r_phys||²) − κ·Tr(R))
+  L_phys = max(0, mean(||r_phys||²) − κ·Tr(R_sensor))
   r_phys[k] = y_rec[k+1] − kinematic_step(y_rec[k], u_cmd[k])
-  Tr(R) = 0.018 (measurement noise covariance trace)
+  Tr(R_sensor) = 0 (传感器噪声已关闭)
 
 正交正则化:
   L_ortho = ||W_cls @ W_fm^T||_F^2  (分类/流匹配子空间正交约束)
@@ -67,7 +67,7 @@ DILATIONS = [1, 2, 4, 8, 16, 32]  # 膨胀因子序列 (RF=253)
 CONV_KERNEL_SIZE = 3               # 因果卷积核大小
 
 # 噪声统计 (用于 PINN 损失)
-TRACE_R = 0.018    # Tr(diag([0.008, 0.008, 0.002])) —— 测量噪声协方差迹
+TRACE_R = 0.0  # 传感器噪声已关闭，Tr(R_sensor) = 0
 
 
 # ============================================================================

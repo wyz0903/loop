@@ -4,7 +4,7 @@
 
 ## 项目概要
 
-这是一个用于**轮式移动机器人（WMR）传感器攻击检测与恢复**的研究仿真系统。一个类似TurtleBot4的差速驱动机器人在NMPC控制下跟踪参考轨迹，同时其传感器测量数据可能在随机时刻受到攻击。一个基于条件流匹配（Conditional Flow Matching）的检测器（CFMDetector）用于分类攻击类型并恢复干净信号——且无需修改EKF或NMPC。本项目为一个科研项目，目标是在IEEE TIE上发表论文。
+这是一个用于**轮式移动机器人（WMR）传感器攻击检测与恢复**的研究仿真系统。一个类似TurtleBot4的差速驱动机器人在NMPC控制下跟踪参考轨迹，同时其传感器测量数据可能在随机时刻受到攻击。一个基于条件流匹配（Conditional Flow Matching）的检测器（CFMDetector）用于分类攻击类型并恢复干净信号——恢复信号直接作为位姿估计送入NMPC。本项目为一个科研项目，目标是在IEEE TIE上发表论文。
 
 ## 工作习惯
 
@@ -37,7 +37,7 @@ python simulate.py --attack A0        # 无攻击正常运行
 python simulate.py --compare          # 五族轨迹无攻击跟踪对比图
 python simulate.py --all              # 批量所有9种攻击
 python attack.py                      # 打印攻击类型目录 + 攻击模块自检
-python model.py                       # 运行运动学 / EKF 模块自检
+python model.py                       # 运行运动学 / 传感器模块自检
 ```
 
 ## 模型架构
@@ -56,7 +56,7 @@ ReferenceTrajectory(参考轨迹) → NMPC → u_cmd → WMRKinematics(RK4运动
                                  ODE采样: 噪声 z_0 → 逐步积分 → â(k)
                                  信号恢复: y_rec = y_meas − â(k)
                                         ↓
-                               EKF.predict(u_cmd) → update(y_rec) → X_hat(状态估计)
+                               y_rec → 直接作为位姿估计 (替代 EKF)
                                         ↓
                                compute_error(Upsilon_r, X_hat) → X_error(误差状态)
                                         ↓
@@ -67,7 +67,7 @@ ReferenceTrajectory(参考轨迹) → NMPC → u_cmd → WMRKinematics(RK4运动
 
 | 文件 | 作用 |
 | ---------------------- | ------------------------------------------------------------ |
-| `model.py` | WMR 运动学 (RK4)，EKF 估计器，李萨如 (Lissajous)/圆形 (Circular) 轨迹生成器，传感器模拟器 |
+| `model.py` | WMR 运动学 (RK4)，李萨如 (Lissajous)/圆形 (Circular) 轨迹生成器，传感器模拟器 |
 | `controller/controller.py` | CasADi Opti NMPC：误差动力学 RK4 预测，菱形约束，控制增量代价函数，IPOPT 求解器 |
 | `attack.py` | 8 种传感器攻击类型 (A1–A8) + 正常情况 (A0)；统一的 `inject()` 注入接口 |
 | `simulate.py` | 统一闭环仿真：CFM检测器 / 无检测器基线 / 五族轨迹对比 |
@@ -122,4 +122,4 @@ ReferenceTrajectory(参考轨迹) → NMPC → u_cmd → WMRKinematics(RK4运动
 - `v_max = 0.3 m/s`, `ω_max = 1.76 rad/s`
 - `Ts = 0.05 s` (20 Hz 控制频率), `T_sim = 35 s` (700 步)
 - 空间安全边界：`±2.5 m` (x, y 位置硬限幅)
-- 传感器噪声（低噪声设置）：`σ_xy = 0.008 m`, `σ_θ = 0.004 rad`
+- 传感器噪声：`σ_xy = 0.0 m`, `σ_θ = 0.0 rad`（关闭，简化问题）

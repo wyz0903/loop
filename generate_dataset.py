@@ -5,7 +5,7 @@ generate_dataset.py — 多样化轨迹攻击数据集生成器
 
 关键设计：
   1. 随机化参考轨迹参数 — 确保模型泛化性（不再是固定 8 字形）
-  2. 记录详尽信号 — EKF 新息、控制指令、测量值、攻击真值等
+  2. 记录详尽信号 — 内部运动学新息、控制指令、测量值、攻击真值等
   3. 静态分布 — 不引入检测器反馈，仅记录开环观测数据
   4. 输出格式 — 每轮仿真一个 .npz 文件 + 全局 metadata.csv 索引
 
@@ -34,7 +34,7 @@ import pandas as pd
 from collections import defaultdict
 from typing import Tuple, Optional
 
-from model import (WMRParams, WMRKinematics, EKFEstimator, SensorSimulator,
+from model import (WMRParams, WMRKinematics, SensorSimulator,
                    LissajousTrajectory, CircularTrajectory, SIM_STEPS)
 from controller import NMPCController, NMPCParams
 from attack import SensorAttack, AttackConfig
@@ -458,7 +458,6 @@ def run_single_simulation(traj: RandomizedTrajectory,
 
     robot = WMRKinematics(wmr_params)
     sensor = SensorSimulator()
-    ekf = EKFEstimator(wmr_params)
     ctrl = NMPCController(NMPCParams())
     ctrl.load_or_build()
 
@@ -468,7 +467,7 @@ def run_single_simulation(traj: RandomizedTrajectory,
 
     # ---- 重置 ----
     traj.reset()
-    # 机器人与 EKF 从轨迹起点附近随机初始化 (测试 NMPC 收敛性)
+    # 机器人从轨迹起点附近随机初始化 (测试 NMPC 收敛性)
     perturb_rng = np.random.RandomState(seed)
     init_state = np.array([
         traj._x_r + perturb_rng.uniform(-0.3, 0.3),
@@ -476,7 +475,6 @@ def run_single_simulation(traj: RandomizedTrajectory,
         traj._theta_r + perturb_rng.uniform(-0.2, 0.2),
     ])
     robot.reset(init_state)
-    ekf.reset(init_state)
     ctrl.reset()
     attacker.reset()
     np.random.seed(seed)
@@ -485,8 +483,8 @@ def run_single_simulation(traj: RandomizedTrajectory,
     data = defaultdict(list)
     u_cmd = np.zeros(2)
 
-    # 内部运动学预测起点 — 第一步用初始位姿 (匹配推理端 set_ekf_state per-step 锚定)
-    Upsilon_hat_prev = init_state.copy()
+    # 内部运动学预测起点 — 第一步用初始位姿 (匹配推理端上一帧恢复测量锚定)
+    y_meas_prev = init_state.copy()
 
     for step in range(n_steps):
         t = step * Ts
@@ -502,18 +500,15 @@ def run_single_simulation(traj: RandomizedTrajectory,
         y_meas = attacker.inject(t, y_clean)
         attack_signal = y_meas - y_clean  # 等效攻击信号 (重放攻击下非加性)
 
-        # 3. 内部运动学新息 (从上一帧 EKF 后验出发 — 匹配推理端 per-step 锚定)
-        X_pred_internal = _internal_kinematic_step(Upsilon_hat_prev, u_cmd)
+        # 3. 内部运动学新息 (锚定到上一帧测量)
+        X_pred_internal = _internal_kinematic_step(y_meas_prev, u_cmd)
         internal_innovation = y_meas - X_pred_internal
 
-        # 4. EKF 估计 (无检测器干预 — 静态分布)
-        Upsilon_hat, ekf_innovation = ekf.step(y_meas, u_cmd)
+        # 4. 锚定到当前测量 (供下一步运动学预测使用)
+        y_meas_prev = y_meas.copy()
 
-        # 4.5 保存 EKF 后验供下一步运动学预测 (匹配推理端 detector.set_ekf_state)
-        Upsilon_hat_prev = Upsilon_hat.copy()
-
-        # 5. 跟踪误差
-        X_error = WMRKinematics.compute_error(Upsilon_r, Upsilon_hat)
+        # 5. 跟踪误差 (测量直接作为位姿估计)
+        X_error = WMRKinematics.compute_error(Upsilon_r, y_meas)
 
         # 6. NMPC 控制
         u_cmd = ctrl.solve(X_error, Ur_seq)
@@ -530,8 +525,7 @@ def run_single_simulation(traj: RandomizedTrajectory,
         data['sensor_noise'].append(noise.copy())          # 传感器噪声 (3,)
         data['Upsilon_r'].append(Upsilon_r.copy())         # 参考位姿 (3,)
         data['u_r'].append(u_r.copy())                     # 参考指令 (2,)
-        data['Upsilon_hat'].append(Upsilon_hat.copy())     # EKF 估计 (3,)
-        data['ekf_innovation'].append(ekf_innovation.copy()) # EKF 新息 (3,)
+        data['Upsilon_hat'].append(y_meas.copy())             # 状态估计 = 测量 (3,)
         data['internal_innovation'].append(internal_innovation.copy())  # 内部运动学新息 (3,) ★
         data['X_error'].append(X_error.copy())             # 跟踪误差 (3,)
         data['u_cmd'].append(u_cmd.copy())                 # 控制指令 (2,)

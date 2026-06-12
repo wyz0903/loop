@@ -12,7 +12,6 @@ cfm_backend.py — CFMDetector 推理后端
   - DetectionResult — 检测结果数据结构
   - detect(y_meas) → DetectionResult
   - set_control(u_cmd)
-  - set_ekf_state(ekf_state)
   - reset()
 """
 
@@ -48,7 +47,7 @@ class DetectionResult:
     Attributes:
         attack_class:   攻击类别标签 'A0'~'A8'
         confidence:     分类置信度 [0, 1]
-        y_recovered:    恢复后的传感器信号 (3,) — 输入 EKF
+        y_recovered:    恢复后的传感器信号 (3,) — 用作位姿估计
         attack_estimate: 估计的攻击分量 (3,) — y_meas - y_recovered
         features:        附加信息字典
     """
@@ -167,8 +166,8 @@ class CFMDetectorBackend:
         self._innov_buffer.append(innovation)
         self._ucmd_buffer.append(self._u_cmd.copy())
 
-        # 3. 更新内部运动学状态
-        self._internal_state = X_pred.copy()
+        # 3. 更新内部运动学状态为当前测量 (锚定，供下一步 innovation 使用)
+        self._internal_state = y_meas.copy()
 
         # 4. 窗口未就绪 → 直通
         if not self._is_window_ready():
@@ -191,6 +190,9 @@ class CFMDetectorBackend:
         y_recovered, attack_estimate = self._recover(
             y_meas, attack_class, confidence, nn_attack_est, X_pred)
 
+        # 7. 锚定内部运动学状态到恢复测量 (供下一步 innovation 使用)
+        self._internal_state = y_recovered.copy()
+
         return DetectionResult(
             attack_class=attack_class,
             confidence=confidence,
@@ -203,14 +205,6 @@ class CFMDetectorBackend:
     def set_control(self, u_cmd: np.ndarray) -> None:
         """记录控制指令, 供内部运动学模型使用。"""
         self._u_cmd = np.asarray(u_cmd, dtype=float).ravel()
-
-    def set_ekf_state(self, ekf_state: np.ndarray) -> None:
-        """接收 EKF 后验估计 Upsilon_hat，锚定内部运动学状态。
-
-        EKF 接收的是检测器恢复后的信号 y_rec，其估计始终是全系统对真实位姿
-        的最优估计。每步锚定可彻底切断开环 Euler 积分的误差累积。
-        """
-        self._internal_state = np.asarray(ekf_state, dtype=float).ravel().copy()
 
     def reset(self) -> None:
         """重置所有内部状态。"""

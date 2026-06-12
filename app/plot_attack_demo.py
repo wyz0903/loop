@@ -15,7 +15,7 @@ from collections import defaultdict
 # 添加项目根目录到 Python 路径
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..'))
 
-from model import (WMRParams, WMRKinematics, EKFEstimator, SensorSimulator,
+from model import (WMRParams, WMRKinematics, SensorSimulator,
                    SIM_STEPS, SIM_TIME)
 from controller import NMPCController, NMPCParams
 from attack import SensorAttack, AttackConfig
@@ -38,14 +38,13 @@ def run_one(traj, attack_type, onset, duration, ctrl, sim_seed):
     wmr_params = WMRParams()
     robot = WMRKinematics(wmr_params)
     sensor = SensorSimulator()
-    ekf = EKFEstimator(wmr_params)
 
     atk_cfg = AttackConfig(attack_duration=duration)
     attacker = SensorAttack(attack_type=attack_type, onset_time=onset,
                             config=atk_cfg, seed=sim_seed)
 
     traj.reset()
-    # 机器人与 EKF 从轨迹起点附近随机初始化 (测试 NMPC 收敛性)
+    # 机器人从轨迹起点附近随机初始化 (测试 NMPC 收敛性)
     perturb_rng = np.random.RandomState(sim_seed)
     init_state = np.array([
         traj._x_r + perturb_rng.uniform(-0.3, 0.3),
@@ -53,7 +52,6 @@ def run_one(traj, attack_type, onset, duration, ctrl, sim_seed):
         traj._theta_r + perturb_rng.uniform(-0.2, 0.2),
     ])
     robot.reset(init_state)
-    ekf.reset(init_state)
     ctrl.reset()
     attacker.reset()
     np.random.seed(sim_seed)
@@ -75,9 +73,8 @@ def run_one(traj, attack_type, onset, duration, ctrl, sim_seed):
         y_meas = attacker.inject(t, y_clean)
         attack_signal = y_meas - y_clean
 
-        # EKF 估计 — NMPC 必须基于估计值而非真实值
-        Upsilon_hat, ekf_innovation = ekf.step(y_meas, u_cmd)
-        X_error = WMRKinematics.compute_error(Upsilon_r, Upsilon_hat)
+        # 测量直接作为位姿估计送入 NMPC
+        X_error = WMRKinematics.compute_error(Upsilon_r, y_meas)
         u_cmd = ctrl.solve(X_error, Ur_seq)
         u_a = WMRKinematics.clamp_control(u_cmd)
         robot.step(u_a)
