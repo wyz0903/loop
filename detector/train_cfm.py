@@ -67,32 +67,29 @@ class PreprocessedDataset(Dataset):
         self.X = np.load(os.path.join(data_dir, f'X_{split}.npy'), mmap_mode='r')
         self.cls_labels = np.load(os.path.join(data_dir, f'Y_{split}_cls.npy'), mmap_mode='r')
 
-        # A0 降采样
-        self._active_indices = np.arange(len(self.cls_labels))
+        # A0 降采样: 每 epoch 调用 resample_a0() 重新随机
+        self._all_indices = np.arange(len(self.cls_labels))
+        self._downsample_rate = downsample_a0
+        self._active_indices = self._all_indices.copy()
         if downsample_a0 > 0 and split == 'train':
-            a0_idx = np.where(self.cls_labels == 0)[0]
-            n_keep = int(len(a0_idx) * (1.0 - downsample_a0))
-            if n_keep < len(a0_idx):
-                rng = np.random.RandomState(42)
-                a0_keep = rng.choice(a0_idx, size=max(n_keep, 1000), replace=False)
-                non_a0_idx = np.where(self.cls_labels != 0)[0]
-                self._active_indices = np.sort(np.concatenate([a0_keep, non_a0_idx]))
-                print(f"[Dataset] A0 降采样 {downsample_a0:.0%}: "
-                      f"{len(a0_idx)}→{len(a0_keep)} A0 窗口")
+            a0_before = int(np.sum(self.cls_labels == 0))
+            self.resample_a0()
+            a0_after = int(np.sum(self.cls_labels[self._active_indices] == 0))
+            print(f"[Dataset] A0 降采样 {downsample_a0:.0%}: "
+                  f"{a0_before}→{a0_after} A0 窗口 (每 epoch 重新随机)")
 
-        self._compute_class_weights()
         print(f"[Dataset] {split}: {len(self):,} 窗口, X={self.X.shape}")
 
-    def _compute_class_weights(self):
-        class_counts = defaultdict(int)
-        for idx in self._active_indices:
-            lbl = self.cls_labels[idx]
-            class_counts[ALL_ATTACK_TYPES[lbl]] += 1
-        total = len(self._active_indices)
-        self.class_weights = torch.zeros(len(ALL_ATTACK_TYPES))
-        for i, atk in enumerate(ALL_ATTACK_TYPES):
-            count = class_counts.get(atk, 0)
-            self.class_weights[i] = total / max(count, 1) / len(ALL_ATTACK_TYPES)
+    def resample_a0(self):
+        """每 epoch 随机重新降采样 A0 窗口 (仅训练集, 无固定种子)。"""
+        if self._downsample_rate <= 0 or self.split != 'train':
+            return
+        a0_idx = np.where(self.cls_labels == 0)[0]
+        n_keep = int(len(a0_idx) * (1.0 - self._downsample_rate))
+        if n_keep < len(a0_idx):
+            a0_keep = np.random.choice(a0_idx, size=max(n_keep, 1000), replace=False)
+            non_a0_idx = np.where(self.cls_labels != 0)[0]
+            self._active_indices = np.sort(np.concatenate([a0_keep, non_a0_idx]))
 
     def __len__(self) -> int:
         return len(self._active_indices)
@@ -106,7 +103,7 @@ class PreprocessedDataset(Dataset):
 # ============================================================================
 # 训练超参数
 # ============================================================================
-BATCH_SIZE = 2048
+BATCH_SIZE = 1024
 NUM_WORKERS = 2
 PREFETCH_FACTOR = 4
 LEARNING_RATE = 5e-4          # 固定学习率
@@ -123,12 +120,11 @@ DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 # 1. 训练循环
 # ============================================================================
 
-def train_epoch(model, dataloader, optimizer, device, class_weights):
-    """单 epoch 训练 (纯 float32, 仅交叉熵 + 类别加权)。"""
+def train_epoch(model, dataloader, optimizer, device):
+    """单 epoch 训练 (纯 float32, 标准交叉熵)。"""
     model.train()
     total_loss = 0.0
     correct = total = 0
-    cw = class_weights.to(device)
 
     for x, cls_label in dataloader:
         x = x.to(device, non_blocking=True)
@@ -136,7 +132,7 @@ def train_epoch(model, dataloader, optimizer, device, class_weights):
 
         optimizer.zero_grad(set_to_none=True)
         cls_logits, _ = model(x)
-        loss = F.cross_entropy(cls_logits, cls_label, weight=cw,
+        loss = F.cross_entropy(cls_logits, cls_label,
                                label_smoothing=LABEL_SMOOTHING)
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=GRAD_CLIP)
@@ -152,21 +148,20 @@ def train_epoch(model, dataloader, optimizer, device, class_weights):
 
 
 @torch.no_grad()
-def evaluate(model, dataloader, device, class_weights):
-    """评估: 分类准确率 (标准交叉熵, 无标签平滑)"""
+def evaluate(model, dataloader, device):
+    """评估: 分类准确率 (标准交叉熵, 无标签平滑, 无类别权重)"""
     model.eval()
     total_loss = 0.0
     correct = total = 0
     class_correct = defaultdict(int)
     class_total = defaultdict(int)
-    cw = class_weights.to(device)
 
     for x, cls_label in dataloader:
         x = x.to(device, non_blocking=True)
         cls_label = cls_label.to(device, non_blocking=True)
 
         cls_logits, _ = model(x)
-        loss = F.cross_entropy(cls_logits, cls_label, weight=cw)
+        loss = F.cross_entropy(cls_logits, cls_label)
 
         B = x.size(0)
         total_loss += loss.item() * B
@@ -245,8 +240,6 @@ def main():
     model = build_model(backbone_type=args.backbone)
     model.to(DEVICE)
 
-    class_weights = train_dataset.class_weights
-
     # ---- 仅评估 ----
     if args.eval_only:
         print(f"\n加载权重: {args.eval_only}")
@@ -258,7 +251,7 @@ def main():
             print(f"  多余键: {len(unexpected)}")
 
         test_loss, test_acc, per_class_acc = evaluate(
-        model, test_loader, DEVICE, class_weights)
+        model, test_loader, DEVICE)
         print(f"\n测试集: Loss={test_loss:.4f}, Acc={test_acc:.4f}")
         print("各类别准确率:")
         for atk in ALL_ATTACK_TYPES:
@@ -280,9 +273,10 @@ def main():
     history = {'train_loss': [], 'train_acc': [], 'val_loss': [], 'val_acc': []}
 
     for epoch in range(1, args.epochs + 1):
+        train_dataset.resample_a0()  # 每 epoch 随机重新降采样 A0
         train_loss, train_acc = train_epoch(
-            model, train_loader, optimizer, DEVICE, class_weights)
-        val_loss, val_acc, _ = evaluate(model, val_loader, DEVICE, class_weights)
+            model, train_loader, optimizer, DEVICE)
+        val_loss, val_acc, _ = evaluate(model, val_loader, DEVICE)
         scheduler.step(val_loss)
 
         history['train_loss'].append(train_loss)
@@ -321,7 +315,7 @@ def main():
     model.load_state_dict(state_dict)
 
     test_loss, test_acc, per_class_acc = evaluate(
-        model, test_loader, DEVICE, class_weights)
+        model, test_loader, DEVICE)
     print(f"\n{'='*60}")
     print(f"训练完成！")
     print(f"  最佳 epoch: {best_epoch}")
