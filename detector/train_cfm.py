@@ -20,7 +20,7 @@ from typing import Tuple
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.data import Dataset, DataLoader, WeightedRandomSampler
+from torch.utils.data import Dataset, DataLoader
 from torch.optim import AdamW
 import matplotlib
 matplotlib.use('Agg')
@@ -93,10 +93,6 @@ class PreprocessedDataset(Dataset):
         for i, atk in enumerate(ALL_ATTACK_TYPES):
             count = class_counts.get(atk, 0)
             self.class_weights[i] = total / max(count, 1) / len(ALL_ATTACK_TYPES)
-        self.sample_weights = np.array([
-            self.class_weights[self.cls_labels[idx]].item()
-            for idx in self._active_indices
-        ])
 
     def __len__(self) -> int:
         return len(self._active_indices)
@@ -127,11 +123,12 @@ DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 # 1. 训练循环
 # ============================================================================
 
-def train_epoch(model, dataloader, optimizer, device):
-    """单 epoch 训练 (纯 float32, 仅交叉熵)。"""
+def train_epoch(model, dataloader, optimizer, device, class_weights):
+    """单 epoch 训练 (纯 float32, 仅交叉熵 + 类别加权)。"""
     model.train()
     total_loss = 0.0
     correct = total = 0
+    cw = class_weights.to(device)
 
     for x, cls_label in dataloader:
         x = x.to(device, non_blocking=True)
@@ -139,7 +136,8 @@ def train_epoch(model, dataloader, optimizer, device):
 
         optimizer.zero_grad(set_to_none=True)
         cls_logits, _ = model(x)
-        loss = F.cross_entropy(cls_logits, cls_label, label_smoothing=LABEL_SMOOTHING)
+        loss = F.cross_entropy(cls_logits, cls_label, weight=cw,
+                               label_smoothing=LABEL_SMOOTHING)
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=GRAD_CLIP)
         optimizer.step()
@@ -154,20 +152,21 @@ def train_epoch(model, dataloader, optimizer, device):
 
 
 @torch.no_grad()
-def evaluate(model, dataloader, device):
-    """评估: 分类准确率"""
+def evaluate(model, dataloader, device, class_weights):
+    """评估: 分类准确率 (标准交叉熵, 无标签平滑)"""
     model.eval()
     total_loss = 0.0
     correct = total = 0
     class_correct = defaultdict(int)
     class_total = defaultdict(int)
+    cw = class_weights.to(device)
 
     for x, cls_label in dataloader:
         x = x.to(device, non_blocking=True)
         cls_label = cls_label.to(device, non_blocking=True)
 
         cls_logits, _ = model(x)
-        loss = F.cross_entropy(cls_logits, cls_label, label_smoothing=LABEL_SMOOTHING)
+        loss = F.cross_entropy(cls_logits, cls_label, weight=cw)
 
         B = x.size(0)
         total_loss += loss.item() * B
@@ -216,7 +215,7 @@ def main():
     parser.add_argument('--epochs', type=int, default=NUM_EPOCHS)
     parser.add_argument('--lr', type=float, default=LEARNING_RATE)
     parser.add_argument('--batch-size', type=int, default=BATCH_SIZE)
-    parser.add_argument('--downsample-a0', type=float, default=0.0,
+    parser.add_argument('--downsample-a0', type=float, default=0.5,
                         help='A0 降采样比例')
     args = parser.parse_args()
 
@@ -229,12 +228,8 @@ def main():
     val_dataset = PreprocessedDataset(split='val')
     test_dataset = PreprocessedDataset(split='test')
 
-    train_sampler = WeightedRandomSampler(
-        weights=torch.from_numpy(train_dataset.sample_weights),
-        num_samples=len(train_dataset), replacement=False)
-
     train_loader = DataLoader(train_dataset, batch_size=args.batch_size,
-                               sampler=train_sampler, num_workers=NUM_WORKERS,
+                               shuffle=True, num_workers=NUM_WORKERS,
                                pin_memory=True, prefetch_factor=PREFETCH_FACTOR,
                                persistent_workers=(NUM_WORKERS > 0))
     val_loader = DataLoader(val_dataset, batch_size=args.batch_size * 2,
@@ -250,6 +245,8 @@ def main():
     model = build_model(backbone_type=args.backbone)
     model.to(DEVICE)
 
+    class_weights = train_dataset.class_weights
+
     # ---- 仅评估 ----
     if args.eval_only:
         print(f"\n加载权重: {args.eval_only}")
@@ -260,7 +257,8 @@ def main():
         if unexpected:
             print(f"  多余键: {len(unexpected)}")
 
-        test_loss, test_acc, per_class_acc = evaluate(model, test_loader, DEVICE)
+        test_loss, test_acc, per_class_acc = evaluate(
+        model, test_loader, DEVICE, class_weights)
         print(f"\n测试集: Loss={test_loss:.4f}, Acc={test_acc:.4f}")
         print("各类别准确率:")
         for atk in ALL_ATTACK_TYPES:
@@ -270,7 +268,10 @@ def main():
 
     # ---- 优化器 ----
     optimizer = AdamW(model.parameters(), lr=args.lr, weight_decay=WEIGHT_DECAY)
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer, mode='min', factor=0.5, patience=10, min_lr=1e-6)
     print(f"  优化器: AdamW (lr={args.lr}, wd={WEIGHT_DECAY})")
+    print(f"  调度器: ReduceLROnPlateau (factor=0.5, patience=10)")
 
     # ---- 训练循环 ----
     best_val_acc = 0.0
@@ -279,8 +280,10 @@ def main():
     history = {'train_loss': [], 'train_acc': [], 'val_loss': [], 'val_acc': []}
 
     for epoch in range(1, args.epochs + 1):
-        train_loss, train_acc = train_epoch(model, train_loader, optimizer, DEVICE)
-        val_loss, val_acc, _ = evaluate(model, val_loader, DEVICE)
+        train_loss, train_acc = train_epoch(
+            model, train_loader, optimizer, DEVICE, class_weights)
+        val_loss, val_acc, _ = evaluate(model, val_loader, DEVICE, class_weights)
+        scheduler.step(val_loss)
 
         history['train_loss'].append(train_loss)
         history['train_acc'].append(train_acc)
@@ -317,7 +320,8 @@ def main():
                             map_location=DEVICE, weights_only=True)
     model.load_state_dict(state_dict)
 
-    test_loss, test_acc, per_class_acc = evaluate(model, test_loader, DEVICE)
+    test_loss, test_acc, per_class_acc = evaluate(
+        model, test_loader, DEVICE, class_weights)
     print(f"\n{'='*60}")
     print(f"训练完成！")
     print(f"  最佳 epoch: {best_epoch}")
