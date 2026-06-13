@@ -222,22 +222,34 @@ class CFMDetectorBackend:
     # ------------------------------------------------------------------
 
     def _load_model(self, model_path: str):
-        """加载 CFMDetector (cls-only 兼容)。"""
-        from detector.cfm_detector import CFMDetector
+        """Load CFMDetector with backward-compat handling for old configs."""
+        from detector.cfm_detector import CFMDetector, IN_CHANNELS
 
         config_path = os.path.join(os.path.dirname(model_path), 'cfm_cls_config.npz')
         cfg = {}
         if os.path.exists(config_path):
             cfg = dict(np.load(config_path, allow_pickle=True))
 
+        # ---- 向后兼容: 旧配置 → 新架构 ----
+        backbone_type = str(cfg.get('backbone_type', 'simple_conv'))
+        if backbone_type == 'causal_conv':
+            print(f"  [WARN] 旧配置 backbone_type='causal_conv' → 回退为 'simple_conv'")
+            backbone_type = 'simple_conv'
+
+        in_channels = int(cfg.get('in_channels', IN_CHANNELS))
+        if in_channels != IN_CHANNELS:
+            print(f"  [WARN] 旧配置 in_channels={in_channels} → 强制使用 {IN_CHANNELS}")
+            in_channels = IN_CHANNELS
+
         model = CFMDetector(
-            in_channels=int(cfg.get('in_channels', 8)),
+            in_channels=in_channels,
             window_size=int(cfg.get('window_size', self.window_size)),
             d_model=int(cfg.get('d_model', 128)),
             num_classes=int(cfg.get('num_classes', 9)),
-            backbone_type=str(cfg.get('backbone_type', 'causal_conv')),
-            dilations=list(cfg.get('dilations', [1, 2, 4, 8, 16, 32])) if 'dilations' in cfg else None,
+            backbone_type=backbone_type,
+            conv_channels=list(cfg.get('conv_channels', [64, 128, 128])) if 'conv_channels' in cfg else None,
             conv_kernel_size=int(cfg.get('conv_kernel_size', 3)),
+            pool_size=int(cfg.get('pool_size', 2)),
             num_transformer_layers=int(cfg.get('num_transformer_layers', 4)),
             num_heads=int(cfg.get('num_heads', 8)),
             dim_feedforward=int(cfg.get('dim_feedforward', 512)),
@@ -247,8 +259,13 @@ class CFMDetectorBackend:
             state_dict = torch.load(model_path, map_location=self._device,
                                      weights_only=True)
             missing, unexpected = model.load_state_dict(state_dict, strict=False)
+            loaded_keys = len(state_dict) - len(unexpected)
+            total_keys = len(state_dict)
             if missing:
-                print(f"  [INFO] 缺少的权重键: {len(missing)} 个")
+                missing_pct = len(missing) / max(total_keys, 1) * 100
+                print(f"  [INFO] 缺少的权重键: {len(missing)} 个 ({missing_pct:.0f}%)")
+                if missing_pct > 30:
+                    print(f"  [WARN] 模型权重严重不匹配 — 请重新训练! (python detector/train_cfm.py)")
             if unexpected:
                 print(f"  [INFO] 多余的权重键: {len(unexpected)} 个")
         else:

@@ -32,7 +32,7 @@ warnings.filterwarnings('ignore', message='.*non-writable tensor.*')
 from detector.cfm_detector import (CFMDetector,
                                     D_MODEL, NUM_TRANSFORMER_LAYERS, NUM_HEADS,
                                     DIM_FEEDFORWARD,
-                                    DILATIONS, CONV_KERNEL_SIZE)
+                                    CONV_CHANNELS, CONV_KERNEL_SIZE, POOL_SIZE)
 
 # ============================================================================
 # 攻击类型常量
@@ -103,7 +103,7 @@ class PreprocessedDataset(Dataset):
 # ============================================================================
 # 训练超参数
 # ============================================================================
-BATCH_SIZE = 1024
+BATCH_SIZE = 256
 NUM_WORKERS = 2
 PREFETCH_FACTOR = 4
 LEARNING_RATE = 5e-4          # 固定学习率
@@ -112,6 +112,11 @@ NUM_EPOCHS = 150
 LABEL_SMOOTHING = 0.05
 EARLY_STOP_PATIENCE = 50
 GRAD_CLIP = 1.0
+
+# ReduceLROnPlateau 调度器
+LR_PATIENCE = 30               # 多少 epoch 无改善后降 LR
+LR_FACTOR = 0.8                # LR 衰减因子 (越接近 1 越温和, 避免陷入局部最优)
+LR_MIN = 1e-6                  # LR 下限
 
 DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
@@ -189,12 +194,33 @@ def evaluate(model, dataloader, device):
 # 2. 主训练入口
 # ============================================================================
 
-def build_model(backbone_type='causal_conv'):
+def _save_model_config(model: CFMDetector):
+    """保存模型配置到 cfm_cls_config.npz (供 cfm_backend 加载使用)。"""
+    import numpy as np
+    cfg = {
+        'in_channels': int(model.in_channels),
+        'window_size': int(model.window_size),
+        'd_model': int(model.d_model),
+        'num_classes': int(model.num_classes),
+        'backbone_type': str(model.backbone_type),
+    }
+    # 仅对 simple_conv 骨干保存卷积参数
+    if model.backbone_type == 'simple_conv':
+        backbone = model.backbone
+        if hasattr(backbone, 'channel_attn') and backbone.channel_attn is not None:
+            cfg['use_channel_attn'] = True
+        else:
+            cfg['use_channel_attn'] = False
+    np.savez(os.path.join(MODEL_DIR, 'cfm_cls_config.npz'), **cfg)
+
+
+def build_model(backbone_type='simple_conv'):
     """构建 CFMDetector (cls-only)。"""
     model = CFMDetector(
         backbone_type=backbone_type,
-        dilations=DILATIONS,
+        conv_channels=CONV_CHANNELS,
         conv_kernel_size=CONV_KERNEL_SIZE,
+        pool_size=POOL_SIZE,
     )
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"[Model] 参数量: {n_params:,}")
@@ -203,8 +229,8 @@ def build_model(backbone_type='causal_conv'):
 
 def main():
     parser = argparse.ArgumentParser(description='CFM 分类检测器训练 (cls-only)')
-    parser.add_argument('--backbone', type=str, default='causal_conv',
-                        choices=['causal_conv', 'transformer'])
+    parser.add_argument('--backbone', type=str, default='simple_conv',
+                        choices=['simple_conv', 'transformer'])
     parser.add_argument('--eval-only', type=str, default=None,
                         help='仅评估指定模型权重')
     parser.add_argument('--epochs', type=int, default=NUM_EPOCHS)
@@ -262,9 +288,9 @@ def main():
     # ---- 优化器 ----
     optimizer = AdamW(model.parameters(), lr=args.lr, weight_decay=WEIGHT_DECAY)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, mode='min', factor=0.5, patience=10, min_lr=1e-6)
+        optimizer, mode='min', factor=LR_FACTOR, patience=LR_PATIENCE, min_lr=LR_MIN)
     print(f"  优化器: AdamW (lr={args.lr}, wd={WEIGHT_DECAY})")
-    print(f"  调度器: ReduceLROnPlateau (factor=0.5, patience=10)")
+    print(f"  调度器: ReduceLROnPlateau (factor={LR_FACTOR}, patience={LR_PATIENCE})")
 
     # ---- 训练循环 ----
     best_val_acc = 0.0
@@ -296,8 +322,10 @@ def main():
             best_val_acc = val_acc
             best_epoch = epoch
             patience_counter = 0
-            torch.save(model.state_dict(),
-                       os.path.join(MODEL_DIR, 'cfm_cls_best.pt'))
+            model_path = os.path.join(MODEL_DIR, 'cfm_cls_best.pt')
+            torch.save(model.state_dict(), model_path)
+            # 同步保存配置 (供 cfm_backend 加载使用)
+            _save_model_config(model)
             print("  *", end='')
         else:
             patience_counter += 1

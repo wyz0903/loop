@@ -52,9 +52,11 @@ ReferenceTrajectory(参考轨迹) → NMPC → u_cmd → WMRKinematics(RK4运动
                                       y_meas ← SensorAttack.inject()(注入攻击)
                                         ↓
                                CFMDetector.detect(y_meas)(执行检测)
-                                 Transformer主干 → 分类头 + 流匹配头
-                                 ODE采样: 噪声 z_0 → 逐步积分 → â(k)
-                                 信号恢复: y_rec = y_meas − â(k)
+                                 内部运动学预测 → 新息 innov
+                                 滑动窗口: [y_meas(3) + innov(3) + u_cmd(2)] = 8 通道
+                                 SimpleConvBackbone (3块 Conv-BN-ReLU-Pool)
+                                   → 注意力池化 → 9 类 softmax (A0-A8)
+                                 恢复策略: A0/低置信度 → y_meas 直通; 攻击 → 运动学死推算
                                         ↓
                                y_rec → 直接作为位姿估计 (替代 EKF)
                                         ↓
@@ -72,10 +74,10 @@ ReferenceTrajectory(参考轨迹) → NMPC → u_cmd → WMRKinematics(RK4运动
 | `attack.py` | 8 种传感器攻击类型 (A1–A8) + 正常情况 (A0)；统一的 `inject()` 注入接口 |
 | `simulate.py` | 统一闭环仿真：CFM检测器 / 无检测器基线 / 五族轨迹对比 |
 | `generate_dataset.py` | 开环数据生成：5 种随机轨迹系列 × 9 种攻击 |
-| `cfm_backend.py` | CFMDetectorBackend 推理包装器：滑动窗口缓冲 + ODE 采样 + 信号恢复 + DetectionResult |
-| `detector/cfm_detector.py` | CFMDetector 模型定义：TransformerBackbone + AdaLN-Zero FlowMatchingHead + ClassificationHead |
-| `detector/preprocess_data.py` | 100 步滑动窗口，RobustScaler（基于四分位距 IQR）+ 物理量归一化，防数据泄漏的文件级拆分 |
-| `detector/train_cfm.py` | CFMDetector 训练脚本：L = L_cls + λ_fm·L_fm + λ_phys·L_phys（分类+流匹配+物理正则化） |
+| `cfm_backend.py` | CFMDetectorBackend 推理包装器：滑动窗口缓冲 + 内部运动学 + 分类 + 恢复策略路由 |
+| `detector/cfm_detector.py` | CFMDetector 模型定义：SimpleConvBackbone (3块 Conv-BN-ReLU-Pool) + 注意力池化分类头 |
+| `detector/preprocess_data.py` | 100 步滑动窗口，物理锚点归一化 (RobustNormalizer)，防数据泄漏的文件级拆分 |
+| `detector/train_cfm.py` | CFMDetector 训练脚本：L = L_cls（纯交叉熵分类，label smoothing 0.05），A0 每 epoch 随机降采样 |
 | `detector/evaluate.py` | 综合评估流水线：闭环仿真 + 混淆矩阵 + 重建对比 + 轨迹跟踪对比 |
 | `detector/models/` | 训练好的模型权重 (cfm_cls_best.pt, cfm_cls_config.npz) |
 | `detector/test/analyze.py` | DL指标分析：混淆矩阵 + 检测准确率/延迟/虚警率 + 汇总图 |
@@ -109,11 +111,11 @@ ReferenceTrajectory(参考轨迹) → NMPC → u_cmd → WMRKinematics(RK4运动
 
 ### 关键设计决策
 
-- **条件流匹配 (Conditional Flow Matching)**：使用 OT-CFM 学习攻击信号的条件概率分布 p(a|y_meas, u_cmd)。训练时匹配条件向量场 v_θ(t, z_t, cond)，推理时从噪声 z_0 ~ N(0,I) 通过 ODE 采样逐步积分得到攻击估计 â(k)。
-- **Transformer 主干 + AdaLN-Zero**：使用 4 层 Transformer 编码器（d_model=128, 8 头）作为共享特征提取器，AdaLN-Zero 块（DiT 风格）用于流匹配头中的条件注入，零初始化门控实现恒等初始化。
-- **统一端到端训练**：单一损失函数 L = L_cls + λ_fm·L_fm + λ_phys·L_phys。L_cls 为交叉熵分类损失，L_fm 为流匹配 MSE 损失，L_phys 为运动学 ODE 残差约束（PINN 正则化）。
-- **物理信息正则化 (PINN)**：L_phys = max(0, mean(||r_phys||²) − κ·Tr(R))，其中 r_phys 为恢复信号的运动学残差，约束恢复后的信号满足 WMR 运动学方程。
-- **精简后处理 (仅 2 项策略)**：ODE Euler 10 步采样 + 置信度阈值门控（conf < 0.5 直通）。移除旧版的 EMA、多数投票、尾部加权平均、A5 迟滞计数器、持久偏移检测、周期性重校准等复杂机制。
+- **简单卷积骨干 + 通道自注意力 (SimpleConvBackbone + ChannelSelfAttention)**：输入层对 8 个原始通道做多头自注意力（4 头，proj_dim=64），显式学习通道间物理耦合关系（如 innov ↔ y_meas ↔ u_cmd）。注意力矩阵 8×8 可直接可视化为论文图。其后接 3 个 Conv-BN-ReLU-MaxPool 块，通道 8→64→128→128，时序 100→50→25→12。总参数量 ~108K（含通道注意力 ~30K），远小于旧版 TCN 的 1.3M。
+- **物理锚点归一化 (Physical-Anchor Normalization)**：y_meas 用工作空间边界 [2.5m, 2.5m, π] 作为尺度锚点，创新通道用物理异常阈值 [0.5m, 0.5m, 0.3rad] 作为尺度。避免 IQR 归一化将常规攻击信号放大至 10³-10⁵ 导致梯度爆炸。物理含义清晰，论文可辩护。
+- **注意力池化分类头**：可学习的 attn_query 对特征序列加权求和，自适应地聚焦于攻击窗口最具判别力的时间步，替代简单的全局平均池化。
+- **纯分类训练**：单一交叉熵损失 + label smoothing 0.05，无类别权重，通过每 epoch 随机降采样 50% A0 窗口平衡类别分布。
+- **恢复策略路由**：A0 正常或低置信度 (<0.5) → y_meas 直通，避免注入估计误差；检测到攻击 (A1-A8) → 运动学死推算作为位姿估计。无信号重建能力，简洁可解释。
 - **防泄漏分层 IID 拆分**：按轨迹族分层抽样为 train/val/test (70/15/15)，同一 config 的所有窗口整体进入同一划分，保证各划分同分布且无信息泄漏。
 
 ### 物理常量（TurtleBot4 安全模式设定）
