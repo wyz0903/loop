@@ -721,7 +721,7 @@ def run_validation_eval(model_path: str, norm_path: str, data_dir: str,
         cfg = dict(np.load(config_path, allow_pickle=True))
 
     model = CFMDetector(
-        in_channels=int(cfg.get('in_channels', 5)),
+        in_channels=int(cfg.get('in_channels', 8)),
         window_size=int(cfg.get('window_size', 100)),
         d_model=int(cfg.get('d_model', 128)),
         num_classes=int(cfg.get('num_classes', 9)),

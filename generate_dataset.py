@@ -508,6 +508,8 @@ def run_single_simulation(traj: RandomizedTrajectory,
         # 3. 内部运动学新息 (锚定到上一帧测量)
         X_pred_internal = _internal_kinematic_step(y_meas_prev, u_cmd)
         internal_innovation = y_meas - X_pred_internal
+        internal_innovation[2] = np.arctan2(np.sin(internal_innovation[2]),
+                                              np.cos(internal_innovation[2]))  # θ 包裹到[-π,π]
 
         # 4. 锚定到当前测量 (供下一步运动学预测使用)
         y_meas_prev = y_meas.copy()
@@ -527,6 +529,7 @@ def run_single_simulation(traj: RandomizedTrajectory,
         data['true_state'].append(true_state.copy())       # 真实位姿 (3,)
         data['y_meas'].append(y_meas.copy())               # 含攻击测量 (3,)
         data['attack_signal'].append(attack_signal.copy()) # 攻击真值 (3,)
+        data['y_clean'].append(y_clean.copy())             # 干净传感器信号 (3,) ★ 训练目标
         data['sensor_noise'].append(noise.copy())          # 传感器噪声 (3,)
         data['Upsilon_r'].append(Upsilon_r.copy())         # 参考位姿 (3,)
         data['u_r'].append(u_r.copy())                     # 参考指令 (2,)
