@@ -31,7 +31,7 @@ plt.rcParams['axes.unicode_minus'] = False
 from model import (WMRParams, WMRKinematics, SensorSimulator,
                    LissajousTrajectory, CircularTrajectory, SIM_STEPS)
 from controller import NMPCController, NMPCParams
-from attack import SensorAttack, AttackConfig
+from attack import SensorAttack, AttackConfig, ALL_ATTACK_TYPES, ATTACK_NAMES
 from cfm_backend import CFMDetectorBackend
 
 # ============================================================================
@@ -50,13 +50,6 @@ os.makedirs(RESULT_DIR, exist_ok=True)
 # 每次仿真在 [0, max] 内均匀随机采样，符号随机正负; 全零时机器人严格从起点出发
 INIT_POS_MAX = 0.15        # 位置偏移最大幅值 [m] (每个轴独立 U(0, max) × 随机符号)
 INIT_HEADING_MAX = 0.2     # 朝向偏移最大幅值 [rad] (U(0, max) × 随机符号)
-
-ALL_ATTACK_TYPES = ['A0', 'A1', 'A2', 'A3', 'A4', 'A5', 'A6', 'A7', 'A8']
-ATTACK_NAMES = {
-    'A0': 'Normal', 'A1': 'Constant Bias', 'A2': 'Sinusoidal',
-    'A3': 'Drift', 'A4': 'Step', 'A5': 'Replay Attack',
-    'A6': 'Intermittent Dropout', 'A7': 'Scaling', 'A8': 'Sensor Freeze',
-}
 
 TRAJECTORY_FAMILIES = ['lissajous', 'circular', 'spiral', 'random_waypoint', 'square']
 
@@ -138,7 +131,7 @@ def run_simulation(attack_type: str = 'A4',
     # ---- 初始化 ----
     wmr_params = WMRParams()
     Ts = wmr_params.Ts
-    n_steps = SIM_STEPS  # 700
+    n_steps = SIM_STEPS  # 1000
 
     # 轨迹
     traj = _create_trajectory(trajectory_type, Ts, seed)

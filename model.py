@@ -7,12 +7,23 @@ model.py -- WMR Kinematic Model, Reference Trajectories, Sensor Simulator
 
 import numpy as np
 from dataclasses import dataclass
-from typing import Tuple, Optional
+from typing import Tuple
 
 
 # 仿真全局常量
 SIM_TIME = 50.0        # 仿真总时长 [s]
 SIM_STEPS = 1000       # 仿真总步数 = round(SIM_TIME / 0.05)，避免 IEEE 754 截断误差
+
+
+def setup_ieee_style(font_size: int = 9):
+    """设置 IEEE 论文标准 matplotlib 样式 (全局生效)。
+
+    所有绘图模块统一调用此函数，避免 rcParams 配置分散。
+    """
+    import matplotlib.pyplot as plt
+    plt.rcParams['font.sans-serif'] = ['Microsoft YaHei', 'SimHei']
+    plt.rcParams['font.size'] = font_size
+    plt.rcParams['axes.unicode_minus'] = False
 
 
 # ============================================================================
@@ -95,7 +106,7 @@ class LissajousTrajectory:
         self._theta_r = 0.0
 
     def _compute_center_offset(self) -> Tuple[float, float]:
-        """预模拟 35s 轨迹，计算使 bounding box 中心对齐原点的偏移量"""
+        """预模拟 50s 轨迹，计算使 bounding box 中心对齐原点的偏移量"""
         x, y, theta = 0.0, 0.0, 0.0
         x_min, x_max = 0.0, 0.0
         y_min, y_max = 0.0, 0.0
@@ -181,7 +192,7 @@ class CircularTrajectory:
         self._theta_r = 0.0
 
     def _compute_center_offset(self) -> Tuple[float, float]:
-        """预模拟 35s 圆形轨迹，计算居中偏移"""
+        """预模拟 50s 圆形轨迹，计算居中偏移"""
         x, y, theta = 0.0, 0.0, 0.0
         x_min, x_max = 0.0, 0.0
         y_min, y_max = 0.0, 0.0
@@ -230,8 +241,7 @@ class CircularTrajectory:
         return Ur_seq
 
 
-# 向后兼容别名
-ReferenceTrajectory = LissajousTrajectory
+# (ReferenceTrajectory 别名已移除 — 直接使用 LissajousTrajectory)
 
 # ============================================================================
 # 3. WMR 前端位姿运动学
@@ -286,6 +296,33 @@ class WMRKinematics:
         theta = state[2]
         Fh = self.input_matrix(theta)
         return Fh @ u
+
+    @staticmethod
+    def kinematic_predict(state: np.ndarray, u_cmd: np.ndarray,
+                          Ts: float = 0.05, alpha: float = 0.17) -> np.ndarray:
+        """内部运动学 Euler 一步预测 (与 CFMDetector 内部运动学一致)
+
+        WMR 前端位姿运动学:
+          dX/dt = F_h(theta) * u
+          F_h = [[cos(θ),  -α·sin(θ)],
+                 [sin(θ),   α·cos(θ)],
+                 [0,        1        ]]
+
+        Args:
+            state: 当前状态 (3,) [x, y, theta]
+            u_cmd: 控制指令 (2,) [v, w]
+            Ts:    采样周期 [s] (默认 0.05)
+            alpha: 前端偏移量 [m] (默认 0.17)
+
+        Returns:
+            next_state: 预测状态 (3,)
+        """
+        v, w = u_cmd[0], u_cmd[1]
+        theta = state[2]
+        cos_t, sin_t = np.cos(theta), np.sin(theta)
+        dx = v * cos_t - alpha * w * sin_t
+        dy = v * sin_t + alpha * w * cos_t
+        return state + Ts * np.array([dx, dy, w])
 
     def rk4_step(self, state: np.ndarray, u: np.ndarray,
                  Ts: float = None) -> np.ndarray:
@@ -436,11 +473,11 @@ class SensorSimulator:
 
 
 # ============================================================================
-# 6. 五族轨迹可视化
+# 5. 五族轨迹可视化
 # ============================================================================
 
 def _generate_trajectory_path(traj, pos_bound, Ts=0.05, T_sim=50.0):
-    """模拟完整 35s 参考轨迹 (使用轨迹自身的 step，已为 RK4)"""
+    """模拟完整 50s 参考轨迹 (使用轨迹自身的 step，已为 RK4)"""
     n = int(T_sim / Ts)
     traj.reset()
     x_arr, y_arr = np.zeros(n), np.zeros(n)
@@ -555,7 +592,7 @@ if __name__ == "__main__":
         # 快速自测模式
         print("=== model.py 自测 ===")
         params = WMRParams()
-        traj = ReferenceTrajectory(Ts=params.Ts)
+        traj = LissajousTrajectory(Ts=params.Ts)
         robot = WMRKinematics(params)
         sensor = SensorSimulator()
 

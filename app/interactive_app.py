@@ -51,7 +51,7 @@ from tkinter import ttk, messagebox
 from model import (WMRParams, WMRKinematics, SensorSimulator,
                    SIM_TIME, SIM_STEPS)
 from controller import NMPCController, NMPCParams
-from attack import SensorAttack, AttackConfig
+from attack import SensorAttack, AttackConfig, ALL_ATTACK_TYPES, ATTACK_NAMES, ATK_COLORS
 from cfm_backend import CFMDetectorBackend
 
 # ============================================================================
@@ -61,19 +61,6 @@ from cfm_backend import CFMDetectorBackend
 DEFAULT_TS = 0.05
 DEFAULT_SIM_TIME = 50.0
 SIM_STEPS_DEFAULT = int(DEFAULT_SIM_TIME / DEFAULT_TS)  # 1000
-
-ALL_ATTACK_TYPES = ['A0', 'A1', 'A2', 'A3', 'A4', 'A5', 'A6', 'A7', 'A8']
-ATTACK_NAMES = {
-    'A0': 'Normal (正常)',
-    'A1': 'Constant Bias (恒定偏移)',
-    'A2': 'Sinusoidal (正弦注入)',
-    'A3': 'Drift (斜坡漂移)',
-    'A4': 'Step (阶跃)',
-    'A5': 'Replay Attack (重放攻击)',
-    'A6': 'Intermittent Dropout (信号丢失)',
-    'A7': 'Scaling (缩放攻击)',
-    'A8': 'Sensor Freeze (传感器冻结)',
-}
 
 FAMILIES_ORDER = ['lissajous', 'circular', 'spiral', 'random_waypoint', 'square']
 FAMILY_NAMES_ZH = {
@@ -85,11 +72,6 @@ FAMILY_NAMES_ZH = {
 }
 
 # 攻击颜色方案 (与项目 plot_attack_demo.py 一致)
-ATK_COLORS = {
-    'A0': '#4CAF50', 'A1': '#E91E63', 'A2': '#FF9800', 'A3': '#2196F3',
-    'A4': '#F44336', 'A5': '#9C27B0', 'A6': '#795548', 'A7': '#00BCD4', 'A8': '#607D8B',
-}
-
 # IEEE 论文绘图样式
 plt.rcParams['font.sans-serif'] = ['Microsoft YaHei', 'SimHei']
 plt.rcParams['font.size'] = 9
@@ -99,18 +81,6 @@ plt.rcParams['axes.unicode_minus'] = False
 # ============================================================================
 # 辅助函数
 # ============================================================================
-
-def _internal_kinematic_step(state: np.ndarray, u_cmd: np.ndarray) -> np.ndarray:
-    """内部运动学 Euler 积分 — 与 CFMDetector 内部运动学逐位一致"""
-    alpha = 0.17
-    Ts = 0.05
-    v, w = u_cmd[0], u_cmd[1]
-    theta = state[2]
-    cos_t, sin_t = np.cos(theta), np.sin(theta)
-    dx = v * cos_t - alpha * w * sin_t
-    dy = v * sin_t + alpha * w * cos_t
-    return state + Ts * np.array([dx, dy, w])
-
 
 def load_dataset_configs(metadata_path: str) -> list[dict]:
     """从 metadata.csv 加载全部轨迹配置"""
@@ -149,6 +119,72 @@ def load_dataset_configs(metadata_path: str) -> list[dict]:
 
 
 # ============================================================================
+# PerfectDetectorBackend — 理想检测器 (100% 检测, 运动学死推算恢复, 仅用于对比基线)
+# ============================================================================
+
+class PerfectDetectorBackend:
+    """理想检测器: 检测 100% 准确 (基于 ground truth)，恢复使用运动学死推算。
+
+    检测: 通过 set_ground_truth() 获知真实攻击状态 → detect() 返回 100% 正确的类别。
+    恢复: 攻击中完全开环运动学死推算 (不再使用 y_clean 作弊)，正常时信任传感器直通。
+    API 与 CFMDetectorBackend 一致: detect(y_meas) → DetectionResult。
+    """
+
+    def __init__(self):
+        self._attack_type = 'A0'
+        self._attack_signal = np.zeros(3)
+        self._y_clean = np.zeros(3)
+        self._internal_state = np.zeros(3)    # [x, y, theta] 用于运动学死推算
+        self._u_cmd = np.zeros(2)             # [v, w] 控制指令缓存
+
+    def set_ground_truth(self, attack_type: str, attack_signal: np.ndarray,
+                         y_clean: np.ndarray):
+        """每步调用: 传入当前步的真实攻击信息 (由仿真循环提供)。"""
+        self._attack_type = attack_type
+        self._attack_signal = np.asarray(attack_signal, dtype=float).ravel()
+        self._y_clean = np.asarray(y_clean, dtype=float).ravel()
+
+    def detect(self, y_meas: np.ndarray) -> 'DetectionResult':
+        """返回: 正确攻击类别 + 运动学死推算恢复 (不再使用 y_clean 作弊)。
+
+        检测仍为 100% 准确 (基于 ground truth attack_signal)。
+        恢复策略: 正常时信任传感器直通，攻击时完全开环运动学死推算。
+        """
+        from cfm_backend import DetectionResult
+        y_meas = np.asarray(y_meas, dtype=float).ravel()
+
+        # 根据真实攻击信号判断当前是否处于攻击中
+        is_under_attack = np.any(np.abs(self._attack_signal) > 1e-10)
+
+        if is_under_attack:
+            # 攻击中 → 完全开环运动学死推算, 不再相信传感器
+            X_pred = WMRKinematics.kinematic_predict(self._internal_state, self._u_cmd)
+            y_recovered = X_pred.copy()
+        else:
+            # 正常 → 信任传感器测量直通
+            y_recovered = y_meas.copy()
+
+        # 内部状态传播: 为下一步死推算做准备
+        self._internal_state = y_recovered.copy()
+
+        attack_class = self._attack_type if is_under_attack else 'A0'
+        attack_estimate = self._attack_signal.copy() if is_under_attack else np.zeros(3)
+
+        return DetectionResult(
+            attack_class=attack_class, confidence=1.0,
+            y_recovered=y_recovered,
+            attack_estimate=attack_estimate,
+            features={'detector': 'perfect'})
+
+    def set_control(self, u_cmd: np.ndarray) -> None:
+        self._u_cmd = np.asarray(u_cmd, dtype=float).ravel()
+
+    def reset(self) -> None:
+        self._internal_state = np.zeros(3)
+        self._u_cmd = np.zeros(2)
+
+
+# ============================================================================
 # SimulationWorker — 后台仿真线程
 # ============================================================================
 
@@ -165,7 +201,7 @@ class SimulationWorker(threading.Thread):
                  traj_family: str, traj_seed: int,
                  attack_type: str, attack_onset: float,
                  attack_duration: float, sim_time: float,
-                 use_detector: bool = True):
+                 detector_mode: str = 'cfm'):
         super().__init__(daemon=True)
         self._q = result_queue
         self._traj_family = traj_family
@@ -174,7 +210,7 @@ class SimulationWorker(threading.Thread):
         self._attack_onset = attack_onset
         self._attack_duration = attack_duration
         self._sim_time = sim_time
-        self._use_detector = use_detector
+        self._detector_mode = detector_mode  # 'cfm' | 'perfect' | 'none'
 
     def run(self):
         try:
@@ -221,20 +257,20 @@ class SimulationWorker(threading.Thread):
         np.random.seed(self._traj_seed)
 
         # ---- 检测器 ----
-        use_detector = self._use_detector
+        detector_mode = self._detector_mode
         model_dir = os.path.join(PROJECT_ROOT, 'detector', 'models')
         norm_dir = os.path.join(PROJECT_ROOT, 'dataset_win', 'normalizer.npz')
         cfm_model = os.path.join(model_dir, 'cfm_cls_best.pt')
 
-        if use_detector and not os.path.exists(cfm_model):
-            self._q.put(('warning', f'CFM模型未找到: {cfm_model}\n回退为无检测器'))
-            use_detector = False
-
         detector = None
-        if use_detector:
-            detector = CFMDetectorBackend(model_path=cfm_model, norm_path=norm_dir)
-        if detector is not None:
-            detector.reset()
+        if detector_mode == 'cfm':
+            if not os.path.exists(cfm_model):
+                self._q.put(('warning', f'CFM模型未找到: {cfm_model}\n回退为无检测器'))
+            else:
+                detector = CFMDetectorBackend(model_path=cfm_model, norm_path=norm_dir)
+                detector.reset()
+        elif detector_mode == 'perfect':
+            detector = PerfectDetectorBackend()
 
         # ---- 仿真循环 ----
         data = {
@@ -278,7 +314,7 @@ class SimulationWorker(threading.Thread):
             attack_signal = y_meas - y_clean
 
             # 3. 内部运动学新息
-            X_pred_internal = _internal_kinematic_step(internal_state, u_cmd)
+            X_pred_internal = WMRKinematics.kinematic_predict(internal_state, u_cmd)
             internal_state = y_meas.copy()  # 锚定到当前测量
 
             # ---- 检测器 ----
@@ -288,6 +324,9 @@ class SimulationWorker(threading.Thread):
                 det_conf = 0.0
                 det_attack_est = np.zeros(3)
             else:
+                # 理想检测器: 注入真实攻击信息
+                if isinstance(detector, PerfectDetectorBackend):
+                    detector.set_ground_truth(self._attack_type, attack_signal, y_clean)
                 detector.set_control(u_cmd)
                 result = detector.detect(y_meas)
                 y_rec = result.y_recovered.copy()
@@ -351,6 +390,7 @@ class SimulationWorker(threading.Thread):
         data['seed'] = self._traj_seed
         data['elapsed'] = elapsed_total
         data['use_detector'] = detector is not None
+        data['detector_mode'] = detector_mode
 
         # 计算攻击后 RMSE
         onset_idx = int(round(self._attack_onset / Ts)) if self._attack_onset < self._sim_time else n_steps
@@ -470,10 +510,16 @@ class ControlPanel(ttk.Frame):
         # 检测器选择
         ttk.Label(self._frame_attack, text='检测器:').grid(
             row=1, column=0, padx=5, pady=3, sticky='w')
-        self._use_detector_var = tk.BooleanVar(value=True)
-        ttk.Checkbutton(self._frame_attack, text='启用 CFMDetector (PINN-Flow)',
-                        variable=self._use_detector_var).grid(
-            row=1, column=1, padx=5, pady=3, sticky='w')
+        self._detector_var = tk.StringVar(value='cfm')
+        ttk.Radiobutton(self._frame_attack, text='CFM (NN)',
+                        variable=self._detector_var, value='cfm').grid(
+            row=1, column=1, padx=2, pady=2, sticky='w')
+        ttk.Radiobutton(self._frame_attack, text='Perfect (理想)',
+                        variable=self._detector_var, value='perfect').grid(
+            row=1, column=2, padx=2, pady=2, sticky='w')
+        ttk.Radiobutton(self._frame_attack, text='None',
+                        variable=self._detector_var, value='none').grid(
+            row=1, column=3, padx=2, pady=2, sticky='w')
 
         row += 1
 
@@ -690,8 +736,8 @@ class ControlPanel(ttk.Frame):
     def get_sim_time(self) -> float:
         return self._simtime_var.get()
 
-    def get_detector_enabled(self) -> bool:
-        return self._use_detector_var.get()
+    def get_detector_mode(self) -> str:
+        return self._detector_var.get()  # 'cfm' | 'perfect' | 'none'
 
     def set_progress(self, step: int, total: int, t: float, elapsed: float):
         self._progress['maximum'] = total
@@ -883,7 +929,7 @@ class InteractiveApp(tk.Tk):
         self._detail_var.set('仿真运行中...')
 
         # 启动后台线程
-        use_detector = self._panel.get_detector_enabled()
+        detector_mode = self._panel.get_detector_mode()
         self._worker_queue = queue.Queue()
         self._worker = SimulationWorker(
             self._worker_queue,
@@ -893,7 +939,7 @@ class InteractiveApp(tk.Tk):
             attack_onset=attack_onset,
             attack_duration=attack_duration,
             sim_time=sim_time,
-            use_detector=use_detector,
+            detector_mode=detector_mode,
         )
         self._worker.start()
         self.after(100, self._poll_worker)
@@ -923,8 +969,8 @@ class InteractiveApp(tk.Tk):
                     self._panel.enable_slider(self._n_steps)
                     self._update_cursor(0)
                     atk = data.get('attack_type_label', 'A0')
-                    use_det = data.get('use_detector', False)
-                    det_label = 'CFM' if use_det else 'None'
+                    det_mode = data.get('detector_mode', 'none')
+                    det_label = {'cfm': 'CFM', 'perfect': 'Perfect', 'none': 'None'}.get(det_mode, det_mode)
                     rmse = data.get('pos_rmse', 0)
                     self._detail_var.set(
                         f'仿真完成 | 攻击={atk} | 检测器={det_label} | RMSE={rmse:.4f}m | '

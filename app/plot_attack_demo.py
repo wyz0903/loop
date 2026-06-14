@@ -19,8 +19,7 @@ from model import (WMRParams, WMRKinematics, SensorSimulator,
                    SIM_STEPS, SIM_TIME)
 from controller import NMPCController, NMPCParams
 from attack import SensorAttack, AttackConfig
-from generate_dataset import (RandomizedTrajectory, _rk4_front_axle,
-                              _internal_kinematic_step, ATTACK_NAMES)
+from generate_dataset import RandomizedTrajectory
 
 # ---- IEEE 标准字体 ----
 plt.rcParams['font.sans-serif'] = ['Microsoft YaHei', 'SimHei']
@@ -112,7 +111,7 @@ def main():
 
     results = {}
     for atk in ATK_TYPES:
-        print(f"Running {atk} ({ATTACK_NAMES[atk]})...")
+        print(f"Running {atk} ({SensorAttack.ATTACK_NAMES[atk]})...")
         ctrl.reset()
         results[atk] = run_one(traj, atk, onset=onset, duration=duration,
                                ctrl=ctrl, sim_seed=42)
@@ -182,7 +181,7 @@ def main():
                 transform=ax.transAxes, fontsize=7, ha='right',
                 bbox=dict(boxstyle='round,pad=0.3', facecolor='yellow', alpha=0.6))
 
-        ax.set_title(f'{atk} — {ATTACK_NAMES[atk]}', fontsize=11, fontweight='bold', color=color)
+        ax.set_title(f'{atk} — {SensorAttack.ATTACK_NAMES[atk]}', fontsize=11, fontweight='bold', color=color)
         ax.set_xlabel('X [m]'); ax.set_ylabel('Y [m]')
         ax.set_aspect('equal'); ax.grid(True, alpha=0.15)
         ax.plot([-pb,pb,pb,-pb,-pb],[-pb,-pb,pb,pb,-pb],'gray',lw=0.5,ls=':',alpha=0.35)

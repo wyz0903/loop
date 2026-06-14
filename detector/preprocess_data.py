@@ -39,14 +39,10 @@ DATASET_DIR = os.path.join(PROJECT_ROOT, 'dataset')
 OUTPUT_DIR = os.path.join(PROJECT_ROOT, 'dataset_win')
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-ALL_ATTACK_TYPES = ['A0', 'A1', 'A2', 'A3', 'A4', 'A5', 'A6', 'A7', 'A8']
-ATTACK_NAMES = {
-    'A0': 'Normal', 'A1': 'ConstantBias', 'A2': 'Sinusoidal',
-    'A3': 'Drift', 'A4': 'Step', 'A5': 'ReplayAttack',
-    'A6': 'Dropout', 'A7': 'Scaling', 'A8': 'Freeze',
-}
+from attack import ALL_ATTACK_TYPES, ATTACK_NAMES
 
 # 输入通道: 传感器测量 + 内部运动学新息 + 控制上下文
+# 注意: 'internal_innovation' 键名必须与 generate_dataset.py 输出的 .npz 键名一致
 INPUT_CHANNELS = ['y_meas', 'internal_innovation', 'u_cmd']   # y_meas(3) + innov(3) + u_cmd(2) = 8 通道
 from model import SIM_STEPS, SIM_TIME
 N_STEPS = SIM_STEPS       # 1000，避免 IEEE 754 截断误差

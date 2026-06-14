@@ -4,7 +4,7 @@
 
 ## 项目概要
 
-这是一个用于**轮式移动机器人（WMR）传感器攻击检测与恢复**的研究仿真系统。一个类似TurtleBot4的差速驱动机器人在NMPC控制下跟踪参考轨迹，同时其传感器测量数据可能在随机时刻受到攻击。一个基于条件流匹配（Conditional Flow Matching）的检测器（CFMDetector）用于分类攻击类型并恢复干净信号——恢复信号直接作为位姿估计送入NMPC。本项目为一个科研项目，目标是在IEEE TIE上发表论文。
+这是一个用于**轮式移动机器人（WMR）传感器攻击检测与恢复**的研究仿真系统。一个类似TurtleBot4的差速驱动机器人在NMPC控制下跟踪参考轨迹，同时其传感器测量数据可能在随机时刻受到攻击。一个基于 SimpleConvBackbone + 通道自注意力的分类检测器（CFMDetector, cls-only）用于分类攻击类型（9类: A0-A8），检测到攻击时切换到运动学死推算作为位姿估计。本项目为一个科研项目，目标是在IEEE TIE上发表论文。
 
 ## 工作习惯
 
@@ -24,9 +24,8 @@
 3. 通过detector/preprocess_data.py对数据进行预处理。输出 `dataset_win/X_train.npy`、`Y_train_cls.npy`、`Y_train_atk.npy`、`normalizer.npz` 等文件。默认按轨迹族分层 IID 划分为 train/val/test (70/15/15)
 4. 训练CFM检测器，通过detector/train_cfm.py。保存模型至 `detector/models/cfm_cls_best.pt`
 5. 运行检测器仿真，通过simulate.py。输出 `results/sim_*.npz` 和图表
-6. 运行综合评估，通过detector/evaluate.py。输出 `eval/{model_name}/` 含指标、混淆矩阵、重建对比图
-7. 通过detector/test/analyze.py导出DL分析结果
-8. 通过app/interactive_app.py启动交互式可视化GUI
+6. 运行测试集评估，通过detector/evaluate.py。输出 `eval/{model_name}_{timestamp}/` 含混淆矩阵、分类指标、Markdown 报告
+7. 通过app/interactive_app.py启动交互式可视化GUI
 
 ### 独立测试脚本
 
@@ -78,9 +77,9 @@ ReferenceTrajectory(参考轨迹) → NMPC → u_cmd → WMRKinematics(RK4运动
 | `detector/cfm_detector.py` | CFMDetector 模型定义：SimpleConvBackbone (3块 Conv-BN-ReLU-Pool) + 注意力池化分类头 |
 | `detector/preprocess_data.py` | 100 步滑动窗口，物理锚点归一化 (RobustNormalizer)，防数据泄漏的文件级拆分 |
 | `detector/train_cfm.py` | CFMDetector 训练脚本：L = L_cls（纯交叉熵分类，label smoothing 0.05），A0 每 epoch 随机降采样 |
-| `detector/evaluate.py` | 综合评估流水线：闭环仿真 + 混淆矩阵 + 重建对比 + 轨迹跟踪对比 |
+| `detector/evaluate.py` | 测试集分类评估：混淆矩阵 + 逐类精度/召回/F1 + 置信度 + 汇总图 + Markdown 报告 |
 | `detector/models/` | 训练好的模型权重 (cfm_cls_best.pt, cfm_cls_config.npz) |
-| `detector/test/analyze.py` | DL指标分析：混淆矩阵 + 检测准确率/延迟/虚警率 + 汇总图 |
+
 | `app/interactive_app.py` | tkinter 交互式 GUI：轨迹/攻击自由组合 + 时间滑块回放 + 6面板实时显示 |
 | `app/plot_attack_demo.py` | 攻击演示图生成（3×3子图，论文用） |
 | `app/plot_trajectory_coverage.py` | 五族轨迹空间覆盖范围图 |
@@ -122,6 +121,6 @@ ReferenceTrajectory(参考轨迹) → NMPC → u_cmd → WMRKinematics(RK4运动
 
 - `α = 0.17 m` (前端偏移量)
 - `v_max = 0.3 m/s`, `ω_max = 1.76 rad/s`
-- `Ts = 0.05 s` (20 Hz 控制频率), `T_sim = 35 s` (700 步)
+- `Ts = 0.05 s` (20 Hz 控制频率), `T_sim = 50 s` (1000 步)
 - 空间安全边界：`±2.5 m` (x, y 位置硬限幅)
 - 传感器噪声：`σ_xy = 0.0 m`, `σ_θ = 0.0 rad`（关闭，简化问题）

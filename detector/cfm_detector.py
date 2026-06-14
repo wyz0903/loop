@@ -12,7 +12,6 @@ detector/cfm_detector.py — 攻击分类检测器 (cls-only 分支)
     → 注意力池化 → LN → Linear(d_model→9) → cls_logits
 """
 
-import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F

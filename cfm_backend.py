@@ -26,6 +26,9 @@ from typing import Dict
 
 import torch
 
+from model import WMRKinematics
+from attack import ALL_ATTACK_TYPES
+
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
 # ============================================================================
@@ -33,9 +36,7 @@ SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 # ============================================================================
 
 STATE_DIM = 3             # 传感器测量维度 [x, y, theta]
-TS = 0.05                 # 采样周期 [s]
-ALPHA = 0.17              # 前端偏置距离 [m]
-NN_WINDOW_SIZE = 100      # 神经网络输入窗口大小 [步]
+NN_WINDOW_SIZE = 100      # 滑动窗口长度 (与 detector 一致)      # 神经网络输入窗口大小 [步]
 
 
 # ============================================================================
@@ -77,11 +78,8 @@ class CFMDetectorBackend:
       - 检测到攻击时 → 运动学死推算作为位姿估计
     """
 
-    ALL_ATTACK_TYPES = ['A0', 'A1', 'A2', 'A3', 'A4', 'A5', 'A6', 'A7', 'A8']
-
     # ---- 后处理 ----
-    CONFIDENCE_THRESHOLD = 0.5     # 低于此阈值 → 直通不恢复
-    A5_DEAD_RECKON = True          # A5 重放攻击 → 运动学死推算
+    CONFIDENCE_THRESHOLD = 0.5     # 低于此阈值 → 直通不恢复 (所有攻击统一处理)
 
     def __init__(self, model_path: str = None, norm_path: str = None,
                  window_size: int = NN_WINDOW_SIZE, device: str = None):
@@ -193,18 +191,8 @@ class CFMDetectorBackend:
     # 内部运动学模型
     # ------------------------------------------------------------------
 
-    @staticmethod
-    def _kinematic_step(state: np.ndarray, u_cmd: np.ndarray) -> np.ndarray:
-        """WMR 前端位姿运动学 Euler 积分。"""
-        v, w = u_cmd[0], u_cmd[1]
-        theta = state[2]
-        cos_t, sin_t = np.cos(theta), np.sin(theta)
-        dx = v * cos_t - ALPHA * w * sin_t
-        dy = v * sin_t + ALPHA * w * cos_t
-        return state + TS * np.array([dx, dy, w])
-
     def _compute_innovation(self, y_meas: np.ndarray):
-        X_pred = self._kinematic_step(self._internal_state, self._u_cmd)
+        X_pred = WMRKinematics.kinematic_predict(self._internal_state, self._u_cmd)
         return X_pred, y_meas - X_pred
 
     # ------------------------------------------------------------------
@@ -241,12 +229,15 @@ class CFMDetectorBackend:
             print(f"  [WARN] 旧配置 in_channels={in_channels} → 强制使用 {IN_CHANNELS}")
             in_channels = IN_CHANNELS
 
+        use_channel_attn = bool(cfg.get('use_channel_attn', True))
+
         model = CFMDetector(
             in_channels=in_channels,
             window_size=int(cfg.get('window_size', self.window_size)),
             d_model=int(cfg.get('d_model', 128)),
             num_classes=int(cfg.get('num_classes', 9)),
             backbone_type=backbone_type,
+            use_channel_attn=use_channel_attn,
             conv_channels=list(cfg.get('conv_channels', [64, 128, 128])) if 'conv_channels' in cfg else None,
             conv_kernel_size=int(cfg.get('conv_kernel_size', 3)),
             pool_size=int(cfg.get('pool_size', 2)),
@@ -330,7 +321,7 @@ class CFMDetectorBackend:
         probs = torch.softmax(cls_logits, dim=1).cpu().numpy()[0]
         pred_cls = int(probs.argmax())
         confidence = float(probs[pred_cls])
-        attack_class = self.ALL_ATTACK_TYPES[pred_cls]
+        attack_class = ALL_ATTACK_TYPES[pred_cls]
 
         return attack_class, confidence
 

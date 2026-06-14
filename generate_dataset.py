@@ -32,12 +32,13 @@ import argparse
 import numpy as np
 import pandas as pd
 from collections import defaultdict
-from typing import Tuple, Optional
+from typing import Tuple
 
 from model import (WMRParams, WMRKinematics, SensorSimulator,
-                   LissajousTrajectory, CircularTrajectory, SIM_STEPS)
+                   SIM_STEPS,
+                   _rk4_front_axle)
 from controller import NMPCController, NMPCParams
-from attack import SensorAttack, AttackConfig
+from attack import SensorAttack, AttackConfig, ALL_ATTACK_TYPES, ATTACK_NAMES
 
 # ============================================================================
 # 全局配置
@@ -47,64 +48,6 @@ SIM_TIME = 50.0
 DEFAULT_ATTACK_ONSET = 15.0      # 默认攻击开始时间
 RESULT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'dataset')
 os.makedirs(RESULT_DIR, exist_ok=True)
-
-# 内部运动学模型参数（与 CFMDetector 内部运动学一致）
-_ALPHA = 0.17
-_TS = 0.05
-
-
-def _internal_kinematic_step(state: np.ndarray, u_cmd: np.ndarray) -> np.ndarray:
-    """内部运动学 Euler 积分 — 与 CFMDetector 内部运动学一致
-
-    WMR 前端位姿运动学:
-      dX/dt = F_h(theta) * u
-      F_h = [[cos(θ),  -α·sin(θ)],
-             [sin(θ),   α·cos(θ)],
-             [0,        1        ]]
-    """
-    v, w = u_cmd[0], u_cmd[1]
-    theta = state[2]
-    cos_t, sin_t = np.cos(theta), np.sin(theta)
-    dx = v * cos_t - _ALPHA * w * sin_t
-    dy = v * sin_t + _ALPHA * w * cos_t
-    return state + _TS * np.array([dx, dy, w])
-
-
-def _rk4_front_axle(x: float, y: float, theta: float, v: float, w: float, Ts: float,
-                     alpha: float = 0.17):
-    """前端偏置运动学 RK4 积分 (与 WMRKinematics 一致)
-
-    运动学: ẋ = v·cos(θ) − α·w·sin(θ),  ẏ = v·sin(θ) + α·w·cos(θ),  θ̇ = w
-
-    参考轨迹与机器人使用同一运动学模型，确保参考轨迹物理可行。
-    """
-    h = Ts
-
-    def _f(_x, _y, _t):
-        return (v * np.cos(_t) - alpha * w * np.sin(_t),
-                v * np.sin(_t) + alpha * w * np.cos(_t),
-                w)
-
-    k1x, k1y, k1t = _f(x, y, theta)
-    k2x, k2y, k2t = _f(x + h/2*k1x, y + h/2*k1y, theta + h/2*k1t)
-    k3x, k3y, k3t = _f(x + h/2*k2x, y + h/2*k2y, theta + h/2*k2t)
-    k4x, k4y, k4t = _f(x + h*k3x, y + h*k3y, theta + h*k3t)
-
-    xn = x + h/6.0 * (k1x + 2*k2x + 2*k3x + k4x)
-    yn = y + h/6.0 * (k1y + 2*k2y + 2*k3y + k4y)
-    tn = theta + h/6.0 * (k1t + 2*k2t + 2*k3t + k4t)
-    tn = np.arctan2(np.sin(tn), np.cos(tn))
-    return xn, yn, tn
-
-
-# 攻击类型 (与 attack.py 同步)
-ALL_ATTACK_TYPES = ['A0', 'A1', 'A2', 'A3', 'A4', 'A5', 'A6', 'A7', 'A8']
-ATTACK_NAMES = {
-    'A0': 'Normal', 'A1': 'ConstantBias', 'A2': 'Sinusoidal',
-    'A3': 'Drift', 'A4': 'Step', 'A5': 'ReplayAttack',
-    'A6': 'Dropout', 'A7': 'Scaling', 'A8': 'Freeze',
-}
-
 
 # ============================================================================
 # 1. 多样化参考轨迹生成器
@@ -459,7 +402,7 @@ def run_single_simulation(traj: RandomizedTrajectory,
     # ---- 初始化组件 ----
     wmr_params = WMRParams()
     Ts = wmr_params.Ts
-    n_steps = SIM_STEPS   # 700
+    n_steps = SIM_STEPS   # 1000
 
     robot = WMRKinematics(wmr_params)
     sensor = SensorSimulator()
@@ -506,7 +449,7 @@ def run_single_simulation(traj: RandomizedTrajectory,
         attack_signal = y_meas - y_clean  # 等效攻击信号 (重放攻击下非加性)
 
         # 3. 内部运动学新息 (锚定到上一帧测量)
-        X_pred_internal = _internal_kinematic_step(y_meas_prev, u_cmd)
+        X_pred_internal = WMRKinematics.kinematic_predict(y_meas_prev, u_cmd)
         internal_innovation = y_meas - X_pred_internal
         internal_innovation[2] = np.arctan2(np.sin(internal_innovation[2]),
                                               np.cos(internal_innovation[2]))  # θ 包裹到[-π,π]
@@ -534,7 +477,7 @@ def run_single_simulation(traj: RandomizedTrajectory,
         data['Upsilon_r'].append(Upsilon_r.copy())         # 参考位姿 (3,)
         data['u_r'].append(u_r.copy())                     # 参考指令 (2,)
         data['Upsilon_hat'].append(y_meas.copy())             # 状态估计 = 测量 (3,)
-        data['internal_innovation'].append(internal_innovation.copy())  # 内部运动学新息 (3,) ★
+        data['internal_innovation'].append(internal_innovation.copy())  # 内部运动学新息 (3,) ★ 键名与 preprocess_data.py INPUT_CHANNELS 对应
         data['X_error'].append(X_error.copy())             # 跟踪误差 (3,)
         data['u_cmd'].append(u_cmd.copy())                 # 控制指令 (2,)
         data['u_a'].append(u_a.copy())                     # 实际执行指令 (2,)
