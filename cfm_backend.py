@@ -5,7 +5,7 @@ cfm_backend.py — 攻击分类检测器推理后端 (cls-only 分支)
 
 恢复策略:
   - A0 (正常) → y_meas 直通
-  - A5 (重放) → 运动学死推算
+  - A4 (重放) → 运动学死推算
   - 其他攻击 → 运动学死推算 (cls-only 无信号重建能力)
   - 低置信度 → y_meas 直通
 
@@ -48,7 +48,7 @@ class DetectionResult:
     """单步检测器的完整输出
 
     Attributes:
-        attack_class:   攻击类别标签 'A0'~'A8'
+        attack_class:   攻击类别标签 'A0'~'A7'
         confidence:     分类置信度 [0, 1]
         y_recovered:    恢复后的传感器信号 (3,) — 用作位姿估计
         attack_estimate: 估计的攻击分量 (3,) — cls-only 分支为零向量
@@ -235,7 +235,7 @@ class CFMDetectorBackend:
             in_channels=in_channels,
             window_size=int(cfg.get('window_size', self.window_size)),
             d_model=int(cfg.get('d_model', 128)),
-            num_classes=int(cfg.get('num_classes', 9)),
+            num_classes=int(cfg.get('num_classes', 8)),
             backbone_type=backbone_type,
             use_channel_attn=use_channel_attn,
             conv_channels=list(cfg.get('conv_channels', [64, 128, 128])) if 'conv_channels' in cfg else None,
@@ -306,7 +306,7 @@ class CFMDetectorBackend:
         """单次 NN 前向 — 仅分类。
 
         Returns:
-            attack_class:  分类标签 'A0'~'A8'
+            attack_class:  分类标签 'A0'~'A7'
             confidence:    分类置信度 [0, 1]
         """
         ymeas_window = np.array(list(self._ymeas_buffer))

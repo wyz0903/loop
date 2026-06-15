@@ -4,7 +4,7 @@
 
 ## 项目概要
 
-这是一个用于**轮式移动机器人（WMR）传感器攻击检测与恢复**的研究仿真系统。一个类似TurtleBot4的差速驱动机器人在NMPC控制下跟踪参考轨迹，同时其传感器测量数据可能在随机时刻受到攻击。一个基于 SimpleConvBackbone + 通道自注意力的分类检测器（CFMDetector, cls-only）用于分类攻击类型（9类: A0-A8），检测到攻击时切换到运动学死推算作为位姿估计。本项目为一个科研项目，目标是在IEEE TIE上发表论文。
+这是一个用于**轮式移动机器人（WMR）传感器攻击检测与恢复**的研究仿真系统。一个类似TurtleBot4的差速驱动机器人在NMPC控制下跟踪参考轨迹，同时其传感器测量数据可能在随机时刻受到攻击。一个基于 SimpleConvBackbone + 通道自注意力的分类检测器（CFMDetector, cls-only）用于分类攻击类型（8类: A0-A7），检测到攻击时切换到运动学死推算作为位姿估计。本项目为一个科研项目，目标是在IEEE TIE上发表论文。
 
 ## 工作习惯
 
@@ -30,11 +30,11 @@
 ### 独立测试脚本
 
 ```
-python simulate.py                    # CFM模式闭环仿真（默认A4+lissajous）
+python simulate.py                    # CFM模式闭环仿真（默认A1+lissajous）
 python simulate.py --no-detector      # 无检测器基线
 python simulate.py --attack A0        # 无攻击正常运行
 python simulate.py --compare          # 五族轨迹无攻击跟踪对比图
-python simulate.py --all              # 批量所有9种攻击
+python simulate.py --all              # 批量所有8种攻击
 python attack.py                      # 打印攻击类型目录 + 攻击模块自检
 python model.py                       # 运行运动学 / 传感器模块自检
 ```
@@ -54,7 +54,7 @@ ReferenceTrajectory(参考轨迹) → NMPC → u_cmd → WMRKinematics(RK4运动
                                  内部运动学预测 → 新息 innov
                                  滑动窗口: [y_meas(3) + innov(3) + u_cmd(2)] = 8 通道
                                  SimpleConvBackbone (3块 Conv-BN-ReLU-Pool)
-                                   → 注意力池化 → 9 类 softmax (A0-A8)
+                                   → 注意力池化 → 8 类 softmax (A0-A7)
                                  恢复策略: A0/低置信度 → y_meas 直通; 攻击 → 运动学死推算
                                         ↓
                                y_rec → 直接作为位姿估计 (替代 EKF)
@@ -70,9 +70,9 @@ ReferenceTrajectory(参考轨迹) → NMPC → u_cmd → WMRKinematics(RK4运动
 | ---------------------- | ------------------------------------------------------------ |
 | `model.py` | WMR 运动学 (RK4)，李萨如 (Lissajous)/圆形 (Circular) 轨迹生成器，传感器模拟器 |
 | `controller/controller.py` | CasADi Opti NMPC：误差动力学 RK4 预测，菱形约束，控制增量代价函数，IPOPT 求解器 |
-| `attack.py` | 8 种传感器攻击类型 (A1–A8) + 正常情况 (A0)；统一的 `inject()` 注入接口 |
+| `attack.py` | 7 种传感器攻击类型 (A1–A7) + 正常情况 (A0)；统一的 `inject()` 注入接口 |
 | `simulate.py` | 统一闭环仿真：CFM检测器 / 无检测器基线 / 五族轨迹对比 |
-| `generate_dataset.py` | 开环数据生成：5 种随机轨迹系列 × 9 种攻击 |
+| `generate_dataset.py` | 开环数据生成：5 种随机轨迹系列 × 8 种攻击 |
 | `cfm_backend.py` | CFMDetectorBackend 推理包装器：滑动窗口缓冲 + 内部运动学 + 分类 + 恢复策略路由 |
 | `detector/cfm_detector.py` | CFMDetector 模型定义：SimpleConvBackbone (3块 Conv-BN-ReLU-Pool) + 注意力池化分类头 |
 | `detector/preprocess_data.py` | 100 步滑动窗口，物理锚点归一化 (RobustNormalizer)，防数据泄漏的文件级拆分 |
@@ -94,11 +94,10 @@ ReferenceTrajectory(参考轨迹) → NMPC → u_cmd → WMRKinematics(RK4运动
 | A1 | Constant Bias (恒定偏移) | 加性 |
 | A2 | Sinusoidal (正弦注入) | 加性 |
 | A3 | Drift (斜坡漂移) | 加性 |
-| A4 | Step (阶跃) | 加性 |
-| A5 | Replay Attack (重放攻击) | 非加性 |
-| A6 | Intermittent Dropout (信号丢失) | 非加性 |
-| A7 | Scaling (缩放攻击) | 乘性 |
-| A8 | Sensor Freeze (传感器冻结) | 非加性 |
+| A4 | Replay Attack (重放攻击) | 非加性 |
+| A5 | Intermittent Dropout (信号丢失) | 非加性 |
+| A6 | Scaling (缩放攻击) | 乘性 |
+| A7 | Sensor Freeze (传感器冻结) | 非加性 |
 
 ### 轨迹系列
 
@@ -114,7 +113,7 @@ ReferenceTrajectory(参考轨迹) → NMPC → u_cmd → WMRKinematics(RK4运动
 - **物理锚点归一化 (Physical-Anchor Normalization)**：y_meas 用工作空间边界 [2.5m, 2.5m, π] 作为尺度锚点，创新通道用物理异常阈值 [0.5m, 0.5m, 0.3rad] 作为尺度。避免 IQR 归一化将常规攻击信号放大至 10³-10⁵ 导致梯度爆炸。物理含义清晰，论文可辩护。
 - **注意力池化分类头**：可学习的 attn_query 对特征序列加权求和，自适应地聚焦于攻击窗口最具判别力的时间步，替代简单的全局平均池化。
 - **纯分类训练**：单一交叉熵损失 + label smoothing 0.05，无类别权重，通过每 epoch 随机降采样 50% A0 窗口平衡类别分布。
-- **恢复策略路由**：A0 正常或低置信度 (<0.5) → y_meas 直通，避免注入估计误差；检测到攻击 (A1-A8) → 运动学死推算作为位姿估计。无信号重建能力，简洁可解释。
+- **恢复策略路由**：A0 正常或低置信度 (<0.5) → y_meas 直通，避免注入估计误差；检测到攻击 (A1-A7) → 运动学死推算作为位姿估计。无信号重建能力，简洁可解释。
 - **防泄漏分层 IID 拆分**：按轨迹族分层抽样为 train/val/test (70/15/15)，同一 config 的所有窗口整体进入同一划分，保证各划分同分布且无信息泄漏。
 
 ### 物理常量（TurtleBot4 安全模式设定）

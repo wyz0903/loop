@@ -16,13 +16,13 @@ generate_dataset.py — 多样化轨迹攻击数据集生成器
   - random_waypoint : 随机路径点, ω_r 方波切换产生折线/锯齿轨迹
   - square          : 正方形(圆角), 直行段 + 90°圆弧转弯，边长2-5m随机
 
-每条轨迹 × 9 种攻击 (A0~A8) × N 组随机参数 = 多样化训练集
+每条轨迹 × 8 种攻击 (A0~A7) × N 组随机参数 = 多样化训练集
 
 用法:
-  python generate_dataset.py                           # 默认: 50 组轨迹 × 9 攻击 = 450 轮
+  python generate_dataset.py                           # 默认: 50 组轨迹 × 8 攻击 = 400 轮
   python generate_dataset.py --num-configs 100         # 100 组轨迹参数
   python generate_dataset.py --quick                   # 快速测试: 3 组 × 3 攻击
-  python generate_dataset.py --attack A4               # 只生成一种攻击的数据,以A4为例。
+  python generate_dataset.py --attack A1               # 只生成一种攻击的数据,以A1为例。
 """
 
 import os
@@ -392,7 +392,7 @@ def run_single_simulation(traj: RandomizedTrajectory,
 
     Args:
         traj:         随机化的参考轨迹生成器
-        attack_type:  攻击类型 A0~A8
+        attack_type:  攻击类型 A0~A7
         attack_onset: 攻击开始时间
         seed:         随机种子
 
@@ -526,7 +526,7 @@ def generate_dataset(num_configs: int = None,
     Args:
         num_configs:   轨迹参数组数 (向后兼容，随机选族)
         num_per_family: 每族轨迹条数 (默认 12, 5族×12=60配置)
-        attack_types:  要生成的攻击列表，默认全部 9 种
+        attack_types:  要生成的攻击列表，默认全部 8 种
         seed:          全局随机种子
 
     Returns:
@@ -726,9 +726,9 @@ def main():
     parser.add_argument('--num-configs', type=int, default=None,
                         help='轨迹参数组数 (旧模式: 随机选族)')
     parser.add_argument('--attack', type=str, default=None,
-                        help='只生成指定攻击类型 (如 A4), 默认全部')
+                        help='只生成指定攻击类型 (如 A1), 默认全部')
     parser.add_argument('--quick', action='store_true',
-                        help='快速测试: 每族2条 × 3攻击 (A0,A1,A4)')
+                        help='快速测试: 每族2条 × 3攻击 (A0,A1,A2)')
     parser.add_argument('--output-dir', type=str, default=None,
                         help='输出目录 (默认 ./dataset/)')
     parser.add_argument('--seed', type=int, default=42,
@@ -743,7 +743,7 @@ def main():
 
     if args.quick:
         num_per_family = 2
-        attack_types = ['A0', 'A1', 'A4']
+        attack_types = ['A0', 'A1', 'A2']
         print(f"[快速模式] 每族 {num_per_family} 条 × 3 种攻击 = "
               f"{num_per_family * 5 * 3} 轮")
         df = generate_dataset(

@@ -123,7 +123,7 @@ def load_model(config_path: str, weight_path: str, device: torch.device):
         in_channels=int(_cast(cfg.get('in_channels', 8))),
         window_size=int(_cast(cfg.get('window_size', 100))),
         d_model=int(_cast(cfg.get('d_model', 128))),
-        num_classes=int(_cast(cfg.get('num_classes', 9))),
+        num_classes=int(_cast(cfg.get('num_classes', 8))),
         backbone_type=str(_cast(cfg.get('backend_type', cfg.get('backbone_type', 'simple_conv')))),
         conv_channels=list(_cast(cfg.get('conv_channels', [64, 128, 128]))),
         conv_kernel_size=int(_cast(cfg.get('conv_kernel_size', 3))),
@@ -182,7 +182,7 @@ def run_inference(model, dataloader, device: torch.device):
 # ============================================================================
 
 def build_confusion_matrix(y_true: np.ndarray, y_pred: np.ndarray,
-                           num_classes: int = 9):
+                           num_classes: int = 8):
     """构建混淆矩阵 (原始计数 + 行归一化)。
 
     Returns:

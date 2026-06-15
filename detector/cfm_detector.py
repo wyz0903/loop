@@ -4,12 +4,12 @@ detector/cfm_detector.py — 攻击分类检测器 (cls-only 分支)
 精简架构: 简单卷积骨干 + 注意力池化分类头。仅做攻击类型识别。
 
 输入: [y_meas(3) + innov(3) + u_cmd(2)] = 8 通道
-输出: 攻击类别 A0-A8 (9 类 softmax)
+输出: 攻击类别 A0-A7 (8 类 softmax)
 
 架构:
   SimpleConvBackbone (3块 Conv-BN-ReLU-Pool, 通道 8→64→128→128)
     → features (B,W//8,d_model)
-    → 注意力池化 → LN → Linear(d_model→9) → cls_logits
+    → 注意力池化 → LN → Linear(d_model→8) → cls_logits
 """
 
 import torch
@@ -28,7 +28,7 @@ D_MODEL = 128
 NUM_HEADS = 8
 NUM_TRANSFORMER_LAYERS = 4
 DIM_FEEDFORWARD = 512
-NUM_CLASSES = 9
+NUM_CLASSES = 8
 IN_CHANNELS = 8          # [y_meas(3) + innov(3) + u_cmd(2)]
 WINDOW_SIZE = 100
 
@@ -195,10 +195,10 @@ class CFMDetector(nn.Module):
     架构:
       x (B,W,8) -> [ChannelSelfAttention] -> SimpleConvBackbone (3 block)
         -> features (B,W//8,d_model)
-        -> 注意力池化 -> LN -> Dropout -> cls_head -> cls_logits (B,9)
+        -> 注意力池化 -> LN -> Dropout -> cls_head -> cls_logits (B,8)
 
     输入:  [y_meas(3) + innov(3) + u_cmd(2)] = 8 通道
-    输出:  cls_logits (B, 9)  攻击类别 A0-A8
+    输出:  cls_logits (B, 9)  攻击类别 A0-A7
     """
 
     def __init__(self,

@@ -4,10 +4,10 @@ simulate.py — WMR 闭环仿真 (含 CFM 检测器集成)
 统一的闭环仿真脚本，支持: 正常运行 / 攻击场景 / CFM 检测器介入。
 
 模式:
-  python simulate.py                        # CFM 模式 (默认 A4, lissajous)
+  python simulate.py                        # CFM 模式 (默认 A1, lissajous)
   python simulate.py --no-detector          # 无检测器基线
   python simulate.py --attack A1            # 指定攻击类型
-  python simulate.py --all                  # 批量所有 9 种攻击
+  python simulate.py --all                  # 批量所有 8 种攻击
   python simulate.py --compare              # 五族轨迹无攻击跟踪对比
   python simulate.py --no-plot              # 跳过图形显示
 """
@@ -106,7 +106,7 @@ def _create_trajectory(traj_type: str, Ts: float, seed: int):
 # 核心仿真
 # ============================================================================
 
-def run_simulation(attack_type: str = 'A4',
+def run_simulation(attack_type: str = 'A1',
                    use_detector: bool = True,
                    trajectory_type: str = 'lissajous',
                    seed: int = 42,
@@ -117,7 +117,7 @@ def run_simulation(attack_type: str = 'A4',
     """运行单次闭环仿真
 
     Args:
-        attack_type:     攻击类型 'A0'~'A8' (A0=无攻击)
+        attack_type:     攻击类型 'A0'~'A7' (A0=无攻击)
         use_detector:    True=CFMDetectorBackend, False=y_meas 直送 NMPC
         trajectory_type: 轨迹类型 lissajous/circular/spiral/random_waypoint/square
         seed:            随机种子
@@ -433,8 +433,8 @@ def plot_results(data: dict, save_path: str = None):
         cls_ints = np.array([int(str(c)[1:]) if str(c).startswith('A') else 0
                              for c in det_classes])
         ax.fill_between(t, 0, cls_ints, alpha=0.3, color='#9467bd', step='post')
-        ax.set_ylim(-0.5, 8.5); ax.set_yticks(range(9))
-        ax.set_yticklabels([f'A{i}' for i in range(9)])
+        ax.set_ylim(-0.5, 7.5); ax.set_yticks(range(8))
+        ax.set_yticklabels([f'A{i}' for i in range(8)])
         if has_attack:
             ax.axvline(x=onset_time, color='red', linestyle='--', linewidth=1.5, alpha=0.7)
         ax2 = ax.twinx()
@@ -739,10 +739,10 @@ def main():
     parser = argparse.ArgumentParser(
         description='WMR Closed-Loop Simulation with CFM Detector')
 
-    parser.add_argument('--attack', type=str, default='A4',
-                        help='Attack type A0-A8 (default: A4)')
+    parser.add_argument('--attack', type=str, default='A1',
+                        help='Attack type A0-A7 (default: A1)')
     parser.add_argument('--all', action='store_true',
-                        help='Run all 9 attack types')
+                        help='Run all 8 attack types')
     parser.add_argument('--no-detector', action='store_true',
                         help='Disable CFM detector (direct y_meas to NMPC)')
     parser.add_argument('--trajectory', type=str, default='lissajous',

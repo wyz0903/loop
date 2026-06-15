@@ -177,7 +177,7 @@ def evaluate(model, dataloader, device):
 
     n = max(total, 1)
     per_class_acc = {}
-    for cls_idx in range(9):
+    for cls_idx in range(8):
         if class_total[cls_idx] > 0:
             per_class_acc[ALL_ATTACK_TYPES[cls_idx]] = (
                 class_correct[cls_idx] / class_total[cls_idx])
