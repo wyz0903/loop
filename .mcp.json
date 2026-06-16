@@ -27,6 +27,14 @@
     "time": {
       "command": "npx",
       "args": ["-y", "@guanxiong/mcp-server-time"]
+    },
+    "zotero": {
+      "command": "D:\\anaconda\\envs\\learning&control\\Scripts\\zotero-mcp.exe",
+      "env": {
+        "ZOTERO_LOCAL": "true",
+        "NO_PROXY": "localhost,127.0.0.1",
+        "no_proxy": "localhost,127.0.0.1"
+      }
     }
   }
 }

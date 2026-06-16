@@ -56,8 +56,8 @@ class AttackConfig:
     # —— A5 信号丢失 (Intermittent Dropout) ——
     # 来源: 接线松动、连接器氧化，传感器间歇性开路 → 输出为零
     # Gilbert-Elliott 双状态 Markov 模型
-    dropout_p_gf: float = 0.008                       # P(good→fault) 每步转移概率
-    dropout_p_fg: float = 0.12                        # P(fault→good) 每步转移概率
+    dropout_p_gf: float = 0.02                        # P(good→fault) 每步转移概率 (稳态故障率~20%)
+    dropout_p_fg: float = 0.08                        # P(fault→good) 每步转移概率 (平均故障持续~12.5步)
     dropout_zero_output: bool = True                   # True=输出归零, False=保持末值
 
     # —— A6 缩放攻击 (Scaling) ——

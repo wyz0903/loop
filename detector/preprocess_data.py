@@ -52,6 +52,10 @@ TRAIN_RATIO = 0.70
 VAL_RATIO = 0.15    # test = 1 - train - val = 0.17
 SPLIT_SEED = 42     # 分层抽样固定种子, 保证可复现
 
+# 窗口攻击活跃度阈值 — 标注时检查窗口内攻击信号是否真实存在
+ATTACK_EPS = 1e-6               # 单步攻击幅值阈值 [m/rad]
+MIN_ACTIVE_RATIO = 0.05         # 窗口内最少 5% 步受攻击才保留攻击标签
+
 
 # 物理上限 (TurtleBot4 安全模式)
 PHYSICAL_MAX = np.array([0.3, 1.76], dtype=np.float32)  # v_max, omega_max
@@ -363,7 +367,13 @@ def main():
                 w_end = w * args.stride + args.window
                 w_start = w * args.stride
                 if w_end > onset_step and w_start < offset_step:
-                    cls_per_window[w] = atk_label
+                    # 窗口攻击活跃度检查: 攻击信号真实存在才保留标签
+                    a_true_window = y_meas_w[w] - y_clean_w[w]           # (W, 3)
+                    attack_mag = np.linalg.norm(a_true_window, axis=1)    # (W,) 每步幅值
+                    active_ratio = np.mean(attack_mag > ATTACK_EPS)
+                    if active_ratio >= MIN_ACTIVE_RATIO:
+                        cls_per_window[w] = atk_label
+                    # else: 保持 A0_LABEL — 窗口内攻击信号过弱, 视为正常
 
         if in_train:
             train_X.append(X_w)
@@ -386,18 +396,18 @@ def main():
 
     # 合并
     print("合并数据...")
-    X_train_all = np.concatenate(train_X, axis=0).astype(np.float32)
-    X_val_all = np.concatenate(val_X, axis=0).astype(np.float32)
-    X_test_all = np.concatenate(test_X, axis=0).astype(np.float32)
-    clean_train_all = np.concatenate(train_clean, axis=0).astype(np.float32)
-    clean_val_all = np.concatenate(val_clean, axis=0).astype(np.float32)
-    clean_test_all = np.concatenate(test_clean, axis=0).astype(np.float32)
-    cls_train_all = np.concatenate(train_cls, axis=0)
-    cls_val_all = np.concatenate(val_cls, axis=0)
-    cls_test_all = np.concatenate(test_cls, axis=0)
-    y_meas_train_all = np.concatenate(train_ymeas, axis=0).astype(np.float32)
-    y_meas_val_all = np.concatenate(val_ymeas, axis=0).astype(np.float32)
-    y_meas_test_all = np.concatenate(test_ymeas, axis=0).astype(np.float32)
+    X_train_all = np.concatenate(train_X, axis=0).astype(np.float32) if train_X else np.empty((0, args.window, len(INPUT_CHANNELS)*3-1), dtype=np.float32)
+    X_val_all = np.concatenate(val_X, axis=0).astype(np.float32) if val_X else np.empty((0, args.window, len(INPUT_CHANNELS)*3-1), dtype=np.float32)
+    X_test_all = np.concatenate(test_X, axis=0).astype(np.float32) if test_X else np.empty((0, args.window, len(INPUT_CHANNELS)*3-1), dtype=np.float32)
+    clean_train_all = np.concatenate(train_clean, axis=0).astype(np.float32) if train_clean else np.empty((0, args.window, 3), dtype=np.float32)
+    clean_val_all = np.concatenate(val_clean, axis=0).astype(np.float32) if val_clean else np.empty((0, args.window, 3), dtype=np.float32)
+    clean_test_all = np.concatenate(test_clean, axis=0).astype(np.float32) if test_clean else np.empty((0, args.window, 3), dtype=np.float32)
+    cls_train_all = np.concatenate(train_cls, axis=0) if train_cls else np.empty((0,), dtype=np.int64)
+    cls_val_all = np.concatenate(val_cls, axis=0) if val_cls else np.empty((0,), dtype=np.int64)
+    cls_test_all = np.concatenate(test_cls, axis=0) if test_cls else np.empty((0,), dtype=np.int64)
+    y_meas_train_all = np.concatenate(train_ymeas, axis=0).astype(np.float32) if train_ymeas else np.empty((0, args.window, 3), dtype=np.float32)
+    y_meas_val_all = np.concatenate(val_ymeas, axis=0).astype(np.float32) if val_ymeas else np.empty((0, args.window, 3), dtype=np.float32)
+    y_meas_test_all = np.concatenate(test_ymeas, axis=0).astype(np.float32) if test_ymeas else np.empty((0, args.window, 3), dtype=np.float32)
 
     print(f"\n原始数据:")
     print(f"  Train: X={X_train_all.shape}, cls={cls_train_all.shape}, "

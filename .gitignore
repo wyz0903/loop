@@ -47,3 +47,15 @@ review/
 # Evaluation outputs
 eval/
 detector/eval/
+
+# Literature PDF stash (all files — research content, not code)
+papers/
+
+# Utility scripts (Zotero import, bib manager, etc.)
+tools/
+
+# Knowledge base (literature notes, synthesis, workflow — research content, not code)
+knowledge/
+
+# Persistent memory (Claude session memory)
+memory/
