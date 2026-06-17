@@ -32,7 +32,8 @@ warnings.filterwarnings('ignore', message='.*non-writable tensor.*')
 from detector.cfm_detector import (CFMDetector,
                                     D_MODEL, NUM_TRANSFORMER_LAYERS, NUM_HEADS,
                                     DIM_FEEDFORWARD,
-                                    CONV_CHANNELS, CONV_KERNEL_SIZE, POOL_SIZE)
+                                    CONV_CHANNELS, CONV_KERNEL_SIZES, CONV_DILATIONS,
+                                    POOL_SIZE)
 
 # ============================================================================
 # 攻击类型常量 (来自 attack.py 唯一数据源)
@@ -123,7 +124,7 @@ EARLY_STOP_PATIENCE = 50
 GRAD_CLIP = 1.0
 
 # 重建损失
-RECON_LAMBDA = 0.2               # 重建损失权重
+RECON_LAMBDA = 0.3               # 重建损失权重
 RECON_WARMUP = 20                # 前 N epoch 仅分类, 之后加入重建损失
 
 # ReduceLROnPlateau 调度器
@@ -308,7 +309,7 @@ def build_model(backbone_type='simple_conv', norm_params: dict = None):
     """构建 CFMDetector (编码器-解码器)。"""
     kwargs = {'backbone_type': backbone_type,
               'conv_channels': CONV_CHANNELS,
-              'conv_kernel_size': CONV_KERNEL_SIZE,
+              'conv_kernel_size': CONV_KERNEL_SIZES[0],
               'pool_size': POOL_SIZE}
     if norm_params:
         kwargs['ymeas_scale'] = norm_params['ymeas_scale'].tolist()

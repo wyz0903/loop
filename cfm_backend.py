@@ -118,7 +118,6 @@ class CFMDetectorBackend:
 
         # ---- 滑动窗口缓冲区 ----
         self._ymeas_buffer = deque(maxlen=window_size)
-        self._innov_buffer = deque(maxlen=window_size)
         self._ucmd_buffer = deque(maxlen=window_size)
 
         # ---- 统计分析 ----
@@ -137,27 +136,21 @@ class CFMDetectorBackend:
         """主检测接口 — 每步调用一次。
 
         检测策略:
-          1. 内部运动学预测 → 新息
-          2. 推入滑动窗口
-          3. 编码器+分类头分类 (107K, 每次必跑)
-          4. 检测到攻击 → 解码器重建 (+43.6K, 按需)
-          5. 正常/低置信度 → 直通; 攻击 → 解码器恢复
+          1. 推入滑动窗口缓冲区 (y_meas, u_cmd)
+          2. 窗口锚定运动学新息在 _build_input_tensor 中在线计算
+          3. 分类 + 按需解码 → 恢复路由
         """
         self._step_count += 1
         y_meas = np.asarray(y_meas, dtype=float).ravel()
 
-        # 1. 内部运动学预测 → 新息
-        X_pred, innovation = self._compute_innovation(y_meas)
-
-        # 2. 推入缓冲区
+        # 1. 推入缓冲区
         self._ymeas_buffer.append(y_meas.copy())
-        self._innov_buffer.append(innovation)
         self._ucmd_buffer.append(self._u_cmd.copy())
 
-        # 3. 更新内部运动学状态为当前测量 (锚定)
+        # 2. 更新内部运动学状态 (锚定)
         self._internal_state = y_meas.copy()
 
-        # 4. 窗口未就绪 → 直通
+        # 3. 窗口未就绪 → 直通
         if not self._is_window_ready():
             return DetectionResult(
                 attack_class='A0', confidence=0.0,
@@ -165,12 +158,12 @@ class CFMDetectorBackend:
                 features={'status': 'window_filling',
                           'readiness': self._window_readiness()})
 
-        # 5. 分类: 编码器+分类头 (107K, 每次必跑)
+        # 4. 分类: 编码器+分类头
         t0 = time.time()
         x_tensor = self._build_input_tensor()
         attack_class, confidence, features = self._nn_classify(x_tensor)
 
-        # 6. 按需解码: 仅检测到攻击时运行解码器 (+43.6K)
+        # 5. 按需解码: 仅检测到攻击时运行解码器
         y_decoded = None
         delta = np.zeros(3)
         need_reconstruct = (confidence >= self.CONFIDENCE_THRESHOLD
@@ -181,11 +174,12 @@ class CFMDetectorBackend:
         self._inference_count += 1
         self._total_inference_time += time.time() - t0
 
-        # 7. 恢复: 正常→直通, 攻击→解码器重建
+        # 6. 恢复: 正常→直通, 攻击→解码器重建
+        X_pred = WMRKinematics.kinematic_predict(self._internal_state, self._u_cmd)
         y_recovered = self._recover(y_meas, attack_class, confidence,
                                     X_pred, y_decoded)
 
-        # 8. 锚定内部运动学状态到恢复测量
+        # 7. 锚定内部运动学状态到恢复测量
         self._internal_state = y_recovered.copy()
 
         return DetectionResult(
@@ -201,7 +195,6 @@ class CFMDetectorBackend:
         self._u_cmd = np.zeros(2)
         self._step_count = 0
         self._ymeas_buffer.clear()
-        self._innov_buffer.clear()
         self._ucmd_buffer.clear()
         self._inference_count = 0
         self._total_inference_time = 0.0
@@ -210,26 +203,20 @@ class CFMDetectorBackend:
     # 内部运动学模型
     # ------------------------------------------------------------------
 
-    def _compute_innovation(self, y_meas: np.ndarray):
-        X_pred = WMRKinematics.kinematic_predict(self._internal_state, self._u_cmd)
-        return X_pred, y_meas - X_pred
+    def _compute_innovation_window(self, ymeas: np.ndarray, ucmd: np.ndarray) -> np.ndarray:
+        """计算窗口锚定运动学新息 (整窗)。
 
-    def _compute_kinres_window(self, ymeas: np.ndarray, ucmd: np.ndarray) -> np.ndarray:
-        """计算窗口锚定运动学残差 (整窗)。
+        innov_anchored[t] = y_meas[t] - rollout(y_meas[0], u_cmd[0:t])[t]
 
-        从窗口第一帧 y_meas[0] 出发, 沿 u_cmd 做 100 步运动学递推,
-        与实测值逐帧比较: kin_res = y_meas - y_kin。
-
-        打破非加性攻击的自指涉污染反馈环:
-          - 递推仅用 u_cmd (控制指令), 不引入 y_meas[1:] 的污染
-          - 累积误差暴露 A4(重放)/A5(丢包)/A7(冻结) 的长期不一致
+        从窗口第一帧出发沿控制序列做运动学递推, 与实测逐帧比较。
+        统一替代 1-step innov + kin_res: 打破非加性攻击的自指涉污染反馈环。
 
         Args:
             ymeas: (W, 3) y_meas 窗口
             ucmd:  (W, 2) u_cmd 窗口
 
         Returns:
-            kin_res: (W, 3) 窗口锚定运动学残差
+            innov: (W, 3) 窗口锚定运动学新息
         """
         W = len(ymeas)
         y_kin = np.zeros((W, 3), dtype=np.float32)
@@ -242,20 +229,19 @@ class CFMDetectorBackend:
             dy = v * sin_t + 0.17 * w * cos_t
             y = y + 0.05 * np.array([dx, dy, w])
             y_kin[k + 1] = y
-        kin_res = ymeas - y_kin
-        # theta 包裹到 [-pi, pi]
-        kin_res[:, 2] = np.arctan2(np.sin(kin_res[:, 2]), np.cos(kin_res[:, 2]))
-        return kin_res
+        innov = ymeas - y_kin
+        innov[:, 2] = np.arctan2(np.sin(innov[:, 2]), np.cos(innov[:, 2]))
+        return innov
 
     # ------------------------------------------------------------------
     # 窗口管理
     # ------------------------------------------------------------------
 
     def _is_window_ready(self) -> bool:
-        return len(self._innov_buffer) >= self.window_size
+        return len(self._ymeas_buffer) >= self.window_size
 
     def _window_readiness(self) -> int:
-        return max(0, self.window_size - len(self._innov_buffer))
+        return max(0, self.window_size - len(self._ymeas_buffer))
 
     # ------------------------------------------------------------------
     # 模型加载与归一化
@@ -287,10 +273,10 @@ class CFMDetectorBackend:
         model = CFMDetector(
             in_channels=in_channels,
             window_size=int(cfg.get('window_size', self.window_size)),
-            d_model=int(cfg.get('d_model', 128)),
+            d_model=int(cfg.get('d_model', 96)),
             num_classes=int(cfg.get('num_classes', 8)),
             backbone_type=backbone_type,
-            use_channel_attn=use_channel_attn,
+            use_channel_attn=False,
             use_decoder=use_decoder,
             conv_channels=list(cfg.get('conv_channels', [64, 128, 128])) if 'conv_channels' in cfg else None,
             conv_kernel_size=int(cfg.get('conv_kernel_size', 3)),
@@ -330,25 +316,20 @@ class CFMDetectorBackend:
             self._ymeas_scale = data.get('ymeas_scale',
                                           np.array([2.5, 2.5, np.pi], dtype=np.float32))
             self._feat_median = data['feat_median']
-            if 'innov_scale' in data:
-                self._innov_scale = data['innov_scale']
-            elif 'feat_iqr' in data:
-                self._innov_scale = data['feat_iqr']
+            # innov_anchored 使用 y_meas 物理空间尺度
+            if 'feat_scale' in data:
+                self._feat_scale = data['feat_scale']
+            elif 'innov_scale' in data:
+                self._feat_scale = data['innov_scale']
             else:
-                self._innov_scale = np.array([0.5, 0.5, 0.3], dtype=np.float32)
-            # 窗口运动学残差归一化参数 (向后兼容旧 normalizer 无此字段)
-            self._kinres_median = data.get('kinres_median', np.zeros(3, dtype=np.float32))
-            self._kinres_scale = data.get('kinres_scale',
-                                           np.array([2.5, 2.5, np.pi], dtype=np.float32))
+                self._feat_scale = np.array([2.5, 2.5, np.pi], dtype=np.float32)
             self._cmd_max = data['cmd_max']
         else:
             print(f"  [WARN] 归一化参数未找到: {norm_path}, 使用默认值")
             self._ymeas_median = np.zeros(3, dtype=np.float32)
             self._ymeas_scale = np.array([2.5, 2.5, np.pi], dtype=np.float32)
             self._feat_median = np.zeros(3)
-            self._innov_scale = np.array([0.5, 0.5, 0.3], dtype=np.float32)
-            self._kinres_median = np.zeros(3, dtype=np.float32)
-            self._kinres_scale = np.array([2.5, 2.5, np.pi], dtype=np.float32)
+            self._feat_scale = np.array([2.5, 2.5, np.pi], dtype=np.float32)
             self._cmd_max = np.array([0.3, 1.76])
 
     def _sync_norm_to_model(self):
@@ -361,26 +342,24 @@ class CFMDetectorBackend:
             )
 
     def _normalize(self, ymeas_window: np.ndarray, innov_window: np.ndarray,
-                   kinres_window: np.ndarray, ucmd_window: np.ndarray) -> np.ndarray:
-        """归一化: y_meas + innov + kin_res + u_cmd → (W, 11)。"""
+                   ucmd_window: np.ndarray) -> np.ndarray:
+        """归一化: y_meas + innov_anchored + u_cmd → (W, 8)。"""
         ymeas_norm = (ymeas_window - self._ymeas_median) / np.maximum(self._ymeas_scale, 1e-6)
-        innov_norm = (innov_window - self._feat_median) / np.maximum(self._innov_scale, 1e-6)
-        kinres_norm = (kinres_window - self._kinres_median) / np.maximum(self._kinres_scale, 1e-6)
+        innov_norm = (innov_window - self._feat_median) / np.maximum(self._feat_scale, 1e-6)
         ucmd_norm = ucmd_window / self._cmd_max
-        return np.concatenate([ymeas_norm, innov_norm, kinres_norm, ucmd_norm], axis=1)
+        return np.concatenate([ymeas_norm, innov_norm, ucmd_norm], axis=1)
 
     # ------------------------------------------------------------------
     # NN 推理 (两步: 分类 → 按需解码)
     # ------------------------------------------------------------------
 
     def _build_input_tensor(self) -> torch.Tensor:
-        """从缓冲区构建归一化输入张量 (100, 11)。"""
+        """从缓冲区构建归一化输入张量 (100, 8)。"""
         ymeas_window = np.array(list(self._ymeas_buffer))
-        innov_window = np.array(list(self._innov_buffer))
         ucmd_window = np.array(list(self._ucmd_buffer))
-        # 窗口锚定运动学残差: 在线计算 (~0.1ms)
-        kinres_window = self._compute_kinres_window(ymeas_window, ucmd_window)
-        x_norm = self._normalize(ymeas_window, innov_window, kinres_window, ucmd_window)
+        # 窗口锚定运动学新息: 在线计算 (~0.1ms)
+        innov_window = self._compute_innovation_window(ymeas_window, ucmd_window)
+        x_norm = self._normalize(ymeas_window, innov_window, ucmd_window)
         return torch.from_numpy(x_norm.astype(np.float32)).unsqueeze(0).to(self._device)
 
     def _nn_classify(self, x_tensor: torch.Tensor):

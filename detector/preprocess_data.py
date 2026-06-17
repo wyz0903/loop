@@ -41,12 +41,11 @@ os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 from attack import ALL_ATTACK_TYPES, ATTACK_NAMES
 
-# 输入通道: 传感器测量 + 内部运动学新息 + 窗口锚定运动学残差 + 控制上下文
-# 注意: 'internal_innovation' 键名必须与 generate_dataset.py 输出的 .npz 键名一致
-# 'kin_res' 在 build_windows() 中从 y_meas 和 u_cmd 在线计算 (窗口锚定, 无法预存)
-INPUT_CHANNELS = ['y_meas', 'internal_innovation', 'u_cmd']   # y_meas(3) + innov(3) + u_cmd(2) = 8 通道基础
-# 最终输出 11 通道: [y_meas(3) + innov(3) + kin_res(3) + u_cmd(2)]
-# kin_res(3) 在 build_windows() 窗口级追加
+# 输入通道: 基础信号从 .npz 读取, innov_anchored 在 build_windows() 窗口级计算
+# innov_anchored[t] = y_meas[t] - rollout(y_meas[0], u_cmd[0:t])[t]
+# (统一替代 1-step innov + kin_res: 打破非加性攻击自指涉污染反馈环)
+INPUT_CHANNELS = ['y_meas', 'u_cmd']   # y_meas(3) + u_cmd(2) = 5 通道基础
+# 最终输出 8 通道: [y_meas(3) + innov_anchored(3) + u_cmd(2)]
 from model import SIM_STEPS, SIM_TIME
 N_STEPS = SIM_STEPS       # 1000，避免 IEEE 754 截断误差
 WINDOW_SIZE = 100
@@ -69,70 +68,42 @@ Y_MEAS_SCALE = np.array([2.5, 2.5, np.pi], dtype=np.float32)  # [x_max, y_max, p
 class RobustNormalizer:
     """物理锚点归一化器 (Physical-Anchor Normalization)
 
-    通道布局 (11 通道):
-      - y_meas (前 3 通道):    (x - median_y) / Y_MEAS_SCALE   -- 工作空间物理锚点
-      - innovation (通 3:6):   (x - median_innov) / INNOV_SCALE -- 运动学异常锚点
-      - kin_res (通 6:9):      (x - median_kinres) / Y_MEAS_SCALE -- 窗口运动学残差 (同 y_meas 物理空间)
-      - u_cmd (最后 2 通道):    x / cmd_max                     -- 控制物理上限
+    通道布局 (8 通道):
+      - y_meas (0:3):           (x - median_y) / Y_MEAS_SCALE      — 工作空间物理锚点
+      - innov_anchored (3:6):   (x - median_innov) / Y_MEAS_SCALE  — 与 y_meas 同物理空间
+      - u_cmd (6:8):            x / cmd_max                        — 控制物理上限
 
     设计原理:
-      单步运动学预测误差 (innovation) 在正常运行时 ~ 0 (Ts=0.05s, 无传感器噪声)。
-      若用 IQR 归一化 `(x-median)/IQR`, IQR 可低至 1e-6 量级, 除以极小值
-      将常规攻击信号 (0.1-0.5 m/rad) 放大到 10^3-10^5, 导致 NN 训练梯度爆炸。
-
-      改用固定物理锚点尺度 sigma 作为分母:
-        - y_meas / kin_res 尺度: [2.5m, 2.5m, π rad]  -- 工作空间边界
-        - sigma_xy = 0.5 m   -- 单步位置误差 > 0.5m 在任何工况下均不可能正常发生
-        - sigma_th = 0.3 rad -- 单步航向误差 > 0.3rad (17deg) 明确异常
-
-      优势: 数值天然稳定, 物理含义清晰, 论文可辩护。
-      所有通道均除以该通道的物理特征尺度。
-
-    所有统计量从训练集计算，验证集/测试集复用，保证无信息泄漏。
+      innov_anchored 是 y_meas 与运动学递推的差值, 本身处于米/弧度物理空间。
+      归一化尺度应复用 Y_MEAS_SCALE [2.5m, 2.5m, π rad], 保证数值稳定且物理含义一致。
+      所有统计量从训练集计算, 验证集/测试集复用, 保证无信息泄漏。
     """
 
-    # 创新通道物理锚点尺度 (sigma): 代表"明确异常"的单步误差阈值
-    INNOV_SCALE = np.array([0.5, 0.5, 0.3], dtype=np.float32)  # [x, y, theta]
-
     def __init__(self):
-        self.ymeas_median = None    # (3,) y_meas 通道中位数 (去中心化)
-        self.ymeas_scale = Y_MEAS_SCALE.copy()  # (3,) y_meas 通道锚点尺度
-        self.feat_median = None     # (3,) 创新通道中位数 (去中心化)
-        self.innov_scale = None     # (3,) 创新通道锚点尺度 (= INNOV_SCALE)
-        self.kinres_median = None   # (3,) 窗口残差通道中位数 (去中心化)
-        self.kinres_scale = Y_MEAS_SCALE.copy()  # (3,) 窗口残差锚点尺度 (= Y_MEAS_SCALE, 同物理空间)
-        self.cmd_max = PHYSICAL_MAX.copy()  # (2,) 控制指令物理上限
+        self.ymeas_median = None     # (3,) y_meas 通道中位数
+        self.ymeas_scale = Y_MEAS_SCALE.copy()        # (3,) y_meas 通道锚点尺度
+        self.feat_median = None      # (3,) innov_anchored 通道中位数
+        self.feat_scale = Y_MEAS_SCALE.copy()          # (3,) innov_anchored 尺度 = y_meas 尺度
+        self.cmd_max = PHYSICAL_MAX.copy()             # (2,) 控制指令物理上限
 
     def fit(self, X: np.ndarray):
         """从训练集计算归一化参数
 
         Args:
-            X: (N, W, 11) 训练窗口, 布局 [y_meas(3)+innov(3)+kin_res(3)+u_cmd(2)]
+            X: (N, W, 8) 训练窗口, 布局 [y_meas(3)+innov_anchored(3)+u_cmd(2)]
         """
-        # y_meas 通道 (0:3)
         ymeas_data = X[:, :, 0:3].reshape(-1, 3)
         self.ymeas_median = np.median(ymeas_data, axis=0).astype(np.float32)
-        # 创新通道 (3:6)
         innov_data = X[:, :, 3:6].reshape(-1, 3)
         self.feat_median = np.median(innov_data, axis=0).astype(np.float32)
-        # 物理锚点: 固定 sigma, 不依赖数据分布 (避免 IQR 对尖峰分布的放大效应)
-        self.innov_scale = self.INNOV_SCALE.copy()
-        # 窗口运动学残差通道 (6:9) — 与 y_meas 同物理空间
-        kinres_data = X[:, :, 6:9].reshape(-1, 3)
-        self.kinres_median = np.median(kinres_data, axis=0).astype(np.float32)
         return self
 
     def transform(self, X: np.ndarray) -> np.ndarray:
         """应用归一化"""
         X_norm = np.zeros_like(X, dtype=np.float32)
-        # y_meas 通道 (0:3): (x - median_y) / y_meas_scale
         X_norm[:, :, 0:3] = (X[:, :, 0:3] - self.ymeas_median) / self.ymeas_scale
-        # 创新通道 (3:6): (x - median_innov) / innov_scale
-        X_norm[:, :, 3:6] = (X[:, :, 3:6] - self.feat_median) / self.innov_scale
-        # 窗口残差通道 (6:9): (x - median_kinres) / kinres_scale
-        X_norm[:, :, 6:9] = (X[:, :, 6:9] - self.kinres_median) / self.kinres_scale
-        # u_cmd 通道 (9:11): x / cmd_max
-        X_norm[:, :, 9:11] = X[:, :, 9:11] / self.cmd_max
+        X_norm[:, :, 3:6] = (X[:, :, 3:6] - self.feat_median) / self.feat_scale
+        X_norm[:, :, 6:8] = X[:, :, 6:8] / self.cmd_max
         return X_norm
 
     def fit_transform(self, X: np.ndarray) -> np.ndarray:
@@ -140,27 +111,19 @@ class RobustNormalizer:
         return self.transform(X)
 
     def unnormalize_y_meas(self, Y_norm: np.ndarray) -> np.ndarray:
-        """将归一化的 y_clean_hat 还原为物理单位
-
-        Args:
-            Y_norm: (..., 3) 归一化干净信号
-        Returns:
-            (..., 3) 物理单位
-        """
         return Y_norm * self.ymeas_scale + self.ymeas_median
 
     def save(self, filepath: str):
         np.savez(filepath,
                  ymeas_median=self.ymeas_median, ymeas_scale=self.ymeas_scale,
-                 feat_median=self.feat_median, innov_scale=self.innov_scale,
-                 kinres_median=self.kinres_median, kinres_scale=self.kinres_scale,
+                 feat_median=self.feat_median, feat_scale=self.feat_scale,
                  cmd_max=self.cmd_max)
 
     @classmethod
     def load(cls, filepath: str) -> 'RobustNormalizer':
         data = np.load(filepath)
         obj = cls()
-        # 向后兼容: 旧格式无 ymeas_median/ymeas_scale
+        # 向后兼容旧格式
         if 'ymeas_median' in data:
             obj.ymeas_median = data['ymeas_median']
             obj.ymeas_scale = data['ymeas_scale']
@@ -168,20 +131,12 @@ class RobustNormalizer:
             obj.ymeas_median = np.zeros(3, dtype=np.float32)
             obj.ymeas_scale = Y_MEAS_SCALE.copy()
         obj.feat_median = data['feat_median']
-        # 向后兼容旧格式 'feat_iqr'
-        if 'innov_scale' in data:
-            obj.innov_scale = data['innov_scale']
-        elif 'feat_iqr' in data:
-            obj.innov_scale = data['feat_iqr']
+        if 'feat_scale' in data:
+            obj.feat_scale = data['feat_scale']
+        elif 'innov_scale' in data:
+            obj.feat_scale = data['innov_scale']
         else:
-            obj.innov_scale = cls.INNOV_SCALE.copy()
-        # 向后兼容: 旧格式无 kinres_median/kinres_scale
-        if 'kinres_median' in data:
-            obj.kinres_median = data['kinres_median']
-            obj.kinres_scale = data['kinres_scale']
-        else:
-            obj.kinres_median = np.zeros(3, dtype=np.float32)
-            obj.kinres_scale = Y_MEAS_SCALE.copy()
+            obj.feat_scale = Y_MEAS_SCALE.copy()
         obj.cmd_max = data['cmd_max']
         return obj
 
@@ -219,7 +174,10 @@ def numpy_kinematic_rollout(y0: np.ndarray, u_seq: np.ndarray,
 
 
 def build_windows(data: dict, window_size: int, stride: int) -> tuple:
-    """从单个仿真数据中提取滑动窗口
+    """从单个仿真数据中提取滑动窗口。
+
+    innov_anchored[t] = y_meas[t] - rollout(y_meas[0], u_cmd[0:t])[t]
+    窗口锚定运动学残差 — 统一替代 1-step innov + kin_res。
 
     Args:
         data:      .npz 加载的字典，含各信号的时间序列
@@ -227,39 +185,34 @@ def build_windows(data: dict, window_size: int, stride: int) -> tuple:
         stride:      步长
 
     Returns:
-        X_windows:       (N, W, 11) 模型输入特征窗口
-                         [y_meas(3)+innov(3)+kin_res(3)+u_cmd(2)]
-        y_clean_windows: (N, W, 3)  干净传感器信号窗口 (流匹配目标)
-        y_meas_windows:  (N, W, 3)  原始测量窗口 (物理单位, 用于物理损失)
+        X_windows:       (N, W, 8)  模型输入特征窗口
+                         [y_meas(3)+innov_anchored(3)+u_cmd(2)]
+        y_clean_windows: (N, W, 3)  干净传感器信号窗口
+        y_meas_windows:  (N, W, 3)  原始测量窗口 (物理单位)
     """
-    # 拼接模型输入通道 (y_meas + innovation + u_cmd)
+    # 拼接基础通道 (y_meas + u_cmd)
     ch_arrays = []
     for ch_name in INPUT_CHANNELS:
         arr = data[ch_name]
         if arr.ndim == 1:
             arr = arr[:, np.newaxis]
         ch_arrays.append(arr)
-    X_all = np.concatenate(ch_arrays, axis=1).astype(np.float32)  # (T, 8)
+    X_base = np.concatenate(ch_arrays, axis=1).astype(np.float32)  # (T, 5)
 
-    # theta 创新包裹到 [-pi, pi] (防御性: 确保角度差物理含义)
-    # 创新通道在索引 5 (y_meas 3ch + innov_theta 是第 6 个通道 = 索引 5)
-    X_all[:, 5] = np.arctan2(np.sin(X_all[:, 5]), np.cos(X_all[:, 5]))
+    y_meas_all = data['y_meas'].astype(np.float32)               # (T, 3)
+    u_cmd_all = data['u_cmd'].astype(np.float32)                 # (T, 2)
 
-    # 构建 y_clean 目标: 从 .npz 读取 (新数据) 或从 y_meas - attack_signal 回算 (旧数据)
+    # 构建 y_clean 目标
     if 'y_clean' in data:
-        y_clean_all = data['y_clean'].astype(np.float32)           # (T, 3)
+        y_clean_all = data['y_clean'].astype(np.float32)
     else:
-        # 向后兼容: 从现有数据计算
-        y_meas_all = data['y_meas'].astype(np.float32)
+        y_meas_all_raw = data['y_meas'].astype(np.float32)
         atk_all = data['attack_signal'].astype(np.float32)
-        y_clean_all = y_meas_all - atk_all
-
-    y_meas_all = data['y_meas'].astype(np.float32)               # (T, 3) 物理单位
-    u_cmd_all = data['u_cmd'].astype(np.float32)                 # (T, 2) 物理单位
+        y_clean_all = y_meas_all_raw - atk_all
 
     # 滑动窗口
     n_windows = (N_STEPS - window_size) // stride + 1
-    n_total_ch = X_all.shape[1] + 3  # +3 for kin_res
+    n_total_ch = 8  # y_meas(3) + innov_anchored(3) + u_cmd(2)
     X_windows = np.zeros((n_windows, window_size, n_total_ch), dtype=np.float32)
     y_clean_windows = np.zeros((n_windows, window_size, y_clean_all.shape[1]), dtype=np.float32)
     y_meas_windows = np.zeros((n_windows, window_size, y_meas_all.shape[1]), dtype=np.float32)
@@ -267,15 +220,20 @@ def build_windows(data: dict, window_size: int, stride: int) -> tuple:
     for i in range(n_windows):
         start = i * stride
         end = start + window_size
-        X_windows[i, :, :8] = X_all[start:end]
-        # 窗口锚定运动学残差: kin_res = y_meas - rollout(y_meas[0], u_cmd)
+        # 基础通道 (y_meas + u_cmd)
+        X_windows[i, :, 0:3] = y_meas_all[start:end]              # y_meas
+        X_windows[i, :, 6:8] = u_cmd_all[start:end]               # u_cmd
+
+        # 窗口锚定运动学残差 (统一创新定义)
         y_meas_win = y_meas_all[start:end]
         u_cmd_win = u_cmd_all[start:end]
         y_kin = numpy_kinematic_rollout(y_meas_win[0], u_cmd_win)
-        kin_res = y_meas_win - y_kin
-        # theta 残差包裹到 [-pi, pi]
-        kin_res[:, 2] = np.arctan2(np.sin(kin_res[:, 2]), np.cos(kin_res[:, 2]))
-        X_windows[i, :, 8:11] = kin_res
+        innov_anchored = y_meas_win - y_kin
+        # theta 包裹到 [-pi, pi]
+        innov_anchored[:, 2] = np.arctan2(np.sin(innov_anchored[:, 2]),
+                                           np.cos(innov_anchored[:, 2]))
+        X_windows[i, :, 3:6] = innov_anchored
+
         y_clean_windows[i] = y_clean_all[start:end]
         y_meas_windows[i] = y_meas_win
 
@@ -484,7 +442,7 @@ def main():
     print(f"  y_meas median:   {normalizer.ymeas_median}")
     print(f"  y_meas scale:    {normalizer.ymeas_scale}")
     print(f"  创新通道 median: {normalizer.feat_median}")
-    print(f"  创新通道 scale:  {normalizer.innov_scale}")
+    print(f"  创新通道 scale:  {normalizer.feat_scale}")
     print(f"  u_cmd max:       {normalizer.cmd_max}")
 
     # 保存

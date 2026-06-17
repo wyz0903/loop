@@ -1,27 +1,31 @@
 """
-detector/cfm_detector.py — 攻击分类检测器 + 物理引导解码器
-============================================================
-编码器-解码器架构: 简单卷积骨干 + 注意力池化分类头 + 物理引导解码器。
+detector/cfm_detector.py — KAD: Kinematics-Aware Detector
+==========================================================
+轻量级多尺度运动学感知攻击检测器 + 物理引导解码器。
 
-输入: [y_meas(3) + innov(3) + kin_res(3) + u_cmd(2)] = 11 通道, 归一化后
-  - y_meas (3):    传感器测量值 (含攻击)
-  - innov (3):     1-step 运动学新息 (短尺度, 捕获突变型异常)
-  - kin_res (3):   窗口锚定运动学残差 (长尺度, 捕获累积不一致, 打破非加性攻击自洽性)
-  - u_cmd (2):     控制指令
+输入: [y_meas(3) + innov_anchored(3) + u_cmd(2)] = 8 通道, 归一化后
+  - y_meas (3):          传感器测量值 (含攻击)
+  - innov_anchored (3):  窗口锚定运动学残差 = y_meas - rollout(y_meas[0], u_cmd)
+                         (统一替代 1-step innov + kin_res, 打破非加性攻击自洽性)
+  - u_cmd (2):           控制指令
 输出:
   - cls_logits (B, 8)            攻击类别 A0-A7
   - y_pred (B, 100, 3)           重建的干净传感器信号 (物理单位)
 
 架构:
-  Encoder:  SimpleConvBackbone (3块 Conv-BN-ReLU-Pool, 11→64→128→128)
-            → features (B, 12, 128)
-  Classifier: 注意力池化 → LN → Dropout → Linear(128→8) → cls_logits
+  Encoder:  MultiScaleDSConvBackbone (3块膨胀深度可分离卷积, 自适应K)
+            8→32→64→96 通道, 100→50→25→12 时序
+            → features (B, 12, 96)
+  KinematicConsistencyBias: 零参数物理先验, 注入注意力
+  Classifier: 运动学引导注意力池化 → LN → Dropout → Linear(96→8)
   Decoder:  features → ConvTranspose1d 上采样 → delta_pred (B, 100, 3)
-            y_kin ← batch_kinematic_rollout(y0_phys, u_cmd_phys)  [冻结, 不参与梯度]
+            y_kin ← batch_kinematic_rollout(y0_phys, u_cmd_phys)  [冻结梯度]
             y_pred = y_kin + delta_pred
 
-物理引导: 解码器只学习攻击修正量 delta_pred, 运动学部分由已知模型提供,
-        不浪费参数学控制→状态映射。delta_pred 显式编码攻击模式。
+设计亮点:
+  - 多尺度膨胀卷积: dilation=1,3,9 自适应最优运动学时间尺度 (28K 参数)
+  - 运动学一致性偏置: 零参数物理先验引导注意力关注可信时间步
+  - 物理引导解码: 只学习攻击修正量, 运动学由已知模型提供
 """
 
 import torch
@@ -41,27 +45,29 @@ ALPHA = 0.17       # 前端偏移量 [m]
 # ============================================================================
 
 # 模型架构
-D_MODEL = 128
+D_MODEL = 96
+NUM_CLASSES = 8
+IN_CHANNELS = 8          # [y_meas(3) + innov_anchored(3) + u_cmd(2)]
+WINDOW_SIZE = 100
+
+# 多尺度深度可分离卷积骨干
+CONV_CHANNELS = [32, 64, 96]       # 逐块输出通道 (3块)
+CONV_KERNEL_SIZES = [7, 5, 3]      # 逐块卷积核大小
+CONV_DILATIONS = [1, 3, 9]         # 3 个并行膨胀率 (自适应 K)
+POOL_SIZE = 2                      # 池化核大小 (时序降采样)
+
+# Transformer 骨干参数 (向后兼容)
 NUM_HEADS = 8
 NUM_TRANSFORMER_LAYERS = 4
 DIM_FEEDFORWARD = 512
-NUM_CLASSES = 8
-IN_CHANNELS = 11          # [y_meas(3) + innov(3) + kin_res(3) + u_cmd(2)]
-WINDOW_SIZE = 100
-
-# 简单卷积骨干
-CONV_CHANNELS = [64, 128, 128]     # 逐块输出通道 (3块)
-CONV_KERNEL_SIZE = 3               # 卷积核大小 (same padding)
-POOL_SIZE = 2                      # 池化核大小 (时序降采样)
-
-# 通道自注意力
-USE_CHANNEL_ATTN = True            # 是否启用通道自注意力 (消融实验开关)
-CHANNEL_ATTN_HEADS = 4             # 注意力头数
-CHANNEL_ATTN_DIM = 64              # 中间投影维度
 
 # 物理引导解码器
 DECODER_CHANNELS = [64, 32, 16]    # 上采样逐层通道
-USE_DECODER = True                 # 是否启用解码器 (消融实验开关)
+USE_DECODER = True
+
+# 运动学一致性偏置
+KIN_BIAS_SIGMA = 0.5               # 创新异常阈值 [m]
+
 
 # ============================================================================
 # 工具函数: 批量运动学 rollout
@@ -72,7 +78,7 @@ def batch_kinematic_rollout(y0: torch.Tensor, u_seq: torch.Tensor,
                             ) -> torch.Tensor:
     """欧拉积分运动学递推 (与 WMRKinematics.kinematic_predict 一致)。
 
-    从初始状态 y0 出发, 沿控制序列 u_seq 递推 100 步。
+    从初始状态 y0 出发, 沿控制序列 u_seq 递推。
     使用欧拉积分以匹配内部运动学模型, 截断误差 O(Ts²) ≈ 0.0025/步。
 
     Args:
@@ -110,7 +116,7 @@ def batch_kinematic_rollout(y0: torch.Tensor, u_seq: torch.Tensor,
 # ============================================================================
 
 class TransformerBackbone(nn.Module):
-    """统一 Transformer 编码器主干。"""
+    """统一 Transformer 编码器主干 (向后兼容旧版配置)。"""
 
     def __init__(self, in_channels: int = IN_CHANNELS, window_size: int = WINDOW_SIZE,
                  d_model: int = D_MODEL, num_layers: int = NUM_TRANSFORMER_LAYERS,
@@ -140,117 +146,161 @@ class TransformerBackbone(nn.Module):
 
 
 # ============================================================================
-# 2. 简单卷积骨干 (Conv-BN-ReLU-Pool)
+# 2. 多尺度膨胀深度可分离卷积骨干 (KAD 核心)
 # ============================================================================
 
-class SimpleConvBlock(nn.Module):
-    """标准卷积块: Conv1d → BatchNorm → ReLU → MaxPool."""
+class MultiScaleDSConvBlock(nn.Module):
+    """多尺度膨胀深度可分离卷积块。
+
+    3 个并行的膨胀深度卷积 (dilation=1,3,9) 捕获不同时间尺度的特征:
+      - d=1 (感受野 7 步 = 0.35s): 快速变化 (类 1-step innov)
+      - d=3 (感受野 19 步 = 0.95s): 中等尺度动态
+      - d=9 (感受野 55 步 = 2.75s): 慢速累积 (类 window-anchored kin_res)
+
+    Pointwise Conv 学习三尺度间的最优加权 — 自适应 K。
+    """
 
     def __init__(self, in_channels: int, out_channels: int,
-                 kernel_size: int = 3, pool_size: int = 2):
+                 kernel_size: int = 7,
+                 dilations: list = None,
+                 pool_size: int = 2):
         super().__init__()
-        self.conv = nn.Conv1d(in_channels, out_channels, kernel_size,
-                              padding=kernel_size // 2)
+        if dilations is None:
+            dilations = CONV_DILATIONS
+
+        # 3 个并行膨胀深度卷积 (groups=in_channels: 逐通道独立滤波)
+        self.depthwise_convs = nn.ModuleList([
+            nn.Conv1d(in_channels, in_channels, kernel_size,
+                      padding=(kernel_size // 2) * d,
+                      dilation=d, groups=in_channels, bias=False)
+            for d in dilations
+        ])
+
+        # Pointwise 卷积: 混合多尺度特征 (3*C_in → C_out)
+        self.pointwise = nn.Conv1d(in_channels * len(dilations), out_channels,
+                                   kernel_size=1, bias=False)
         self.bn = nn.BatchNorm1d(out_channels)
         self.pool = nn.MaxPool1d(pool_size)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.pool(F.relu(self.bn(self.conv(x))))
+        # x: (B, C_in, W)
+        # 并行多尺度深度卷积
+        multi_scale = [dw(x) for dw in self.depthwise_convs]  # [(B, C_in, W)] × 3
+        h = torch.cat(multi_scale, dim=1)                      # (B, 3*C_in, W)
+
+        # Pointwise 混合 + BN + GELU + Pool
+        h = self.pointwise(h)                                   # (B, C_out, W)
+        h = F.gelu(self.bn(h))
+        h = self.pool(h)                                        # (B, C_out, W//2)
+        return h
 
 
-class ChannelSelfAttention(nn.Module):
-    """通道自注意力: 原始输入通道作为 token 互相 attend, 学习物理耦合。
+class MultiScaleDSConvBackbone(nn.Module):
+    """多尺度深度可分离卷积骨干网络。
 
-    每个通道的时序信号作为其 embedding。注意力矩阵 (B, h, C, C) 揭示
-    通道间物理依赖关系 (如 innov_x ↔ y_meas_x ↔ u_cmd_v)。
+    3 个 MultiScaleDSConvBlock, 逐块通道扩增 + 时序降采样。
 
-    输入/输出: (B, C, W) — 同形状, 同维度
-    """
+    通道变化: 8 → 32 → 64 → 96
+    时序变化: 100 → 50 → 25 → 12
 
-    def __init__(self, num_channels: int = 11, time_steps: int = 100,
-                 proj_dim: int = CHANNEL_ATTN_DIM,
-                 num_heads: int = CHANNEL_ATTN_HEADS, dropout: float = 0.2):
-        super().__init__()
-        assert time_steps % num_heads == 0 or num_heads == 1, \
-            f"time_steps ({time_steps}) 必须整除 num_heads ({num_heads})"
-        self.num_channels = num_channels
-        self.time_steps = time_steps
-        self.proj_dim = proj_dim
-
-        self.input_proj = nn.Linear(time_steps, proj_dim)
-        self.mha = nn.MultiheadAttention(proj_dim, num_heads,
-                                         dropout=dropout, batch_first=True)
-        self.output_proj = nn.Linear(proj_dim, time_steps)
-        self.norm = nn.LayerNorm(time_steps)
-        self.dropout = nn.Dropout(dropout)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # x: (B, C, W)
-        residual = x
-        h = self.input_proj(x)                     # (B, C, proj_dim)
-        h, _attn = self.mha(h, h, h)               # (B, C, proj_dim)
-        h = self.output_proj(h)                     # (B, C, W)
-        return self.norm(residual + self.dropout(h))
-
-
-class SimpleConvBackbone(nn.Module):
-    """简单卷积骨干网络。
-
-    3 个 Conv-BN-ReLU-Pool 块, 逐块通道扩增 + 时序降采样。
-
-    输入: (B, W, C) → 内部排列为 Conv1d 格式 (B, C, W)
-    输出: (B, W', d_model)  其中 W' = W // 8
-
-    通道变化: 8→64→128→128
-    时序变化: 100→50→25→12
+    输入: (B, W, C)
+    输出: (B, W', d_model)  其中 W' = W // 8, d_model = 96
     """
 
     def __init__(self, in_channels: int = IN_CHANNELS,
                  channels: list = None,
-                 kernel_size: int = CONV_KERNEL_SIZE,
-                 pool_size: int = POOL_SIZE,
-                 use_channel_attn: bool = USE_CHANNEL_ATTN,
-                 channel_attn_heads: int = CHANNEL_ATTN_HEADS,
-                 channel_attn_dim: int = CHANNEL_ATTN_DIM,
-                 time_steps: int = None,
-                 dropout: float = 0.2):
+                 kernel_sizes: list = None,
+                 dilations: list = None,
+                 pool_size: int = POOL_SIZE):
         super().__init__()
         if channels is None:
             channels = CONV_CHANNELS
+        if kernel_sizes is None:
+            kernel_sizes = CONV_KERNEL_SIZES
+        if dilations is None:
+            dilations = CONV_DILATIONS
         self.d_model = channels[-1]
-        self.use_channel_attn = use_channel_attn
 
-        if use_channel_attn:
-            self.channel_attn = ChannelSelfAttention(
-                num_channels=in_channels,
-                time_steps=time_steps if time_steps is not None else WINDOW_SIZE,
-                proj_dim=channel_attn_dim,
-                num_heads=channel_attn_heads,
-                dropout=dropout,
-            )
-        else:
-            self.channel_attn = None
-
-        layers = []
+        blocks = []
         ci = in_channels
-        for co in channels:
-            layers.append(SimpleConvBlock(ci, co, kernel_size, pool_size))
+        for i, co in enumerate(channels):
+            blocks.append(MultiScaleDSConvBlock(
+                in_channels=ci, out_channels=co,
+                kernel_size=kernel_sizes[i],
+                dilations=dilations,
+                pool_size=pool_size,
+            ))
             ci = co
-        self.blocks = nn.Sequential(*layers)
+        self.blocks = nn.Sequential(*blocks)
         self.norm_out = nn.LayerNorm(self.d_model)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        h = x.permute(0, 2, 1)     # (B,W,C) -> (B,C,W)
-        if self.channel_attn is not None:
-            h = self.channel_attn(h)  # channel mixing
-        h = self.blocks(h)          # (B,C,W) -> (B,C,W//8)
-        h = h.permute(0, 2, 1)     # (B,C,W//8) -> (B,W//8,C)
+        # x: (B, W, C) → (B, C, W) for Conv1d
+        h = x.permute(0, 2, 1)
+        h = self.blocks(h)          # (B, C, W) → (B, 96, 12)
+        h = h.permute(0, 2, 1)     # (B, 12, 96)
         h = self.norm_out(h)
         return h
 
 
 # ============================================================================
-# 3. 物理引导解码器
+# 3. 运动学一致性偏置 (零参数物理先验)
+# ============================================================================
+
+class KinematicConsistencyBias(nn.Module):
+    """零参数物理先验: 从窗口锚定创新计算运动学一致性偏置。
+
+    不参与梯度。将 innov_anchored 的 L2 范数映射为注意力偏置:
+      bias[j] = -‖innov_anchored[t_j]‖ / σ
+
+    物理解释:
+      innov_anchored[t] = y_meas[t] - rollout(y_meas[0], u_cmd[0:t])[t]
+      若测量与运动学预测一致 → innov ≈ 0 → bias ≈ 0 (中性)
+      若测量偏离运动学预测 → innov 大 → bias < 0 (抑制该步注意力)
+
+    攻击类型偏置特征 (可视化素材):
+      A0 正常:  所有步 bias ≈ 0 (运动学一致)
+      A4 重放:  重放起始处 bias 突降 (轨迹跳变)
+      A5 丢包:  丢包步 bias 大幅为负 (零测量 vs 递推预测)
+      A7 冻结:  冻结后 bias 单调下降 (冻结值无法预测后续运动)
+    """
+
+    def __init__(self, sigma: float = KIN_BIAS_SIGMA):
+        super().__init__()
+        self.sigma = sigma
+
+    def forward(self, x_norm: torch.Tensor,
+                ymeas_scale: torch.Tensor) -> torch.Tensor:
+        """计算运动学一致性偏置。
+
+        Args:
+            x_norm:      (B, W, 8) 归一化输入, 通道 3:5 = innov_anchored
+            ymeas_scale: (3,) y_meas 物理锚点尺度
+
+        Returns:
+            bias: (B, 12) 每输出时间步的运动学一致性偏置
+        """
+        with torch.no_grad():
+            # innov_anchored 在预处理中用 ymeas_scale 归一化
+            innov_norm = x_norm[:, :, 3:6]                      # (B, W, 3)
+            innov_phys = innov_norm * ymeas_scale.view(1, 1, 3)  # 反归一化到物理单位
+
+            # 下采样到 12 个输出时间步 (每块中心)
+            t_idx = [4, 12, 20, 28, 36, 44, 52, 60, 68, 76, 84, 92]
+            innov_at_t = innov_phys[:, t_idx, :]                 # (B, 12, 3)
+
+            # L2 范数 → 偏置 (高创新 → 低一致性 → 负偏置)
+            innov_l2 = torch.norm(innov_at_t, dim=-1)            # (B, 12)
+            bias = -innov_l2 / self.sigma
+
+            # 去中心 (保持注意力 softmax 的数值稳定性)
+            bias = bias - bias.mean(dim=-1, keepdim=True)
+
+        return bias
+
+
+# ============================================================================
+# 4. 物理引导解码器
 # ============================================================================
 
 class PhysicsGuidedDecoder(nn.Module):
@@ -272,29 +322,19 @@ class PhysicsGuidedDecoder(nn.Module):
         if dec_channels is None:
             dec_channels = DECODER_CHANNELS
 
-        # ConvTranspose1d 上采样: 12 → 24 → 48 → 96
         layers = []
         ci = d_model
         for co in dec_channels:
             layers.extend([
                 nn.ConvTranspose1d(ci, co, kernel_size=4, stride=2, padding=1),
                 nn.BatchNorm1d(co),
-                nn.ReLU(inplace=True),
+                nn.GELU(),
             ])
             ci = co
-        # 最终层: 映射到 3 通道 + 插值到精确 100 步
         layers.append(nn.Conv1d(ci, out_channels, kernel_size=5, padding=2))
         self.upsample = nn.Sequential(*layers)
 
     def forward(self, features: torch.Tensor) -> torch.Tensor:
-        """从编码器特征预测攻击修正量。
-
-        Args:
-            features: (B, 12, d_model) 编码器降采样特征序列
-
-        Returns:
-            delta_pred: (B, 100, 3) 攻击修正量, 物理单位
-        """
         h = features.permute(0, 2, 1)           # (B, d_model, 12)
         h = self.upsample(h)                     # (B, 3, 96)
         h = F.interpolate(h, size=100, mode='linear', align_corners=False)
@@ -303,25 +343,25 @@ class PhysicsGuidedDecoder(nn.Module):
 
 
 # ============================================================================
-# 4. 分类检测器 (编码器 + 分类头 + 解码器)
+# 5. KAD 分类检测器 (编码器 + 运动学偏置注意力 + 解码器)
 # ============================================================================
 
 class CFMDetector(nn.Module):
-    """攻击分类检测器 + 物理引导解码器。
+    """KAD: Kinematics-Aware Detector。
 
     架构:
       Encoder:   x (B,100,8)
-                 → ChannelSelfAttention → SimpleConvBackbone
-                 → features (B, 12, 128)
-      Classifier: 注意力池化 → LN → Dropout → Linear(128,8) → cls_logits
+                 → MultiScaleDSConvBackbone (11→32→64→96)
+                 → features (B, 12, 96)
+      Bias:      KinematicConsistencyBias (零参数物理先验)
+      Classifier: 运动学引导注意力池化 → LN → Dropout → Linear(96,8)
+                 scores = features @ query / √d + α · bias
       Decoder:    features → PhysicsGuidedDecoder → delta_pred (B,100,3)
                  y_kin ← batch_kinematic_rollout(y0_phys, u_cmd_phys)
                  y_pred = y_kin + delta_pred
 
-    输入:  [y_meas(3) + innov(3) + u_cmd(2)] = 8 通道, 归一化后
-    输出:  cls_logits (B, 8)    攻击类别 A0-A7
-           y_pred (B, 100, 3)    重建的干净传感器信号 (物理单位)
-           delta_pred (B, 100, 3) 攻击修正量 (物理单位)
+    输入:  [y_meas(3) + innov_anchored(3) + u_cmd(2)] = 8 通道, 归一化后
+    输出:  cls_logits (B, 8), y_pred (B, 100, 3), delta_pred (B, 100, 3)
     """
 
     def __init__(self,
@@ -331,11 +371,11 @@ class CFMDetector(nn.Module):
                  num_classes: int = NUM_CLASSES,
                  backbone_type: str = 'simple_conv',
                  conv_channels: list = None,
-                 conv_kernel_size: int = CONV_KERNEL_SIZE,
+                 conv_kernel_size: int = 3,
                  pool_size: int = POOL_SIZE,
-                 use_channel_attn: bool = USE_CHANNEL_ATTN,
-                 channel_attn_heads: int = CHANNEL_ATTN_HEADS,
-                 channel_attn_dim: int = CHANNEL_ATTN_DIM,
+                 use_channel_attn: bool = False,
+                 channel_attn_heads: int = 4,
+                 channel_attn_dim: int = 64,
                  num_transformer_layers: int = NUM_TRANSFORMER_LAYERS,
                  num_heads: int = NUM_HEADS,
                  dim_feedforward: int = DIM_FEEDFORWARD,
@@ -372,16 +412,13 @@ class CFMDetector(nn.Module):
 
         # ---- 骨干网络 ----
         if backbone_type == 'simple_conv':
-            self.backbone = SimpleConvBackbone(
+            # KAD 骨干: 多尺度膨胀深度可分离卷积
+            self.backbone = MultiScaleDSConvBackbone(
                 in_channels=in_channels,
-                channels=conv_channels,
-                kernel_size=conv_kernel_size,
+                channels=conv_channels if conv_channels else CONV_CHANNELS,
+                kernel_sizes=CONV_KERNEL_SIZES,
+                dilations=CONV_DILATIONS,
                 pool_size=pool_size,
-                use_channel_attn=use_channel_attn,
-                channel_attn_heads=channel_attn_heads,
-                channel_attn_dim=channel_attn_dim,
-                time_steps=window_size,
-                dropout=dropout,
             )
         elif backbone_type == 'transformer':
             self.backbone = TransformerBackbone(
@@ -392,7 +429,13 @@ class CFMDetector(nn.Module):
         else:
             raise ValueError(f"Unknown backbone_type: {backbone_type}")
 
-        # ---- 分类头 (注意力池化) ----
+        # ---- 运动学一致性偏置 (零参数物理先验) ----
+        self.kin_bias = KinematicConsistencyBias(sigma=KIN_BIAS_SIGMA)
+
+        # ---- 可学习偏置强度 ----
+        self.bias_alpha = nn.Parameter(torch.tensor(0.1))
+
+        # ---- 分类头 (运动学引导注意力池化) ----
         self.cls_norm = nn.LayerNorm(d_model)
         self.cls_head = nn.Linear(d_model, num_classes)
         self.cls_dropout = nn.Dropout(0.3)
@@ -415,11 +458,11 @@ class CFMDetector(nn.Module):
         nn.init.zeros_(self.cls_head.bias)
 
     # ------------------------------------------------------------------
-    # 归一化参数设置 (训练/推理时从 normalizer 加载后调用)
+    # 归一化参数设置
     # ------------------------------------------------------------------
 
     def set_norm_params(self, ymeas_scale, ymeas_median, cmd_max):
-        """设置归一化参数 buffer。"""
+        """设置归一化参数 buffer (训练/推理时从 normalizer 加载后调用)。"""
         self.ymeas_scale.copy_(torch.as_tensor(ymeas_scale, dtype=torch.float32))
         self.ymeas_median.copy_(torch.as_tensor(ymeas_median, dtype=torch.float32))
         self.cmd_max.copy_(torch.as_tensor(cmd_max, dtype=torch.float32))
@@ -431,19 +474,37 @@ class CFMDetector(nn.Module):
     def encode(self, x: torch.Tensor) -> torch.Tensor:
         """编码输入窗口 → 特征序列。
 
-        Args: x: (B, W, 8) 归一化输入。Returns: features (B, W//8, d_model)
+        Args: x: (B, W, 8) 归一化输入。Returns: features (B, 12, d_model)
         """
         return self.backbone(x)
 
-    def classify(self, features: torch.Tensor) -> torch.Tensor:
-        """从特征序列分类攻击类型 (注意力池化)。
+    def classify(self, features: torch.Tensor,
+                 x_norm: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """运动学引导注意力池化分类。
 
-        Args: features: (B, W', d_model)。Returns: cls_logits (B, num_classes)
+        在标准注意力分数上叠加运动学一致性偏置:
+          scores[i] = features[i] · query / √d  +  α · kin_bias[i]
+        测量与运动学一致的步获得更高偏置 → 更多注意力。
+
+        Args:
+            features: (B, 12, d_model) 编码器特征
+            x_norm:   (B, 100, 8) 归一化输入 (用于计算运动学偏置)
+
+        Returns:
+            cls_logits: (B, num_classes)
         """
         d = features.shape[-1]
-        scores = torch.matmul(features, self.attn_query) / (d ** 0.5)
-        attn_weights = torch.softmax(scores, dim=1)          # (B, W')
-        pooled = (features * attn_weights.unsqueeze(-1)).sum(dim=1)  # (B, d_model)
+
+        # 标准注意力分数
+        scores = torch.matmul(features, self.attn_query) / (d ** 0.5)  # (B, 12)
+
+        # 注入运动学一致性偏置 (零参数物理先验)
+        if x_norm is not None:
+            kin_bias = self.kin_bias(x_norm, self.ymeas_scale)          # (B, 12)
+            scores = scores + self.bias_alpha * kin_bias
+
+        attn_weights = torch.softmax(scores, dim=1)                     # (B, 12)
+        pooled = (features * attn_weights.unsqueeze(-1)).sum(dim=1)     # (B, d_model)
         pooled = self.cls_norm(pooled)
         pooled = self.cls_dropout(pooled)
         return self.cls_head(pooled)
@@ -453,23 +514,24 @@ class CFMDetector(nn.Module):
         """物理引导解码: 运动学递推 + 学习修正 → 重建干净信号。
 
         Args:
-            features: (B, W', d_model) 编码器特征
-            x_norm:   (B, W, 8) 归一化输入窗口 (用于提取 y0 和 u_cmd)
+            features: (B, 12, d_model) 编码器特征
+            x_norm:   (B, 100, 8) 归一化输入 (用于提取 y0 和 u_cmd)
 
         Returns:
-            y_pred:     (B, W, 3) 重建的干净传感器信号 (物理单位)
-            delta_pred: (B, W, 3) 攻击修正量 (物理单位)
+            y_pred:     (B, 100, 3) 重建的干净传感器信号 (物理单位)
+            delta_pred: (B, 100, 3) 攻击修正量 (物理单位)
         """
         if self.decoder is None:
             raise RuntimeError("Decoder not enabled. Set use_decoder=True.")
 
         # 1. 从归一化输入反归一化得到物理量
+        # 通道 0:2 = y_meas, 通道 6:7 = u_cmd
         y0_norm = x_norm[:, 0, :3]                     # (B, 3) 首步 y_meas
         u_norm = x_norm[:, :, -2:]                      # (B, W, 2) u_cmd
         y0_phys = y0_norm * self.ymeas_scale + self.ymeas_median
         u_phys = u_norm * self.cmd_max
 
-        # 2. 运动学递推 (冻结梯度 — 这是已知物理, 不学习)
+        # 2. 运动学递推 (冻结梯度 — 已知物理, 不学习)
         with torch.no_grad():
             y_kin = batch_kinematic_rollout(y0_phys, u_phys)  # (B, W, 3)
 
@@ -488,14 +550,14 @@ class CFMDetector(nn.Module):
 
         Args:
             x:            (B, W, 8) 归一化输入窗口
-            return_recon: 是否返回重建信号 (训练/完整推理时为 True)
+            return_recon: 是否返回重建信号
 
         Returns:
             return_recon=False: (cls_logits, features)
             return_recon=True:  (cls_logits, features, y_pred, delta_pred)
         """
         features = self.encode(x)
-        cls_logits = self.classify(features)
+        cls_logits = self.classify(features, x)
 
         if return_recon and self.decoder is not None:
             y_pred, delta_pred = self.decode(features, x)

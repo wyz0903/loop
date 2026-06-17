@@ -51,11 +51,10 @@ ReferenceTrajectory(参考轨迹) → NMPC → u_cmd → WMRKinematics(RK4运动
                                       y_meas ← SensorAttack.inject()(注入攻击)
                                         ↓
                                CFMDetector.detect(y_meas)(执行检测)
-                                 内部运动学预测 → 新息 innov
-                                 窗口锚定运动学残差 → kin_res
-                                 滑动窗口: [y_meas(3) + innov(3) + kin_res(3) + u_cmd(2)] = 11 通道
-                                 SimpleConvBackbone (3块 Conv-BN-ReLU-Pool)
-                                   → 注意力池化 → 8 类 softmax (A0-A7)
+                                 innov_anchored = y_meas - rollout(y_meas[0], u_cmd)  (在线窗口级计算)
+                                 滑动窗口: [y_meas(3) + innov_anchored(3) + u_cmd(2)] = 8 通道
+                                 MultiScaleDSConvBackbone (3块膨胀深度可分离卷积, 自适应K)
+                                   → 运动学一致性偏置注意力 → 8 类 softmax (A0-A7)
                                  恢复策略: A0/低置信度 → y_meas 直通; 攻击 → 运动学死推算
                                         ↓
                                y_rec → 直接作为位姿估计 (替代 EKF)
@@ -75,7 +74,7 @@ ReferenceTrajectory(参考轨迹) → NMPC → u_cmd → WMRKinematics(RK4运动
 | `simulate.py` | 统一闭环仿真：CFM检测器 / 无检测器基线 / 五族轨迹对比 |
 | `generate_dataset.py` | 开环数据生成：5 种随机轨迹系列 × 8 种攻击 |
 | `cfm_backend.py` | CFMDetectorBackend 推理包装器：滑动窗口缓冲 + 内部运动学 + 分类 + 恢复策略路由 |
-| `detector/cfm_detector.py` | CFMDetector 模型定义：SimpleConvBackbone (3块 Conv-BN-ReLU-Pool) + 注意力池化分类头 |
+| `detector/cfm_detector.py` | KAD 模型定义：MultiScaleDSConvBackbone (膨胀深度可分离卷积) + 运动学一致性偏置注意力 |
 | `detector/preprocess_data.py` | 100 步滑动窗口，物理锚点归一化 (RobustNormalizer)，防数据泄漏的文件级拆分 |
 | `detector/train_cfm.py` | CFMDetector 训练脚本：L = L_cls（纯交叉熵分类，label smoothing 0.05），A0 每 epoch 随机降采样 |
 | `detector/evaluate.py` | 测试集分类评估：混淆矩阵 + 逐类精度/召回/F1 + 置信度 + 汇总图 + Markdown 报告 |
@@ -110,8 +109,10 @@ ReferenceTrajectory(参考轨迹) → NMPC → u_cmd → WMRKinematics(RK4运动
 
 ### 关键设计决策
 
-- **简单卷积骨干 + 通道自注意力 (SimpleConvBackbone + ChannelSelfAttention)**：输入层对 11 个原始通道做多头自注意力（4 头，proj_dim=64），显式学习通道间物理耦合关系。注意力矩阵 11×11 可直接可视化为论文图。其后接 3 个 Conv-BN-ReLU-MaxPool 块，通道 11→64→128→128，时序 100→50→25→12。总参数量 ~108K（含通道注意力 ~30K），远小于旧版 TCN 的 1.3M。
-- **多尺度运动学一致性 (Multi-Scale Kinematic Consistency)**：输入通道从 8 扩展为 11，新增窗口锚定运动学残差 `kin_res(3)`。短尺度 1-step innov 捕获加性攻击突变；长尺度 window-anchored 残差打破非加性攻击的自指涉污染反馈环——从窗口起点沿 u_cmd 递推，与实测值比较，累积暴露 A4(重放)/A5(丢包)/A7(冻结) 的长期不一致。仅增加 576 参数 (0.45%)，零架构变更。
+- **多尺度膨胀深度可分离卷积骨干 (MultiScaleDSConvBackbone)**：3 块膨胀深度可分离卷积 (dilation=1,3,9)，每块 3 个并行膨胀深度卷积 + Pointwise Conv 混合。不同膨胀率对应不同运动学时间尺度 (0.35s / 0.95s / 2.75s)，Pointwise Conv 隐式学习最优尺度加权——自适应 K。通道 8→32→64→96，时序 100→50→25→12。骨干参数量 ~27K，远小于旧版 Standard Conv 骨干 ~76K。
+- **窗口锚定运动学新息 (Unified Anchored Innovation)**：`innov[t] = y_meas[t] - rollout(y_meas[0], u_cmd[0:t])[t]`。统一替代旧版 1-step innov + kin_res 双尺度，打破非加性攻击自指涉污染反馈环。归一化复用 y_meas 物理空间尺度 [2.5m, 2.5m, π]，简洁统一。
+- **运动学一致性偏置注意力 (Kinematics-Guided Attention Pooling)**：零参数物理先验——从 innov_anchored 的 L2 范数计算每时间步的运动学一致性偏置，注入注意力分数。攻击步 (innov 大 → bias < 0) 被抑制，正常步 (innov ≈ 0 → bias ≈ 0) 获得更多关注。可学习标量 α 控制物理先验强度。
+- **总参数量 ~28K**：46x 小于旧版 TCN (1.3M)，4x 小于 SimpleConvBackbone (~108K)，极轻量适合嵌入式部署。
 - **物理锚点归一化 (Physical-Anchor Normalization)**：y_meas 用工作空间边界 [2.5m, 2.5m, π] 作为尺度锚点，创新通道用物理异常阈值 [0.5m, 0.5m, 0.3rad] 作为尺度。避免 IQR 归一化将常规攻击信号放大至 10³-10⁵ 导致梯度爆炸。物理含义清晰，论文可辩护。
 - **注意力池化分类头**：可学习的 attn_query 对特征序列加权求和，自适应地聚焦于攻击窗口最具判别力的时间步，替代简单的全局平均池化。
 - **纯分类训练**：单一交叉熵损失 + label smoothing 0.05，无类别权重，通过每 epoch 随机降采样 50% A0 窗口平衡类别分布。
