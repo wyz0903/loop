@@ -112,19 +112,19 @@ class PreprocessedDataset(Dataset):
 # ============================================================================
 # 训练超参数
 # ============================================================================
-BATCH_SIZE = 512
+BATCH_SIZE = 256
 NUM_WORKERS = 2
 PREFETCH_FACTOR = 4
 LEARNING_RATE = 5e-4
-WEIGHT_DECAY = 5e-4              # 从 1e-4 增强
+WEIGHT_DECAY = 5e-4
 NUM_EPOCHS = 150
-LABEL_SMOOTHING = 0.1            # 从 0.05 增强
+LABEL_SMOOTHING = 0.0            # 标签平滑 (0=关闭)
 EARLY_STOP_PATIENCE = 50
 GRAD_CLIP = 1.0
 
 # 重建损失
 RECON_LAMBDA = 0.2               # 重建损失权重
-RECON_WARMUP = 10                # 前 N epoch 仅分类, 之后加入重建损失
+RECON_WARMUP = 20                # 前 N epoch 仅分类, 之后加入重建损失
 
 # ReduceLROnPlateau 调度器
 LR_PATIENCE = 30
@@ -141,7 +141,7 @@ DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 def train_epoch(model, dataloader, optimizer, device, epoch: int):
     """单 epoch 训练 (分类 + 重建联合损失)。
 
-    前 RECON_WARMUP epoch 仅使用分类损失, 之后逐步加入重建损失。
+    前 RECON_WARMUP epoch 仅使用分类损失, 之后加入重建损失。
     """
     model.train()
     use_recon = epoch > RECON_WARMUP
@@ -171,7 +171,7 @@ def train_epoch(model, dataloader, optimizer, device, epoch: int):
         loss_cls = F.cross_entropy(cls_logits, cls_label,
                                    label_smoothing=LABEL_SMOOTHING)
 
-        # 重建损失 (物理引导: y_pred ≈ y_clean)
+        # 重建损失
         if use_recon and y_clean is not None:
             loss_recon = F.mse_loss(y_pred, y_clean)
             loss = loss_cls + RECON_LAMBDA * loss_recon
@@ -355,7 +355,7 @@ def main():
     print(f"设备: {DEVICE}")
     print(f"骨干: {args.backbone}")
     print(f"解码器: {'禁用' if args.no_decoder else '启用'} "
-          f"(λ={RECON_LAMBDA}, warmup={RECON_WARMUP} epochs)")
+          f"(λ={RECON_LAMBDA}, warmup={RECON_WARMUP})")
     print(f"正则化: wd={WEIGHT_DECAY}, label_smooth={LABEL_SMOOTHING}")
     print(f"精度: float32, 固定 LR={args.lr}")
 

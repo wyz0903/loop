@@ -138,9 +138,10 @@ class CFMDetectorBackend:
 
         检测策略:
           1. 内部运动学预测 → 新息
-          2. 推入滑动窗口 (y_meas, innov, u_cmd)
-          3. 窗口就绪后 → NN 分类 + 解码器重建
-          4. A0 或低置信度 → 直通; 否则 → 解码器恢复
+          2. 推入滑动窗口
+          3. 编码器+分类头分类 (107K, 每次必跑)
+          4. 检测到攻击 → 解码器重建 (+43.6K, 按需)
+          5. 正常/低置信度 → 直通; 攻击 → 解码器恢复
         """
         self._step_count += 1
         y_meas = np.asarray(y_meas, dtype=float).ravel()
@@ -164,17 +165,27 @@ class CFMDetectorBackend:
                 features={'status': 'window_filling',
                           'readiness': self._window_readiness()})
 
-        # 5. NN 分类 + 解码器重建
+        # 5. 分类: 编码器+分类头 (107K, 每次必跑)
         t0 = time.time()
-        attack_class, confidence, y_decoded, delta = self._nn_infer()
+        x_tensor = self._build_input_tensor()
+        attack_class, confidence, features = self._nn_classify(x_tensor)
+
+        # 6. 按需解码: 仅检测到攻击时运行解码器 (+43.6K)
+        y_decoded = None
+        delta = np.zeros(3)
+        need_reconstruct = (confidence >= self.CONFIDENCE_THRESHOLD
+                            and attack_class != 'A0')
+        if need_reconstruct:
+            y_decoded, delta = self._nn_reconstruct(features, x_tensor)
+
         self._inference_count += 1
         self._total_inference_time += time.time() - t0
 
-        # 6. 恢复: A0/低置信度 → 直通; 攻击 → 解码器重建
+        # 7. 恢复: 正常→直通, 攻击→解码器重建
         y_recovered = self._recover(y_meas, attack_class, confidence,
                                     X_pred, y_decoded)
 
-        # 7. 锚定内部运动学状态到恢复测量
+        # 8. 锚定内部运动学状态到恢复测量
         self._internal_state = y_recovered.copy()
 
         return DetectionResult(
@@ -202,6 +213,39 @@ class CFMDetectorBackend:
     def _compute_innovation(self, y_meas: np.ndarray):
         X_pred = WMRKinematics.kinematic_predict(self._internal_state, self._u_cmd)
         return X_pred, y_meas - X_pred
+
+    def _compute_kinres_window(self, ymeas: np.ndarray, ucmd: np.ndarray) -> np.ndarray:
+        """计算窗口锚定运动学残差 (整窗)。
+
+        从窗口第一帧 y_meas[0] 出发, 沿 u_cmd 做 100 步运动学递推,
+        与实测值逐帧比较: kin_res = y_meas - y_kin。
+
+        打破非加性攻击的自指涉污染反馈环:
+          - 递推仅用 u_cmd (控制指令), 不引入 y_meas[1:] 的污染
+          - 累积误差暴露 A4(重放)/A5(丢包)/A7(冻结) 的长期不一致
+
+        Args:
+            ymeas: (W, 3) y_meas 窗口
+            ucmd:  (W, 2) u_cmd 窗口
+
+        Returns:
+            kin_res: (W, 3) 窗口锚定运动学残差
+        """
+        W = len(ymeas)
+        y_kin = np.zeros((W, 3), dtype=np.float32)
+        y = ymeas[0].copy()
+        y_kin[0] = y
+        for k in range(W - 1):
+            v, w = ucmd[k, 0], ucmd[k, 1]
+            cos_t, sin_t = np.cos(y[2]), np.sin(y[2])
+            dx = v * cos_t - 0.17 * w * sin_t
+            dy = v * sin_t + 0.17 * w * cos_t
+            y = y + 0.05 * np.array([dx, dy, w])
+            y_kin[k + 1] = y
+        kin_res = ymeas - y_kin
+        # theta 包裹到 [-pi, pi]
+        kin_res[:, 2] = np.arctan2(np.sin(kin_res[:, 2]), np.cos(kin_res[:, 2]))
+        return kin_res
 
     # ------------------------------------------------------------------
     # 窗口管理
@@ -292,6 +336,10 @@ class CFMDetectorBackend:
                 self._innov_scale = data['feat_iqr']
             else:
                 self._innov_scale = np.array([0.5, 0.5, 0.3], dtype=np.float32)
+            # 窗口运动学残差归一化参数 (向后兼容旧 normalizer 无此字段)
+            self._kinres_median = data.get('kinres_median', np.zeros(3, dtype=np.float32))
+            self._kinres_scale = data.get('kinres_scale',
+                                           np.array([2.5, 2.5, np.pi], dtype=np.float32))
             self._cmd_max = data['cmd_max']
         else:
             print(f"  [WARN] 归一化参数未找到: {norm_path}, 使用默认值")
@@ -299,6 +347,8 @@ class CFMDetectorBackend:
             self._ymeas_scale = np.array([2.5, 2.5, np.pi], dtype=np.float32)
             self._feat_median = np.zeros(3)
             self._innov_scale = np.array([0.5, 0.5, 0.3], dtype=np.float32)
+            self._kinres_median = np.zeros(3, dtype=np.float32)
+            self._kinres_scale = np.array([2.5, 2.5, np.pi], dtype=np.float32)
             self._cmd_max = np.array([0.3, 1.76])
 
     def _sync_norm_to_model(self):
@@ -311,51 +361,62 @@ class CFMDetectorBackend:
             )
 
     def _normalize(self, ymeas_window: np.ndarray, innov_window: np.ndarray,
-                   ucmd_window: np.ndarray) -> np.ndarray:
-        """归一化: y_meas + innov + u_cmd → (W, 8)。"""
+                   kinres_window: np.ndarray, ucmd_window: np.ndarray) -> np.ndarray:
+        """归一化: y_meas + innov + kin_res + u_cmd → (W, 11)。"""
         ymeas_norm = (ymeas_window - self._ymeas_median) / np.maximum(self._ymeas_scale, 1e-6)
         innov_norm = (innov_window - self._feat_median) / np.maximum(self._innov_scale, 1e-6)
+        kinres_norm = (kinres_window - self._kinres_median) / np.maximum(self._kinres_scale, 1e-6)
         ucmd_norm = ucmd_window / self._cmd_max
-        return np.concatenate([ymeas_norm, innov_norm, ucmd_norm], axis=1)
+        return np.concatenate([ymeas_norm, innov_norm, kinres_norm, ucmd_norm], axis=1)
 
     # ------------------------------------------------------------------
-    # NN 推理
+    # NN 推理 (两步: 分类 → 按需解码)
     # ------------------------------------------------------------------
 
-    def _nn_infer(self):
-        """NN 前向 — 分类 + 解码器重建。
-
-        Returns:
-            attack_class: 分类标签 'A0'~'A7'
-            confidence:   分类置信度 [0, 1]
-            y_decoded:    解码器重建的 y_pred[-1] (3,) 物理单位, 或 None
-            delta:        攻击修正量 delta_pred[-1] (3,) 物理单位, 或 zeros
-        """
+    def _build_input_tensor(self) -> torch.Tensor:
+        """从缓冲区构建归一化输入张量 (100, 11)。"""
         ymeas_window = np.array(list(self._ymeas_buffer))
         innov_window = np.array(list(self._innov_buffer))
         ucmd_window = np.array(list(self._ucmd_buffer))
-        x_norm = self._normalize(ymeas_window, innov_window, ucmd_window)  # (100, 8)
-        x_tensor = torch.from_numpy(x_norm.astype(np.float32)).unsqueeze(0).to(self._device)
+        # 窗口锚定运动学残差: 在线计算 (~0.1ms)
+        kinres_window = self._compute_kinres_window(ymeas_window, ucmd_window)
+        x_norm = self._normalize(ymeas_window, innov_window, kinres_window, ucmd_window)
+        return torch.from_numpy(x_norm.astype(np.float32)).unsqueeze(0).to(self._device)
 
+    def _nn_classify(self, x_tensor: torch.Tensor):
+        """仅分类: 编码器 + 分类头 (107K 参数)。
+
+        Returns:
+            attack_class, confidence, features
+        """
         with torch.no_grad():
-            if self._has_decoder:
-                cls_logits, _, y_pred, delta_pred = self._model(x_tensor, return_recon=True)
-                # 取最后一个时间步作为当前估计 (物理单位)
-                y_decoded = y_pred[0, -1, :].cpu().numpy()       # (3,)
-                delta = delta_pred[0, -1, :].cpu().numpy()        # (3,)
-                # 确保 theta 在 [-π, π) 内
-                y_decoded[2] = np.arctan2(np.sin(y_decoded[2]), np.cos(y_decoded[2]))
-            else:
-                cls_logits, _ = self._model(x_tensor, return_recon=False)
-                y_decoded = None
-                delta = np.zeros(3)
+            cls_logits, features = self._model(x_tensor, return_recon=False)
 
         probs = torch.softmax(cls_logits, dim=1).cpu().numpy()[0]
         pred_cls = int(probs.argmax())
         confidence = float(probs[pred_cls])
         attack_class = ALL_ATTACK_TYPES[pred_cls]
 
-        return attack_class, confidence, y_decoded, delta
+        return attack_class, confidence, features
+
+    def _nn_reconstruct(self, features: torch.Tensor, x_tensor: torch.Tensor
+                        ) -> Tuple[np.ndarray, np.ndarray]:
+        """按需解码: 解码器重建 (仅在检测到攻击时调用, +43.6K 参数)。
+
+        Returns:
+            y_decoded: 重建的 y_pred[-1] (3,) 物理单位
+            delta:     攻击修正量 delta_pred[-1] (3,) 物理单位
+        """
+        if not self._has_decoder:
+            return None, np.zeros(3)
+
+        with torch.no_grad():
+            y_pred, delta_pred = self._model.decode(features, x_tensor)
+            y_decoded = y_pred[0, -1, :].cpu().numpy()
+            delta = delta_pred[0, -1, :].cpu().numpy()
+            y_decoded[2] = np.arctan2(np.sin(y_decoded[2]), np.cos(y_decoded[2]))
+
+        return y_decoded, delta
 
     # ------------------------------------------------------------------
     # 恢复策略
@@ -367,20 +428,16 @@ class CFMDetectorBackend:
         """恢复策略。
 
         - A0 或低置信度 → y_meas 直通
-        - 检测到攻击 + 解码器可用 → 解码器重建 y_decoded
+        - 检测到攻击 + 解码器可用 → 解码器重建
         - 检测到攻击 + 无解码器 → 运动学死推算 (回退)
         """
-        # 低置信度 → 直通
         if confidence < self.CONFIDENCE_THRESHOLD:
             return y_meas.copy()
 
-        # A0 正常 → 直通
         if attack_class == 'A0':
             return y_meas.copy()
 
-        # 检测到攻击 → 解码器重建 (如果有)
         if y_decoded is not None:
             return y_decoded.copy()
 
-        # 回退: 运动学死推算
         return X_pred.copy()

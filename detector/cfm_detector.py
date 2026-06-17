@@ -3,13 +3,17 @@ detector/cfm_detector.py — 攻击分类检测器 + 物理引导解码器
 ============================================================
 编码器-解码器架构: 简单卷积骨干 + 注意力池化分类头 + 物理引导解码器。
 
-输入: [y_meas(3) + innov(3) + u_cmd(2)] = 8 通道, 归一化后
+输入: [y_meas(3) + innov(3) + kin_res(3) + u_cmd(2)] = 11 通道, 归一化后
+  - y_meas (3):    传感器测量值 (含攻击)
+  - innov (3):     1-step 运动学新息 (短尺度, 捕获突变型异常)
+  - kin_res (3):   窗口锚定运动学残差 (长尺度, 捕获累积不一致, 打破非加性攻击自洽性)
+  - u_cmd (2):     控制指令
 输出:
   - cls_logits (B, 8)            攻击类别 A0-A7
   - y_pred (B, 100, 3)           重建的干净传感器信号 (物理单位)
 
 架构:
-  Encoder:  SimpleConvBackbone (3块 Conv-BN-ReLU-Pool, 8→64→128→128)
+  Encoder:  SimpleConvBackbone (3块 Conv-BN-ReLU-Pool, 11→64→128→128)
             → features (B, 12, 128)
   Classifier: 注意力池化 → LN → Dropout → Linear(128→8) → cls_logits
   Decoder:  features → ConvTranspose1d 上采样 → delta_pred (B, 100, 3)
@@ -42,7 +46,7 @@ NUM_HEADS = 8
 NUM_TRANSFORMER_LAYERS = 4
 DIM_FEEDFORWARD = 512
 NUM_CLASSES = 8
-IN_CHANNELS = 8          # [y_meas(3) + innov(3) + u_cmd(2)]
+IN_CHANNELS = 11          # [y_meas(3) + innov(3) + kin_res(3) + u_cmd(2)]
 WINDOW_SIZE = 100
 
 # 简单卷积骨干
@@ -163,7 +167,7 @@ class ChannelSelfAttention(nn.Module):
     输入/输出: (B, C, W) — 同形状, 同维度
     """
 
-    def __init__(self, num_channels: int = 8, time_steps: int = 100,
+    def __init__(self, num_channels: int = 11, time_steps: int = 100,
                  proj_dim: int = CHANNEL_ATTN_DIM,
                  num_heads: int = CHANNEL_ATTN_HEADS, dropout: float = 0.2):
         super().__init__()
