@@ -285,10 +285,16 @@ def _save_model_config(model: CFMDetector):
     }
     if model.backbone_type == 'simple_conv':
         backbone = model.backbone
-        if hasattr(backbone, 'channel_attn') and backbone.channel_attn is not None:
-            cfg['use_channel_attn'] = True
-        else:
-            cfg['use_channel_attn'] = False
+        cfg['use_channel_attn'] = False
+        # KAD 骨干特定配置
+        if hasattr(backbone, 'conv_channels'):
+            cfg['conv_channels'] = backbone.conv_channels
+        if hasattr(backbone, 'conv_kernel_sizes'):
+            cfg['conv_kernel_sizes'] = backbone.conv_kernel_sizes
+        if hasattr(backbone, 'conv_dilations'):
+            cfg['conv_dilations'] = backbone.conv_dilations
+        if hasattr(backbone, 'pool_size'):
+            cfg['pool_size'] = int(backbone.pool_size)
     np.savez(os.path.join(MODEL_DIR, 'cfm_cls_config.npz'), **cfg)
 
 

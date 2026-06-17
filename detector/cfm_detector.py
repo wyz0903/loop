@@ -220,6 +220,10 @@ class MultiScaleDSConvBackbone(nn.Module):
         if dilations is None:
             dilations = CONV_DILATIONS
         self.d_model = channels[-1]
+        self.conv_channels = list(channels)       # 保存供 config 序列化
+        self.conv_kernel_sizes = list(kernel_sizes)
+        self.conv_dilations = list(dilations)
+        self.pool_size = pool_size
 
         blocks = []
         ci = in_channels
@@ -372,6 +376,8 @@ class CFMDetector(nn.Module):
                  backbone_type: str = 'simple_conv',
                  conv_channels: list = None,
                  conv_kernel_size: int = 3,
+                 conv_kernel_sizes: list = None,
+                 conv_dilations: list = None,
                  pool_size: int = POOL_SIZE,
                  use_channel_attn: bool = False,
                  channel_attn_heads: int = 4,
@@ -416,8 +422,8 @@ class CFMDetector(nn.Module):
             self.backbone = MultiScaleDSConvBackbone(
                 in_channels=in_channels,
                 channels=conv_channels if conv_channels else CONV_CHANNELS,
-                kernel_sizes=CONV_KERNEL_SIZES,
-                dilations=CONV_DILATIONS,
+                kernel_sizes=conv_kernel_sizes if conv_kernel_sizes else CONV_KERNEL_SIZES,
+                dilations=conv_dilations if conv_dilations else CONV_DILATIONS,
                 pool_size=pool_size,
             )
         elif backbone_type == 'transformer':
