@@ -116,10 +116,6 @@ class SensorAttack:
         else:
             self.offset_time = float('inf')
 
-        # ---- A4 重放时长随机化 (打破固定周期过拟合) ----
-        if attack_type == 'A4':
-            self.cfg.replay_record_duration = self.rng.uniform(5.0, 15.0)
-
         # ---- 攻击类型特定状态 ----
         self._replay_buffer = []           # A4 录制缓冲
         self._replay_idx = 0               # A4 回放指针
