@@ -162,8 +162,9 @@ def run_inference(model, dataloader, device: torch.device):
     model.eval()
     y_true_all, y_pred_all, y_conf_all = [], [], []
 
-    for x_batch, cls_label in dataloader:
-        x_batch = x_batch.to(device)
+    for batch in dataloader:
+        x_batch = batch[0].to(device)
+        cls_label = batch[1]
         logits, _ = model(x_batch)
         probs = torch.softmax(logits, dim=1)
         conf, pred = probs.max(dim=1)

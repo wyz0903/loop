@@ -1,13 +1,12 @@
 """
-cfm_backend.py — 攻击分类检测器推理后端 (cls-only 分支)
+cfm_backend.py — 攻击分类检测器推理后端 (编码器-解码器)
 ===========================================================
-精简推理: 滑动窗口 + 分类 → 根据检测结果路由恢复策略。
+推理: 滑动窗口 + 分类 + 物理引导解码器重建 → 恢复路由策略。
 
 恢复策略:
   - A0 (正常) → y_meas 直通
-  - A4 (重放) → 运动学死推算
-  - 其他攻击 → 运动学死推算 (cls-only 无信号重建能力)
   - 低置信度 → y_meas 直通
+  - 检测到攻击 → 解码器重建 y_pred[-1] (物理引导: 运动学递推 + 学习修正)
 
 公用 API:
   - CFMDetectorBackend — 推理后端主类
@@ -22,7 +21,7 @@ import time
 import numpy as np
 from dataclasses import dataclass, field
 from collections import deque
-from typing import Dict
+from typing import Dict, Optional
 
 import torch
 
@@ -36,7 +35,7 @@ SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 # ============================================================================
 
 STATE_DIM = 3             # 传感器测量维度 [x, y, theta]
-NN_WINDOW_SIZE = 100      # 滑动窗口长度 (与 detector 一致)      # 神经网络输入窗口大小 [步]
+NN_WINDOW_SIZE = 100      # 滑动窗口长度 (与 detector 一致)
 
 
 # ============================================================================
@@ -51,7 +50,7 @@ class DetectionResult:
         attack_class:   攻击类别标签 'A0'~'A7'
         confidence:     分类置信度 [0, 1]
         y_recovered:    恢复后的传感器信号 (3,) — 用作位姿估计
-        attack_estimate: 估计的攻击分量 (3,) — cls-only 分支为零向量
+        attack_estimate: 估计的攻击分量 (3,) — 解码器修正量 delta_pred
         features:        附加信息字典
     """
     attack_class: str
@@ -66,20 +65,20 @@ class DetectionResult:
 
 
 # ============================================================================
-# CFMDetector 推理后端 (cls-only)
+# CFMDetector 推理后端 (编码器-解码器)
 # ============================================================================
 
 class CFMDetectorBackend:
-    """攻击分类检测器 — 即插即用, 不改动控制系统 (cls-only 分支)。
+    """攻击分类检测器 — 即插即用, 不改动控制系统。
 
     核心设计:
       - 8 通道输入: [y_meas(3) + innov(3) + u_cmd(2)]
-      - 仅分类, 无信号重建
-      - 检测到攻击时 → 运动学死推算作为位姿估计
+      - 编码器分类 + 解码器重建
+      - 检测到攻击时 → 解码器恢复信号 (物理引导: 运动学+学习修正)
     """
 
     # ---- 后处理 ----
-    CONFIDENCE_THRESHOLD = 0.5     # 低于此阈值 → 直通不恢复 (所有攻击统一处理)
+    CONFIDENCE_THRESHOLD = 0.5     # 低于此阈值 → 直通不恢复
 
     def __init__(self, model_path: str = None, norm_path: str = None,
                  window_size: int = NN_WINDOW_SIZE, device: str = None):
@@ -104,6 +103,14 @@ class CFMDetectorBackend:
         # ---- 加载归一化参数 ----
         self._load_normalizer(norm_path)
 
+        # ---- 同步归一化参数到模型 ----
+        self._sync_norm_to_model()
+
+        # ---- 解码器可用性 ----
+        self._has_decoder = (self._model.use_decoder and
+                             self._model.decoder is not None)
+        mode_str = "编码器-解码器 (物理引导重建)" if self._has_decoder else "cls-only (死推算回退)"
+
         # ---- 内部运动学状态 ----
         self._internal_state = np.array([0.0, 0.1, 0.0])
         self._u_cmd = np.zeros(2)
@@ -120,7 +127,7 @@ class CFMDetectorBackend:
 
         print(f"[CFMDetector] 模型已加载: {model_path}")
         print(f"  设备: {self._device}, 窗口: {window_size}")
-        print(f"  模式: cls-only (分类 + 死推算回退)")
+        print(f"  模式: {mode_str}")
 
     # ------------------------------------------------------------------
     # 公共接口
@@ -132,8 +139,8 @@ class CFMDetectorBackend:
         检测策略:
           1. 内部运动学预测 → 新息
           2. 推入滑动窗口 (y_meas, innov, u_cmd)
-          3. 窗口就绪后 → NN 分类
-          4. A0 或低置信度 → 直通; 否则 → 死推算
+          3. 窗口就绪后 → NN 分类 + 解码器重建
+          4. A0 或低置信度 → 直通; 否则 → 解码器恢复
         """
         self._step_count += 1
         y_meas = np.asarray(y_meas, dtype=float).ravel()
@@ -157,21 +164,22 @@ class CFMDetectorBackend:
                 features={'status': 'window_filling',
                           'readiness': self._window_readiness()})
 
-        # 5. NN 分类
+        # 5. NN 分类 + 解码器重建
         t0 = time.time()
-        attack_class, confidence = self._nn_infer()
+        attack_class, confidence, y_decoded, delta = self._nn_infer()
         self._inference_count += 1
         self._total_inference_time += time.time() - t0
 
-        # 6. 恢复: A0/低置信度 → 直通; 其他 → 死推算
-        y_recovered = self._recover(y_meas, attack_class, confidence, X_pred)
+        # 6. 恢复: A0/低置信度 → 直通; 攻击 → 解码器重建
+        y_recovered = self._recover(y_meas, attack_class, confidence,
+                                    X_pred, y_decoded)
 
         # 7. 锚定内部运动学状态到恢复测量
         self._internal_state = y_recovered.copy()
 
         return DetectionResult(
             attack_class=attack_class, confidence=confidence,
-            y_recovered=y_recovered, attack_estimate=np.zeros(3),
+            y_recovered=y_recovered, attack_estimate=delta,
             features={'step': self._step_count})
 
     def set_control(self, u_cmd: np.ndarray) -> None:
@@ -210,7 +218,7 @@ class CFMDetectorBackend:
     # ------------------------------------------------------------------
 
     def _load_model(self, model_path: str):
-        """Load CFMDetector with backward-compat handling for old configs."""
+        """加载 CFMDetector, 兼容旧版配置。"""
         from detector.cfm_detector import CFMDetector, IN_CHANNELS
 
         config_path = os.path.join(os.path.dirname(model_path), 'cfm_cls_config.npz')
@@ -230,6 +238,7 @@ class CFMDetectorBackend:
             in_channels = IN_CHANNELS
 
         use_channel_attn = bool(cfg.get('use_channel_attn', True))
+        use_decoder = bool(cfg.get('use_decoder', True))
 
         model = CFMDetector(
             in_channels=in_channels,
@@ -238,6 +247,7 @@ class CFMDetectorBackend:
             num_classes=int(cfg.get('num_classes', 8)),
             backbone_type=backbone_type,
             use_channel_attn=use_channel_attn,
+            use_decoder=use_decoder,
             conv_channels=list(cfg.get('conv_channels', [64, 128, 128])) if 'conv_channels' in cfg else None,
             conv_kernel_size=int(cfg.get('conv_kernel_size', 3)),
             pool_size=int(cfg.get('pool_size', 2)),
@@ -254,11 +264,15 @@ class CFMDetectorBackend:
             total_keys = len(state_dict)
             if missing:
                 missing_pct = len(missing) / max(total_keys, 1) * 100
-                print(f"  [INFO] 缺少的权重键: {len(missing)} 个 ({missing_pct:.0f}%)")
-                if missing_pct > 30:
-                    print(f"  [WARN] 模型权重严重不匹配 — 请重新训练! (python detector/train_cfm.py)")
+                dec_missing = sum(1 for k in missing if 'decoder' in k)
+                print(f"  [INFO] 缺少的权重键: {len(missing)} 个 ({missing_pct:.0f}%)"
+                      f"{', 解码器: ' + str(dec_missing) + ' 个' if dec_missing else ''}")
+                if missing_pct > 50:
+                    print(f"  [WARN] 模型权重严重不匹配 — 请重新训练!")
             if unexpected:
-                print(f"  [INFO] 多余的权重键: {len(unexpected)} 个")
+                dec_unexpected = sum(1 for k in unexpected if 'decoder' in k)
+                print(f"  [INFO] 多余的权重键: {len(unexpected)} 个"
+                      f"{', 解码器: ' + str(dec_unexpected) + ' 个' if dec_unexpected else ''}")
         else:
             print(f"  [WARN] 模型未找到: {model_path}, 使用随机初始化权重")
 
@@ -268,11 +282,9 @@ class CFMDetectorBackend:
         """加载归一化参数。"""
         if os.path.exists(norm_path):
             data = np.load(norm_path)
-            # y_meas 参数
             self._ymeas_median = data.get('ymeas_median', np.zeros(3, dtype=np.float32))
             self._ymeas_scale = data.get('ymeas_scale',
                                           np.array([2.5, 2.5, np.pi], dtype=np.float32))
-            # 创新参数
             self._feat_median = data['feat_median']
             if 'innov_scale' in data:
                 self._innov_scale = data['innov_scale']
@@ -280,7 +292,6 @@ class CFMDetectorBackend:
                 self._innov_scale = data['feat_iqr']
             else:
                 self._innov_scale = np.array([0.5, 0.5, 0.3], dtype=np.float32)
-            # u_cmd 参数
             self._cmd_max = data['cmd_max']
         else:
             print(f"  [WARN] 归一化参数未找到: {norm_path}, 使用默认值")
@@ -289,6 +300,15 @@ class CFMDetectorBackend:
             self._feat_median = np.zeros(3)
             self._innov_scale = np.array([0.5, 0.5, 0.3], dtype=np.float32)
             self._cmd_max = np.array([0.3, 1.76])
+
+    def _sync_norm_to_model(self):
+        """将归一化参数同步到模型的 registered buffers。"""
+        if hasattr(self._model, 'set_norm_params'):
+            self._model.set_norm_params(
+                ymeas_scale=self._ymeas_scale,
+                ymeas_median=self._ymeas_median,
+                cmd_max=self._cmd_max,
+            )
 
     def _normalize(self, ymeas_window: np.ndarray, innov_window: np.ndarray,
                    ucmd_window: np.ndarray) -> np.ndarray:
@@ -303,11 +323,13 @@ class CFMDetectorBackend:
     # ------------------------------------------------------------------
 
     def _nn_infer(self):
-        """单次 NN 前向 — 仅分类。
+        """NN 前向 — 分类 + 解码器重建。
 
         Returns:
-            attack_class:  分类标签 'A0'~'A7'
-            confidence:    分类置信度 [0, 1]
+            attack_class: 分类标签 'A0'~'A7'
+            confidence:   分类置信度 [0, 1]
+            y_decoded:    解码器重建的 y_pred[-1] (3,) 物理单位, 或 None
+            delta:        攻击修正量 delta_pred[-1] (3,) 物理单位, 或 zeros
         """
         ymeas_window = np.array(list(self._ymeas_buffer))
         innov_window = np.array(list(self._innov_buffer))
@@ -316,25 +338,37 @@ class CFMDetectorBackend:
         x_tensor = torch.from_numpy(x_norm.astype(np.float32)).unsqueeze(0).to(self._device)
 
         with torch.no_grad():
-            cls_logits, _ = self._model(x_tensor)
+            if self._has_decoder:
+                cls_logits, _, y_pred, delta_pred = self._model(x_tensor, return_recon=True)
+                # 取最后一个时间步作为当前估计 (物理单位)
+                y_decoded = y_pred[0, -1, :].cpu().numpy()       # (3,)
+                delta = delta_pred[0, -1, :].cpu().numpy()        # (3,)
+                # 确保 theta 在 [-π, π) 内
+                y_decoded[2] = np.arctan2(np.sin(y_decoded[2]), np.cos(y_decoded[2]))
+            else:
+                cls_logits, _ = self._model(x_tensor, return_recon=False)
+                y_decoded = None
+                delta = np.zeros(3)
 
         probs = torch.softmax(cls_logits, dim=1).cpu().numpy()[0]
         pred_cls = int(probs.argmax())
         confidence = float(probs[pred_cls])
         attack_class = ALL_ATTACK_TYPES[pred_cls]
 
-        return attack_class, confidence
+        return attack_class, confidence, y_decoded, delta
 
     # ------------------------------------------------------------------
     # 恢复策略
     # ------------------------------------------------------------------
 
     def _recover(self, y_meas: np.ndarray, attack_class: str,
-                 confidence: float, X_pred: np.ndarray) -> np.ndarray:
-        """恢复策略 (cls-only: 无信号重建, 仅路由)。
+                 confidence: float, X_pred: np.ndarray,
+                 y_decoded: Optional[np.ndarray] = None) -> np.ndarray:
+        """恢复策略。
 
         - A0 或低置信度 → y_meas 直通
-        - 其他 (检测到攻击) → 运动学死推算
+        - 检测到攻击 + 解码器可用 → 解码器重建 y_decoded
+        - 检测到攻击 + 无解码器 → 运动学死推算 (回退)
         """
         # 低置信度 → 直通
         if confidence < self.CONFIDENCE_THRESHOLD:
@@ -344,5 +378,9 @@ class CFMDetectorBackend:
         if attack_class == 'A0':
             return y_meas.copy()
 
-        # 检测到攻击 → 运动学死推算 (cls-only 无信号重建能力)
+        # 检测到攻击 → 解码器重建 (如果有)
+        if y_decoded is not None:
+            return y_decoded.copy()
+
+        # 回退: 运动学死推算
         return X_pred.copy()
