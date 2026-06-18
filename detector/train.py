@@ -1,12 +1,11 @@
 """
-train_cfm.py — 攻击分类检测器训练脚本 (编码器-解码器)
-=========================================================
+train.py — 攻击分类检测器训练脚本 (编码器-解码器)
+======================================================
 联合训练: 交叉熵分类损失 + 物理引导重建损失 (MSE on y_clean)。
 
 用法:
-  python train_cfm.py                          # 默认训练
-  python train_cfm.py --backbone transformer   # Transformer 骨干
-  python train_cfm.py --eval-only detector/models/cfm_cls_best.pt
+  python train.py                          # 默认训练 (KAD 多尺度骨干)
+  python train.py --eval-only detector/models/cfm_cls_best.pt
 """
 
 import os
@@ -30,8 +29,7 @@ warnings.filterwarnings('ignore', message='Detected call of.*lr_scheduler.step.*
 warnings.filterwarnings('ignore', message='.*non-writable tensor.*')
 
 from detector.cfm_detector import (CFMDetector,
-                                    D_MODEL, NUM_TRANSFORMER_LAYERS, NUM_HEADS,
-                                    DIM_FEEDFORWARD,
+                                    D_MODEL,
                                     CONV_CHANNELS, CONV_KERNEL_SIZES, CONV_DILATIONS,
                                     POOL_SIZE)
 
@@ -285,7 +283,6 @@ def _save_model_config(model: CFMDetector):
     }
     if model.backbone_type == 'simple_conv':
         backbone = model.backbone
-        cfg['use_channel_attn'] = False
         # KAD 骨干特定配置
         if hasattr(backbone, 'conv_channels'):
             cfg['conv_channels'] = backbone.conv_channels
@@ -303,24 +300,33 @@ def _load_norm_params(data_dir: str):
     norm_path = os.path.join(data_dir, 'normalizer.npz')
     if os.path.exists(norm_path):
         data = np.load(norm_path)
-        return {
+        params = {
             'ymeas_scale': data.get('ymeas_scale', np.array([2.5, 2.5, np.pi])),
             'ymeas_median': data.get('ymeas_median', np.zeros(3)),
             'cmd_max': data.get('cmd_max', np.array([0.3, 1.76])),
         }
+        # innov_anchored 归一化参数 (新格式 feat_scale, 向后兼容 innov_scale)
+        params['feat_scale'] = data.get('feat_scale', data.get('innov_scale',
+                                     np.array([2.5, 2.5, np.pi])))
+        params['feat_median'] = data.get('feat_median', np.zeros(3))
+        return params
     return {}
 
 
-def build_model(backbone_type='simple_conv', norm_params: dict = None):
-    """构建 CFMDetector (编码器-解码器)。"""
-    kwargs = {'backbone_type': backbone_type,
-              'conv_channels': CONV_CHANNELS,
-              'conv_kernel_size': CONV_KERNEL_SIZES[0],
+def build_model(norm_params: dict = None):
+    """构建 CFMDetector (KAD 骨干, 编码器-解码器)。"""
+    kwargs = {'conv_channels': CONV_CHANNELS,
+              'conv_kernel_sizes': CONV_KERNEL_SIZES,
+              'conv_dilations': CONV_DILATIONS,
               'pool_size': POOL_SIZE}
     if norm_params:
         kwargs['ymeas_scale'] = norm_params['ymeas_scale'].tolist()
         kwargs['ymeas_median'] = norm_params['ymeas_median'].tolist()
         kwargs['cmd_max'] = norm_params['cmd_max'].tolist()
+        if 'feat_scale' in norm_params:
+            kwargs['feat_scale'] = norm_params['feat_scale'].tolist()
+        if 'feat_median' in norm_params:
+            kwargs['feat_median'] = norm_params['feat_median'].tolist()
 
     model = CFMDetector(**kwargs)
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -334,9 +340,7 @@ def build_model(backbone_type='simple_conv', norm_params: dict = None):
 
 def main():
     global RECON_LAMBDA, RECON_WARMUP, LABEL_SMOOTHING
-    parser = argparse.ArgumentParser(description='CFM 分类检测器训练 (编码器-解码器)')
-    parser.add_argument('--backbone', type=str, default='simple_conv',
-                        choices=['simple_conv', 'transformer'])
+    parser = argparse.ArgumentParser(description='CFM 分类检测器训练 (KAD 多尺度骨干)')
     parser.add_argument('--eval-only', type=str, default=None,
                         help='仅评估指定模型权重')
     parser.add_argument('--epochs', type=int, default=NUM_EPOCHS)
@@ -360,7 +364,7 @@ def main():
     LABEL_SMOOTHING = args.label_smoothing
 
     print(f"设备: {DEVICE}")
-    print(f"骨干: {args.backbone}")
+    print(f"骨干: KAD MultiScaleDSConvBackbone")
     print(f"解码器: {'禁用' if args.no_decoder else '启用'} "
           f"(λ={RECON_LAMBDA}, warmup={RECON_WARMUP})")
     print(f"正则化: wd={WEIGHT_DECAY}, label_smooth={LABEL_SMOOTHING}")
@@ -391,11 +395,7 @@ def main():
                               persistent_workers=(NUM_WORKERS > 0))
 
     # ---- 模型 ----
-    if args.no_decoder:
-        norm_params_for_model = None
-    else:
-        norm_params_for_model = norm_params
-    model = build_model(backbone_type=args.backbone, norm_params=norm_params_for_model)
+    model = build_model(norm_params=norm_params)
     model.to(DEVICE)
 
     # ---- 仅评估 ----

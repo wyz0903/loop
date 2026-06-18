@@ -56,11 +56,6 @@ CONV_KERNEL_SIZES = [7, 5, 3]      # 逐块卷积核大小
 CONV_DILATIONS = [1, 3, 9]         # 3 个并行膨胀率 (自适应 K)
 POOL_SIZE = 2                      # 池化核大小 (时序降采样)
 
-# Transformer 骨干参数 (向后兼容)
-NUM_HEADS = 8
-NUM_TRANSFORMER_LAYERS = 4
-DIM_FEEDFORWARD = 512
-
 # 物理引导解码器
 DECODER_CHANNELS = [64, 32, 16]    # 上采样逐层通道
 USE_DECODER = True
@@ -112,41 +107,7 @@ def batch_kinematic_rollout(y0: torch.Tensor, u_seq: torch.Tensor,
 
 
 # ============================================================================
-# 1. Transformer 骨干 (向后兼容)
-# ============================================================================
-
-class TransformerBackbone(nn.Module):
-    """统一 Transformer 编码器主干 (向后兼容旧版配置)。"""
-
-    def __init__(self, in_channels: int = IN_CHANNELS, window_size: int = WINDOW_SIZE,
-                 d_model: int = D_MODEL, num_layers: int = NUM_TRANSFORMER_LAYERS,
-                 num_heads: int = NUM_HEADS, d_ff: int = DIM_FEEDFORWARD,
-                 dropout: float = 0.2):
-        super().__init__()
-        self.d_model = d_model
-        self.window_size = window_size
-        self.input_proj = nn.Linear(in_channels, d_model)
-        self.pos_embed = nn.Parameter(torch.randn(1, window_size, d_model) * 0.02)
-        encoder_layer = nn.TransformerEncoderLayer(
-            d_model=d_model, nhead=num_heads,
-            dim_feedforward=d_ff, dropout=dropout,
-            activation='gelu', batch_first=True, norm_first=True,
-        )
-        self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
-        self._init_weights()
-
-    def _init_weights(self):
-        nn.init.xavier_uniform_(self.input_proj.weight)
-        nn.init.zeros_(self.input_proj.bias)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        h = self.input_proj(x)
-        h = h + self.pos_embed[:, :h.shape[1], :]
-        return self.encoder(h)
-
-
-# ============================================================================
-# 2. 多尺度膨胀深度可分离卷积骨干 (KAD 核心)
+# 1. 多尺度膨胀深度可分离卷积骨干 (KAD 核心)
 # ============================================================================
 
 class MultiScaleDSConvBlock(nn.Module):
@@ -248,7 +209,7 @@ class MultiScaleDSConvBackbone(nn.Module):
 
 
 # ============================================================================
-# 3. 运动学一致性偏置 (零参数物理先验)
+# 2. 运动学一致性偏置 (零参数物理先验)
 # ============================================================================
 
 class KinematicConsistencyBias(nn.Module):
@@ -274,20 +235,23 @@ class KinematicConsistencyBias(nn.Module):
         self.sigma = sigma
 
     def forward(self, x_norm: torch.Tensor,
-                ymeas_scale: torch.Tensor) -> torch.Tensor:
+                feat_scale: torch.Tensor,
+                feat_median: torch.Tensor) -> torch.Tensor:
         """计算运动学一致性偏置。
 
         Args:
             x_norm:      (B, W, 8) 归一化输入, 通道 3:5 = innov_anchored
-            ymeas_scale: (3,) y_meas 物理锚点尺度
+            feat_scale:  (3,) innov_anchored 归一化尺度 (同 y_meas 物理空间)
+            feat_median: (3,) innov_anchored 归一化中位数
 
         Returns:
             bias: (B, 12) 每输出时间步的运动学一致性偏置
         """
         with torch.no_grad():
-            # innov_anchored 在预处理中用 ymeas_scale 归一化
+            # innov_anchored 在预处理中用 (x - feat_median) / feat_scale 归一化
             innov_norm = x_norm[:, :, 3:6]                      # (B, W, 3)
-            innov_phys = innov_norm * ymeas_scale.view(1, 1, 3)  # 反归一化到物理单位
+            innov_phys = (innov_norm * feat_scale.view(1, 1, 3)
+                          + feat_median.view(1, 1, 3))          # 完整反归一化到物理单位
 
             # 下采样到 12 个输出时间步 (每块中心)
             t_idx = [4, 12, 20, 28, 36, 44, 52, 60, 68, 76, 84, 92]
@@ -304,7 +268,7 @@ class KinematicConsistencyBias(nn.Module):
 
 
 # ============================================================================
-# 4. 物理引导解码器
+# 3. 物理引导解码器
 # ============================================================================
 
 class PhysicsGuidedDecoder(nn.Module):
@@ -347,7 +311,7 @@ class PhysicsGuidedDecoder(nn.Module):
 
 
 # ============================================================================
-# 5. KAD 分类检测器 (编码器 + 运动学偏置注意力 + 解码器)
+# 4. KAD 分类检测器 (编码器 + 运动学偏置注意力 + 解码器)
 # ============================================================================
 
 class CFMDetector(nn.Module):
@@ -355,7 +319,7 @@ class CFMDetector(nn.Module):
 
     架构:
       Encoder:   x (B,100,8)
-                 → MultiScaleDSConvBackbone (11→32→64→96)
+                 → MultiScaleDSConvBackbone (8→32→64→96)
                  → features (B, 12, 96)
       Bias:      KinematicConsistencyBias (零参数物理先验)
       Classifier: 运动学引导注意力池化 → LN → Dropout → Linear(96,8)
@@ -373,32 +337,24 @@ class CFMDetector(nn.Module):
                  window_size: int = WINDOW_SIZE,
                  d_model: int = D_MODEL,
                  num_classes: int = NUM_CLASSES,
-                 backbone_type: str = 'simple_conv',
                  conv_channels: list = None,
-                 conv_kernel_size: int = 3,
                  conv_kernel_sizes: list = None,
                  conv_dilations: list = None,
                  pool_size: int = POOL_SIZE,
-                 use_channel_attn: bool = False,
-                 channel_attn_heads: int = 4,
-                 channel_attn_dim: int = 64,
-                 num_transformer_layers: int = NUM_TRANSFORMER_LAYERS,
-                 num_heads: int = NUM_HEADS,
-                 dim_feedforward: int = DIM_FEEDFORWARD,
-                 dropout: float = 0.2,
                  use_decoder: bool = USE_DECODER,
                  dec_channels: list = None,
                  # 归一化参数 (注册为 buffer, 不参与训练)
                  ymeas_scale: list = None,
                  ymeas_median: list = None,
                  cmd_max: list = None,
-                 **kwargs):
+                 feat_scale: list = None,
+                 feat_median: list = None):
         super().__init__()
         self.in_channels = in_channels
         self.window_size = window_size
         self.d_model = d_model
         self.num_classes = num_classes
-        self.backbone_type = backbone_type
+        self.backbone_type = 'simple_conv'  # 向后兼容: 仅 KAD 多尺度骨干
         self.use_decoder = use_decoder
 
         # ---- 归一化参数 (buffer: 持久保存但不参与梯度) ----
@@ -406,34 +362,33 @@ class CFMDetector(nn.Module):
                                      dtype=torch.float32)
         _ymeas_median = torch.zeros(3, dtype=torch.float32)
         _cmd_max = torch.tensor([0.3, 1.76], dtype=torch.float32)
+        _feat_scale = torch.tensor([2.5, 2.5, 3.141592653589793],
+                                    dtype=torch.float32)
+        _feat_median = torch.zeros(3, dtype=torch.float32)
         if ymeas_scale is not None:
             _ymeas_scale = torch.tensor(ymeas_scale, dtype=torch.float32)
         if ymeas_median is not None:
             _ymeas_median = torch.tensor(ymeas_median, dtype=torch.float32)
         if cmd_max is not None:
             _cmd_max = torch.tensor(cmd_max, dtype=torch.float32)
+        if feat_scale is not None:
+            _feat_scale = torch.tensor(feat_scale, dtype=torch.float32)
+        if feat_median is not None:
+            _feat_median = torch.tensor(feat_median, dtype=torch.float32)
         self.register_buffer('ymeas_scale', _ymeas_scale)
         self.register_buffer('ymeas_median', _ymeas_median)
         self.register_buffer('cmd_max', _cmd_max)
+        self.register_buffer('feat_scale', _feat_scale)
+        self.register_buffer('feat_median', _feat_median)
 
-        # ---- 骨干网络 ----
-        if backbone_type == 'simple_conv':
-            # KAD 骨干: 多尺度膨胀深度可分离卷积
-            self.backbone = MultiScaleDSConvBackbone(
-                in_channels=in_channels,
-                channels=conv_channels if conv_channels else CONV_CHANNELS,
-                kernel_sizes=conv_kernel_sizes if conv_kernel_sizes else CONV_KERNEL_SIZES,
-                dilations=conv_dilations if conv_dilations else CONV_DILATIONS,
-                pool_size=pool_size,
-            )
-        elif backbone_type == 'transformer':
-            self.backbone = TransformerBackbone(
-                in_channels=in_channels, window_size=window_size,
-                d_model=d_model, num_layers=num_transformer_layers,
-                num_heads=num_heads, d_ff=dim_feedforward, dropout=dropout,
-            )
-        else:
-            raise ValueError(f"Unknown backbone_type: {backbone_type}")
+        # ---- 骨干网络 (KAD 多尺度膨胀深度可分离卷积) ----
+        self.backbone = MultiScaleDSConvBackbone(
+            in_channels=in_channels,
+            channels=conv_channels if conv_channels else CONV_CHANNELS,
+            kernel_sizes=conv_kernel_sizes if conv_kernel_sizes else CONV_KERNEL_SIZES,
+            dilations=conv_dilations if conv_dilations else CONV_DILATIONS,
+            pool_size=pool_size,
+        )
 
         # ---- 运动学一致性偏置 (零参数物理先验) ----
         self.kin_bias = KinematicConsistencyBias(sigma=KIN_BIAS_SIGMA)
@@ -467,11 +422,16 @@ class CFMDetector(nn.Module):
     # 归一化参数设置
     # ------------------------------------------------------------------
 
-    def set_norm_params(self, ymeas_scale, ymeas_median, cmd_max):
+    def set_norm_params(self, ymeas_scale, ymeas_median, cmd_max,
+                        feat_median=None, feat_scale=None):
         """设置归一化参数 buffer (训练/推理时从 normalizer 加载后调用)。"""
         self.ymeas_scale.copy_(torch.as_tensor(ymeas_scale, dtype=torch.float32))
         self.ymeas_median.copy_(torch.as_tensor(ymeas_median, dtype=torch.float32))
         self.cmd_max.copy_(torch.as_tensor(cmd_max, dtype=torch.float32))
+        if feat_median is not None:
+            self.feat_median.copy_(torch.as_tensor(feat_median, dtype=torch.float32))
+        if feat_scale is not None:
+            self.feat_scale.copy_(torch.as_tensor(feat_scale, dtype=torch.float32))
 
     # ------------------------------------------------------------------
     # 核心方法
@@ -506,7 +466,7 @@ class CFMDetector(nn.Module):
 
         # 注入运动学一致性偏置 (零参数物理先验)
         if x_norm is not None:
-            kin_bias = self.kin_bias(x_norm, self.ymeas_scale)          # (B, 12)
+            kin_bias = self.kin_bias(x_norm, self.feat_scale, self.feat_median)  # (B, 12)
             scores = scores + self.bias_alpha * kin_bias
 
         attn_weights = torch.softmax(scores, dim=1)                     # (B, 12)

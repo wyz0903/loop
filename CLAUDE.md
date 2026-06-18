@@ -22,7 +22,7 @@
 1. 通过controller.py编译 NMPC 求解器（仅限首次运行，需要 CasADi + IPOPT）
 2. 数据集通过generate_dataset.py生成数据集。将生成 `.npz` 文件输出到 `dataset/` 目录中，并生成一个 `metadata.csv`
 3. 通过detector/preprocess_data.py对数据进行预处理。输出 `dataset_win/X_train.npy`、`Y_train_cls.npy`、`Y_train_atk.npy`、`normalizer.npz` 等文件。默认按轨迹族分层 IID 划分为 train/val/test (70/15/15)
-4. 训练CFM检测器，通过detector/train_cfm.py。保存模型至 `detector/models/cfm_cls_best.pt`
+4. 训练CFM检测器，通过detector/train.py。保存模型至 `detector/models/cfm_cls_best.pt`
 5. 运行检测器仿真，通过simulate.py。输出 `results/sim_*.npz` 和图表
 6. 运行测试集评估，通过detector/evaluate.py。输出 `eval/{model_name}_{timestamp}/` 含混淆矩阵、分类指标、Markdown 报告
 7. 通过app/interactive_app.py启动交互式可视化GUI
@@ -76,7 +76,7 @@ ReferenceTrajectory(参考轨迹) → NMPC → u_cmd → WMRKinematics(RK4运动
 | `cfm_backend.py` | CFMDetectorBackend 推理包装器：滑动窗口缓冲 + 内部运动学 + 分类 + 恢复策略路由 |
 | `detector/cfm_detector.py` | KAD 模型定义：MultiScaleDSConvBackbone (膨胀深度可分离卷积) + 运动学一致性偏置注意力 |
 | `detector/preprocess_data.py` | 100 步滑动窗口，物理锚点归一化 (RobustNormalizer)，防数据泄漏的文件级拆分 |
-| `detector/train_cfm.py` | CFMDetector 训练脚本：L = L_cls（纯交叉熵分类，label smoothing 0.05），A0 每 epoch 随机降采样 |
+| `detector/train.py` | CFMDetector 训练脚本：L = L_cls（纯交叉熵分类，label smoothing 0.05），A0 每 epoch 随机降采样 |
 | `detector/evaluate.py` | 测试集分类评估：混淆矩阵 + 逐类精度/召回/F1 + 置信度 + 汇总图 + Markdown 报告 |
 | `detector/models/` | 训练好的模型权重 (cfm_cls_best.pt, cfm_cls_config.npz) |
 

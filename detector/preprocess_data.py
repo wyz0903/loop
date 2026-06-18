@@ -433,7 +433,8 @@ def main():
           f"y_clean={clean_test_all.shape}, y_meas={y_meas_test_all.shape}")
 
     # 归一化: 训练集计算统计量，验证集/测试集复用 (避免信息泄漏)
-    print("\n归一化: y_meas -> [2.5, 2.5, π], 创新 -> [0.5, 0.5, 0.3], u_cmd -> 物理上限")
+    print("\n归一化: y_meas -> [2.5, 2.5, π] (工作空间锚点), "
+          "创新 -> [2.5, 2.5, π] (y_meas 物理空间), u_cmd -> 物理上限")
     normalizer = RobustNormalizer()
     X_train_all = normalizer.fit_transform(X_train_all)
     X_val_all = normalizer.transform(X_val_all)

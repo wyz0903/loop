@@ -124,19 +124,11 @@ def load_model(config_path: str, weight_path: str, device: torch.device):
         window_size=int(_cast(cfg.get('window_size', 100))),
         d_model=int(_cast(cfg.get('d_model', 96))),
         num_classes=int(_cast(cfg.get('num_classes', 8))),
-        backbone_type=str(_cast(cfg.get('backend_type', cfg.get('backbone_type', 'simple_conv')))),
         conv_channels=list(_cast(cfg.get('conv_channels', [32, 64, 96]))),
         conv_kernel_sizes=list(_cast(cfg.get('conv_kernel_sizes', [7, 5, 3]))),
         conv_dilations=list(_cast(cfg.get('conv_dilations', [1, 3, 9]))),
-        conv_kernel_size=int(_cast(cfg.get('conv_kernel_size', 3))),
         pool_size=int(_cast(cfg.get('pool_size', 2))),
-        use_channel_attn=bool(_cast(cfg.get('use_channel_attn', True))),
-        channel_attn_heads=int(_cast(cfg.get('channel_attn_heads', 4))),
-        channel_attn_dim=int(_cast(cfg.get('channel_attn_dim', 64))),
-        num_transformer_layers=int(_cast(cfg.get('num_transformer_layers', 4))),
-        num_heads=int(_cast(cfg.get('num_heads', 8))),
-        dim_feedforward=int(_cast(cfg.get('dim_feedforward', 512))),
-        dropout=float(_cast(cfg.get('dropout', 0.1))),
+        use_decoder=bool(_cast(cfg.get('use_decoder', True))),
     ).to(device)
 
     state = torch.load(weight_path, map_location=device, weights_only=True)
@@ -568,7 +560,7 @@ def generate_markdown_report(output_dir: str, model_name: str, model_path: str,
 
 def main():
     from torch.utils.data import DataLoader
-    from detector.train_cfm import PreprocessedDataset
+    from detector.train import PreprocessedDataset
 
     args = parse_args()
 

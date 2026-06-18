@@ -21,7 +21,7 @@ import time
 import numpy as np
 from dataclasses import dataclass, field
 from collections import deque
-from typing import Dict, Optional
+from typing import Dict, Optional, Tuple
 
 import torch
 
@@ -147,10 +147,13 @@ class CFMDetectorBackend:
         self._ymeas_buffer.append(y_meas.copy())
         self._ucmd_buffer.append(self._u_cmd.copy())
 
-        # 2. 更新内部运动学状态 (锚定)
+        # 2. 计算运动学死推算 (使用上一步恢复后的内部状态, 在覆盖前计算)
+        X_pred = WMRKinematics.kinematic_predict(self._internal_state, self._u_cmd)
+
+        # 3. 更新内部运动学状态为当前测量 (用于 _compute_innovation_window)
         self._internal_state = y_meas.copy()
 
-        # 3. 窗口未就绪 → 直通
+        # 4. 窗口未就绪 → 直通
         if not self._is_window_ready():
             return DetectionResult(
                 attack_class='A0', confidence=0.0,
@@ -174,8 +177,7 @@ class CFMDetectorBackend:
         self._inference_count += 1
         self._total_inference_time += time.time() - t0
 
-        # 6. 恢复: 正常→直通, 攻击→解码器重建
-        X_pred = WMRKinematics.kinematic_predict(self._internal_state, self._u_cmd)
+        # 6. 恢复: 正常→直通, 攻击→解码器重建 (X_pred 已在步骤 2 计算)
         y_recovered = self._recover(y_meas, attack_class, confidence,
                                     X_pred, y_decoded)
 
@@ -257,17 +259,16 @@ class CFMDetectorBackend:
             cfg = dict(np.load(config_path, allow_pickle=True))
 
         # ---- 向后兼容: 旧配置 → 新架构 ----
-        backbone_type = str(cfg.get('backbone_type', 'simple_conv'))
-        if backbone_type == 'causal_conv':
-            print(f"  [WARN] 旧配置 backbone_type='causal_conv' → 回退为 'simple_conv'")
-            backbone_type = 'simple_conv'
+        if 'backbone_type' in cfg:
+            old_bb = str(cfg['backbone_type'])
+            if old_bb not in ('simple_conv',):
+                print(f"  [WARN] 旧配置 backbone_type='{old_bb}' → KAD 多尺度骨干")
 
         in_channels = int(cfg.get('in_channels', IN_CHANNELS))
         if in_channels != IN_CHANNELS:
             print(f"  [WARN] 旧配置 in_channels={in_channels} → 强制使用 {IN_CHANNELS}")
             in_channels = IN_CHANNELS
 
-        use_channel_attn = bool(cfg.get('use_channel_attn', True))
         use_decoder = bool(cfg.get('use_decoder', True))
 
         model = CFMDetector(
@@ -275,17 +276,11 @@ class CFMDetectorBackend:
             window_size=int(cfg.get('window_size', self.window_size)),
             d_model=int(cfg.get('d_model', 96)),
             num_classes=int(cfg.get('num_classes', 8)),
-            backbone_type=backbone_type,
-            use_channel_attn=False,
             use_decoder=use_decoder,
             conv_channels=list(cfg.get('conv_channels', [32, 64, 96])),
             conv_kernel_sizes=list(cfg.get('conv_kernel_sizes', [7, 5, 3])),
             conv_dilations=list(cfg.get('conv_dilations', [1, 3, 9])),
-            conv_kernel_size=int(cfg.get('conv_kernel_size', 3)),
             pool_size=int(cfg.get('pool_size', 2)),
-            num_transformer_layers=int(cfg.get('num_transformer_layers', 4)),
-            num_heads=int(cfg.get('num_heads', 8)),
-            dim_feedforward=int(cfg.get('dim_feedforward', 512)),
         )
 
         if os.path.exists(model_path):
@@ -323,6 +318,8 @@ class CFMDetectorBackend:
                 self._feat_scale = data['feat_scale']
             elif 'innov_scale' in data:
                 self._feat_scale = data['innov_scale']
+                print("  [WARN] 旧版 normalizer 使用 'innov_scale' 键, "
+                      "建议重新运行 preprocess_data.py")
             else:
                 self._feat_scale = np.array([2.5, 2.5, np.pi], dtype=np.float32)
             self._cmd_max = data['cmd_max']
@@ -341,6 +338,8 @@ class CFMDetectorBackend:
                 ymeas_scale=self._ymeas_scale,
                 ymeas_median=self._ymeas_median,
                 cmd_max=self._cmd_max,
+                feat_median=self._feat_median,
+                feat_scale=self._feat_scale,
             )
 
     def _normalize(self, ymeas_window: np.ndarray, innov_window: np.ndarray,
