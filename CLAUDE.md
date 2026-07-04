@@ -4,7 +4,7 @@
 
 ## 项目概要
 
-这是一个用于**轮式移动机器人（WMR）传感器攻击检测与恢复**的研究仿真系统。一个类似TurtleBot4的差速驱动机器人在NMPC控制下跟踪参考轨迹，同时其传感器测量数据可能在随机时刻受到攻击。一个基于 MultiScaleDSConvBackbone + 运动学一致性偏置注意力的分类检测器（CFMDetector）用于分类攻击类型（8类: A0-A7），检测到攻击时通过解码器重建位姿估计（运动学递推 + 学习修正）。
+这是一个用于**轮式移动机器人（WMR）传感器攻击检测与恢复**的研究仿真系统。一个类似TurtleBot4的差速驱动机器人在NMPC控制下跟踪参考轨迹，同时其传感器测量数据可能在随机时刻受到攻击。一个基于膨胀深度可分离卷积骨干 + 运动学一致性偏置注意力的分类检测器用于分类攻击类型（8类: A0-A7），检测到攻击时通过解码器重建位姿估计（运动学递推 + 学习修正）。
 
 ## 工作习惯
 
@@ -75,11 +75,11 @@ python simulate.py --all              # 批量所有8种攻击
 ```
 ReferenceTrajectory(参考轨迹) → NMPC → u_cmd → WMRKinematics(RK4运动学) → X_true(真实状态)
                                               ↘ (通过 set_control 传入)  ↓
-                                               CFMDetector(检测器)      Sensor(传感器) + Noise(噪声)
+                                              检测器                   Sensor(传感器) + Noise(噪声)
                                                    ↑                    ↓
                                       y_meas ← SensorAttack.inject()(注入攻击)
                                         ↓
-                               CFMDetector.detect(y_meas)(执行检测)
+                               检测器.detect(y_meas)(执行检测)
                                  innov_anchored = y_meas - rollout(y_meas[0], u_cmd)  (在线窗口级计算)
                                  滑动窗口: [y_meas(3) + innov_anchored(3) + u_cmd(2)] = 8 通道
                                  MultiScaleDSConvBackbone (3块膨胀深度可分离卷积, 自适应K)
@@ -103,10 +103,10 @@ ReferenceTrajectory(参考轨迹) → NMPC → u_cmd → WMRKinematics(RK4运动
 | `attack.py`                   | 7 种传感器攻击类型 (A1–A7) + 正常情况 (A0)；统一的`inject()` 注入接口                                                                     |
 | `simulate.py`                 | 统一闭环仿真：CFM检测器 / 无检测器基线 / 五族轨迹对比                                                                                      |
 | `generate_dataset.py`         | 开环数据生成：5 种随机轨迹系列 × 8 种攻击                                                                                                 |
-| `backend.py`                  | CFMDetectorBackend 推理包装器：滑动窗口缓冲 + 内部运动学 + 分类 + 恢复策略路由                                                             |
-| `detector/cfm_detector.py`    | CFMDetector 模型定义：MultiScaleDSConvBackbone (膨胀深度可分离卷积) + 运动学一致性偏置注意力 + 物理引导解码器                              |
+| `backend.py`                  | DetectorBackend 推理包装器：滑动窗口缓冲 + 内部运动学 + 分类 + 恢复策略路由                                                             |
+| `detector/detector.py`        | 检测模型定义：膨胀深度可分离卷积骨干 + 运动学一致性偏置注意力 + 物理引导解码器                              |
 | `detector/preprocess_data.py` | 100 步滑动窗口，物理锚点归一化 (RobustNormalizer)，防数据泄漏的文件级拆分                                                                  |
-| `detector/train.py`           | CFMDetector 训练脚本：L = L_cls + λ_recon*L_recon（联合训练，λ_recon=0.3，warmup=20 epoch，label smoothing 0.0），A0 每 epoch 随机降采样 |
+| `detector/train.py`           | 检测模型训练脚本：L = L_cls + λ_recon*L_recon（联合训练，λ_recon=0.3，warmup=20 epoch，label smoothing 0.0），A0 每 epoch 随机降采样 |
 | `detector/evaluate.py`        | 测试集分类评估：混淆矩阵 + 逐类精度/召回/F1 + 置信度 + 汇总图 + Markdown 报告                                                              |
 | `detector/models/`            | 训练好的模型权重 (cfm_cls_best.pt, cfm_cls_config.npz)                                                                                     |
 

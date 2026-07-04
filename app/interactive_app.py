@@ -51,7 +51,7 @@ from tkinter import ttk, messagebox
 from model import WMRParams, WMRKinematics, SensorSimulator
 from controller import NMPCController, NMPCParams
 from attack import SensorAttack, AttackConfig, ALL_ATTACK_TYPES, ATTACK_NAMES, ATK_COLORS
-from backend import CFMDetectorBackend
+from backend import DetectorBackend
 
 # ============================================================================
 # 全局常量
@@ -126,7 +126,7 @@ class PerfectDetectorBackend:
 
     检测: 通过 set_ground_truth() 获知真实攻击状态 → detect() 返回 100% 正确的类别。
     恢复: 攻击中完全开环运动学死推算 (不再使用 y_clean 作弊)，正常时信任传感器直通。
-    API 与 CFMDetectorBackend 一致: detect(y_meas) → DetectionResult。
+    API 与 DetectorBackend 一致: detect(y_meas) → DetectionResult。
     """
 
     def __init__(self):
@@ -263,7 +263,7 @@ class SimulationWorker(threading.Thread):
             if not os.path.exists(cfm_model):
                 self._q.put(('warning', f'CFM模型未找到: {cfm_model}\n回退为无检测器'))
             else:
-                detector = CFMDetectorBackend(model_path=cfm_model, norm_path=norm_dir)
+                detector = DetectorBackend(model_path=cfm_model, norm_path=norm_dir)
                 detector.reset()
         elif detector_mode == 'perfect':
             detector = PerfectDetectorBackend()

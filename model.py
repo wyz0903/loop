@@ -286,7 +286,7 @@ class WMRKinematics:
     @staticmethod
     def kinematic_predict(state: np.ndarray, u_cmd: np.ndarray,
                           Ts: float = 0.05, alpha: float = 0.17) -> np.ndarray:
-        """内部运动学 Euler 一步预测 (与 CFMDetector 内部运动学一致)
+        """内部运动学 Euler 一步预测 (与检测器内部运动学一致)
 
         WMR 前端位姿运动学:
           dX/dt = F_h(theta) * u

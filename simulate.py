@@ -30,7 +30,7 @@ from model import (WMRParams, WMRKinematics, SensorSimulator,
                    LissajousTrajectory, CircularTrajectory, SIM_STEPS)
 from controller import NMPCController, NMPCParams
 from attack import SensorAttack, ALL_ATTACK_TYPES, ATTACK_NAMES
-from backend import CFMDetectorBackend
+from backend import DetectorBackend
 
 # ============================================================================
 # 全局配置
@@ -57,47 +57,21 @@ TRAJECTORY_FAMILIES = ['lissajous', 'circular', 'spiral', 'random_waypoint', 'sq
 # ============================================================================
 
 def _has_attack(data: dict) -> bool:
-    """该次仿真是否存在真实攻击 (A0 或攻击从未触发时返回 False)"""
-    if str(data.get('attack_type', 'A0')) == 'A0':
-        return False
-    active = data.get('attack_active', None)
-    if active is not None and hasattr(active, 'max'):
-        return bool(active.max() > 0.5)
-    return True
+    return str(data.get('attack_type', 'A0')) != 'A0'
 
 
 def _get_onset_idx(data: dict) -> int:
-    """从仿真数据中获取攻击起始索引 (考虑窗口填充期)"""
-    n_steps = len(data['t']) if 't' in data else 700
-    if 'attack_active' in data:
-        active = data['attack_active']
-        if hasattr(active, 'max') and active.max() > 0.5:
-            raw_onset = int(np.argmax(active > 0.5))
-            return min(max(raw_onset, 100), n_steps - 1)
-    if 'attack_onset' in data:
-        raw_onset = int(float(data['attack_onset']) / data.get('Ts', 0.05))
-        return min(max(raw_onset, 100), n_steps - 1)
-    return min(max(int(ATTACK_ONSET_DEFAULT / 0.05), 100), n_steps - 1)
+    return min(max(int(float(data['attack_onset']) / data['Ts']), 100), len(data['t']) - 1)
 
 
 def _create_trajectory(traj_type: str, Ts: float, seed: int):
-    """创建指定类型的轨迹生成器"""
     from generate_dataset import RandomizedTrajectory
-
     if traj_type == 'lissajous':
         return LissajousTrajectory(Ts=Ts)
     elif traj_type == 'circular':
         return CircularTrajectory(Ts=Ts)
-    elif traj_type in ('spiral', 'random_waypoint', 'square'):
-        family_seeds = {'spiral': 0, 'random_waypoint': 500, 'square': 1500}
-        base = family_seeds.get(traj_type, 0)
-        for s in range(2000):
-            traj = RandomizedTrajectory(Ts=Ts, seed=base + s)
-            if traj.family == traj_type:
-                return traj
-        raise RuntimeError(f'无法创建 {traj_type} 轨迹')
     else:
-        raise ValueError(f"Unknown trajectory type: {traj_type}")
+        return RandomizedTrajectory(Ts=Ts, family=traj_type, seed=seed)
 
 
 # ============================================================================
@@ -116,7 +90,7 @@ def run_simulation(attack_type: str = 'A1',
 
     Args:
         attack_type:     攻击类型 'A0'~'A7' (A0=无攻击)
-        use_detector:    True=CFMDetectorBackend, False=y_meas 直送 NMPC
+        use_detector:    True=DetectorBackend, False=y_meas 直送 NMPC
         trajectory_type: 轨迹类型 lissajous/circular/spiral/random_waypoint/square
         seed:            随机种子
         attack_onset:    攻击起始时间 [s] (None=随机[5,30]s, A0=永不攻击)
@@ -152,7 +126,7 @@ def run_simulation(attack_type: str = 'A1',
     # 检测器
     detector = None
     if use_detector:
-        detector = CFMDetectorBackend(model_path=model_path, norm_path=norm_path)
+        detector = DetectorBackend(model_path=model_path, norm_path=norm_path)
 
     # ---- 重置 ----
     traj.reset()
@@ -353,7 +327,7 @@ def plot_results(data: dict, save_path: str = None):
     Ts = data['Ts']
     atk_type = data.get('attack_type', 'A0')
     use_det = data.get('use_detector', True)
-    det_label = 'CFMDetector' if use_det else 'No Detector'
+    det_label = 'Detector' if use_det else 'No Detector'
     has_attack = _has_attack(data)
     onset_idx = _get_onset_idx(data) if has_attack else None
     onset_time = onset_idx * Ts if has_attack else None
@@ -487,7 +461,7 @@ def plot_summary(all_metrics: list):
     x = np.arange(len(attacks))
 
     fig, axes = plt.subplots(1, 2, figsize=(14, 5.5))
-    fig.suptitle('CFMDetector — All Attack Types Summary', fontsize=14, fontweight='bold')
+    fig.suptitle('检测器 — All Attack Types Summary', fontsize=14, fontweight='bold')
 
     # Panel 1: Post-Attack RMSE
     ax = axes[0]
@@ -571,21 +545,12 @@ def plot_all_trajectories():
     n_steps = SIM_STEPS
     nmpc_params = NMPCParams()
 
-    def _force_family(family: str, ts: float):
-        family_seeds = {'spiral': 0, 'random_waypoint': 500, 'square': 1500}
-        base = family_seeds.get(family, 0)
-        for s in range(2000):
-            traj = RandomizedTrajectory(Ts=ts, seed=base + s)
-            if traj.family == family:
-                return traj
-        raise RuntimeError(f'无法创建 {family} 轨迹')
-
     TRAJ_CONFIGS = [
         ('Lissajous',       '#2196F3', lambda: LissajousTrajectory(Ts=Ts)),
         ('Circular',        '#4CAF50', lambda: CircularTrajectory(Ts=Ts)),
-        ('Spiral',          '#FF9800', lambda: _force_family('spiral', Ts)),
-        ('Random Waypoint', '#E91E63', lambda: _force_family('random_waypoint', Ts)),
-        ('Square',          '#9C27B0', lambda: _force_family('square', Ts)),
+        ('Spiral',          '#FF9800', lambda: RandomizedTrajectory(Ts=Ts, family='spiral', seed=0)),
+        ('Random Waypoint', '#E91E63', lambda: RandomizedTrajectory(Ts=Ts, family='random_waypoint', seed=500)),
+        ('Square',          '#9C27B0', lambda: RandomizedTrajectory(Ts=Ts, family='square', seed=1500)),
     ]
 
     fig, axes = plt.subplots(2, 3, figsize=(20, 13))
