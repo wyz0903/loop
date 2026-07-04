@@ -50,7 +50,6 @@ class AttackConfig:
 
     # —— A4 重放攻击 (Replay Attack) ——
     # 来源: 攻击者录制历史测量值后回放
-    replay_record_duration: float = 10.0              # 录制时长 [s] (攻击前)
     replay_record_gap: float = 0.0                     # 录制截止距攻击开始的间隔 [s]
 
     # —— A5 信号丢失 (Intermittent Dropout) ——
@@ -171,10 +170,10 @@ class SensorAttack:
             return self._inject_A7(t, y_clean)
         else:
             # 加性攻击: A1-A3
-            a_k = self.step(t)
+            a_k = self._step(t)
             return y_clean + a_k
 
-    def step(self, t: float) -> np.ndarray:
+    def _step(self, t: float) -> np.ndarray:
         """生成加性攻击向量 a(k) — 仅 A1-A3 使用"""
         if not self._is_active(t):
             return np.zeros(3)
@@ -297,25 +296,6 @@ class SensorAttack:
             self._frozen_value = y_clean.copy()
         return self._frozen_value.copy()
 
-    # ==================================================================
-    # 工具方法
-    # ==================================================================
-
-    @staticmethod
-    def print_summary():
-        """输出攻击类型汇总"""
-        print("\n" + "=" * 65)
-        print("Sensor Attack Catalog — 传感器攻击目录 (IEEE TIE)")
-        print("=" * 65)
-        for atype in ['A0','A1','A2','A3','A4','A5','A6','A7']:
-            print(f"  {atype}: {SensorAttack.ATTACK_NAMES[atype]}")
-        print("=" * 65)
-        print("  A1-A3 : 加性攻击 (additive)")
-        print("  A4-A5 : 非加性攻击 — 通过 inject() 接口")
-        print("  A6    : 乘性攻击 (multiplicative) — 唯一非加性缩放类")
-        print("  A7    : 非加性攻击 — 传感器输出冻结")
-        print("=" * 65 + "\n")
-
 
 # ============================================================================
 # 模块级攻击元数据 — 项目唯一数据源 (single source of truth)
@@ -344,108 +324,3 @@ ATK_COLORS = {
     'A0': '#4CAF50', 'A1': '#E91E63', 'A2': '#FF9800', 'A3': '#2196F3',
     'A4': '#9C27B0', 'A5': '#795548', 'A6': '#00BCD4', 'A7': '#607D8B',
 }
-
-# ============================================================================
-# 自测
-# ============================================================================
-
-if __name__ == "__main__":
-    SensorAttack.print_summary()
-
-    Ts = 0.05
-    onset = 5.0
-
-    # —— 测试加性攻击 A1-A3 ——
-    print("Testing additive attacks (A1-A3, step interface)...\n")
-    for atype in ['A1', 'A2', 'A3']:
-        att = SensorAttack(attack_type=atype, onset_time=onset, seed=42)
-        vals = []
-        for t in np.arange(0.0, 8.0, Ts):
-            vals.append(att.step(t))
-        vals = np.array(vals)
-        pre = vals[:int(onset/Ts)]
-        post = vals[int(onset/Ts):]
-        assert np.allclose(pre, 0), f"{atype}: pre-onset should be zero!"
-        print(f"  {atype} ({SensorAttack.ATTACK_NAMES[atype]}):")
-        print(f"    Post-onset range x: [{post[:,0].min():.4f}, {post[:,0].max():.4f}]")
-        print(f"    Post-onset range y: [{post[:,1].min():.4f}, {post[:,1].max():.4f}]")
-        print(f"    Post-onset range θ: [{post[:,2].min():.4f}, {post[:,2].max():.4f}]")
-
-    # —— 测试 A4 重放攻击 ——
-    print("\nTesting A4 Replay Attack...")
-    att = SensorAttack(attack_type='A4', onset_time=onset, seed=42)
-    y_clean_hist, y_att_hist = [], []
-    for t in np.arange(0.0, 10.0, Ts):
-        y_clean = np.array([np.sin(t), np.cos(t), 0.1 * t])
-        y_att = att.inject(t, y_clean)
-        y_clean_hist.append(y_clean)
-        y_att_hist.append(y_att)
-    y_clean_hist = np.array(y_clean_hist)
-    y_att_hist = np.array(y_att_hist)
-    pre_mask = np.arange(len(y_att_hist)) < int(onset / Ts)
-    pre_ok = np.allclose(y_att_hist[pre_mask], y_clean_hist[pre_mask], atol=1e-10)
-    post_dev = np.mean(np.abs(y_att_hist[~pre_mask] - y_clean_hist[~pre_mask]))
-    print(f"  攻击前一致: {pre_ok}")
-    print(f"  攻击后平均偏差: {post_dev:.4f}m")
-
-    # —— 测试 A5 信号丢失 ——
-    print("\nTesting A5 Intermittent Dropout...")
-    att = SensorAttack(attack_type='A5', onset_time=onset, seed=42)
-    dropout_count = 0
-    y_att_hist, y_clean_hist = [], []
-    for t in np.arange(0.0, 20.0, Ts):  # 长一点以看到间歇性
-        y_clean = np.array([np.sin(t), np.cos(t), 0.1])
-        y_att = att.inject(t, y_clean)
-        y_att_hist.append(y_att)
-        y_clean_hist.append(y_clean)
-        if t >= onset and np.allclose(y_att, 0):
-            dropout_count += 1
-    y_att_hist = np.array(y_att_hist)
-    post = y_att_hist[int(onset/Ts):]
-    dropout_ratio = dropout_count / len(post) * 100
-    print(f"  丢包率 (攻击后): {dropout_ratio:.1f}%")
-    print(f"  故障态平均持续时间: {dropout_count / max(1, (post == 0).any(axis=1).sum() / max(1, np.sum(np.diff((post == 0).all(axis=1).astype(int)) == 1))):.1f} 步")
-    print(f"  攻击前输出一致: {np.allclose(y_att_hist[:int(onset/Ts)], y_clean_hist[:int(onset/Ts)], atol=1e-10)}")
-
-    # —— 测试 A6 缩放攻击 ——
-    print("\nTesting A6 Scaling Attack...")
-    att = SensorAttack(attack_type='A6', onset_time=onset, seed=42)
-    y_clean_hist, y_att_hist = [], []
-    for t in np.arange(0.0, 8.0, Ts):
-        y_clean = np.array([1.0, 2.0, 0.5])  # 固定输入用于测试缩放
-        y_att = att.inject(t, y_clean)
-        y_clean_hist.append(y_clean)
-        y_att_hist.append(y_att)
-    y_att_hist = np.array(y_att_hist)
-    post = y_att_hist[int(onset/Ts):]
-    print(f"  输入 y_clean: [{1.0}, {2.0}, {0.5}]")
-    print(f"  缩放因子:   s=[{att.cfg.scale_x}, {att.cfg.scale_y}, {att.cfg.scale_theta}]")
-    print(f"  输出 y_att:  [{post[0,0]:.3f}, {post[0,1]:.3f}, {post[0,2]:.3f}]")
-    print(f"  预期:        [{1.0*att.cfg.scale_x:.3f}, {2.0*att.cfg.scale_y:.3f}, {0.5*att.cfg.scale_theta:.3f}]")
-    assert np.allclose(post[0], [1.0*att.cfg.scale_x, 2.0*att.cfg.scale_y, 0.5*att.cfg.scale_theta])
-    pre_ok = np.allclose(y_att_hist[:int(onset/Ts)], y_clean_hist[:int(onset/Ts)], atol=1e-10)
-    print(f"  攻击前一致: {pre_ok}")
-
-    # —— 测试 A7 传感器冻结 ——
-    print("\nTesting A7 Sensor Freeze...")
-    att = SensorAttack(attack_type='A7', onset_time=onset, seed=42)
-    y_att_hist = []
-    y_clean_hist = []
-    for t in np.arange(0.0, 8.0, Ts):
-        y_clean = np.array([t, 2*t, 0.5*t])
-        y_att = att.inject(t, y_clean)
-        y_att_hist.append(y_att)
-        y_clean_hist.append(y_clean)
-    y_att_hist = np.array(y_att_hist)
-    post = y_att_hist[int(onset/Ts):]
-    # 冻结值应始终等于 onset 时刻的 y_clean
-    frozen_expected = y_clean_hist[int(onset/Ts)]
-    all_frozen = np.allclose(post, frozen_expected, atol=1e-10)
-    print(f"  冻结时刻 (t={onset}s) y_clean: {frozen_expected}")
-    print(f"  攻击后所有值 == 冻结值: {all_frozen}")
-    # 确认冻结值不随时间变化
-    assert all_frozen
-
-    print("\n" + "=" * 65)
-    print("  所有攻击自测通过！")
-    print("=" * 65 + "\n")

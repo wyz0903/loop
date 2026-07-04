@@ -15,16 +15,6 @@ SIM_TIME = 50.0        # 仿真总时长 [s]
 SIM_STEPS = 1000       # 仿真总步数 = round(SIM_TIME / 0.05)，避免 IEEE 754 截断误差
 
 
-def setup_ieee_style(font_size: int = 9):
-    """设置 IEEE 论文标准 matplotlib 样式 (全局生效)。
-
-    所有绘图模块统一调用此函数，避免 rcParams 配置分散。
-    """
-    import matplotlib.pyplot as plt
-    plt.rcParams['font.sans-serif'] = ['Microsoft YaHei', 'SimHei']
-    plt.rcParams['font.size'] = font_size
-    plt.rcParams['axes.unicode_minus'] = False
-
 
 # ============================================================================
 # 1. 物理参数定义
@@ -279,10 +269,6 @@ class WMRKinematics:
         else:
             self.state = init_state.copy()
 
-    @property
-    def theta(self) -> float:
-        return self.state[2]
-
     def input_matrix(self, theta: float) -> np.ndarray:
         """计算输入矩阵 F_h(theta) (论文 Eq.2)"""
         return np.array([
@@ -364,48 +350,6 @@ class WMRKinematics:
         self.state[1] = np.clip(self.state[1], -self.p.pos_bound, self.p.pos_bound)
         return self.state
 
-    # ---------- 误差动力学 (用于 MPC 预测) ----------
-
-    def error_dynamics_rhs(self, X: np.ndarray, u: np.ndarray, u_r: np.ndarray) -> np.ndarray:
-        """跟踪误差动力学右侧 (论文 Eq.10)
-        
-        Args:
-            X:   误差状态 [x_e, y_e, theta_e] (3,)
-            u:   控制输入 [v, w] (2,)
-            u_r: 参考指令 [v_r, w_r] (2,)
-            
-        Returns:
-            dX: 误差导数 (3,)
-        """
-        x_e, y_e, theta_e = X[0], X[1], X[2]
-        v_r, w_r = u_r[0], u_r[1]
-
-        f_X = np.array([
-            v_r * np.cos(theta_e),
-            v_r * np.sin(theta_e),
-            w_r
-        ])
-        G_X = np.array([
-            [-1.0,  y_e],
-            [0.0,  -x_e - self.p.alpha],
-            [0.0,  -1.0]
-        ])
-        return f_X + G_X @ u
-
-    def error_rk4_step(self, X: np.ndarray, u: np.ndarray, u_r: np.ndarray, Ts: float = None) -> np.ndarray:
-        """误差动力学 RK4 一步积分 (用于 MPC 内部预测)"""
-        if Ts is None:
-            Ts = self.p.Ts
-        h = Ts
-        k1 = self.error_dynamics_rhs(X, u, u_r)
-        k2 = self.error_dynamics_rhs(X + h/2 * k1, u, u_r)
-        k3 = self.error_dynamics_rhs(X + h/2 * k2, u, u_r)
-        k4 = self.error_dynamics_rhs(X + h * k3, u, u_r)
-        X_next = X + h/6 * (k1 + 2*k2 + 2*k3 + k4)
-        # 角度误差归一化
-        X_next[2] = np.arctan2(np.sin(X_next[2]), np.cos(X_next[2]))
-        return X_next
-
     # ---------- 坐标变换 ----------
 
     @staticmethod
@@ -472,147 +416,3 @@ class SensorSimulator:
         return y_meas
 
 
-# ============================================================================
-# 5. 五族轨迹可视化
-# ============================================================================
-
-def _generate_trajectory_path(traj, pos_bound, Ts=0.05, T_sim=50.0):
-    """模拟完整 50s 参考轨迹 (使用轨迹自身的 step，已为 RK4)"""
-    n = int(T_sim / Ts)
-    traj.reset()
-    x_arr, y_arr = np.zeros(n), np.zeros(n)
-    for i in range(n):
-        Ur, _ = traj.step(i * Ts)
-        x_arr[i], y_arr[i] = Ur[0], Ur[1]
-    within = np.all(np.abs(x_arr) <= pos_bound + 1e-6) and \
-             np.all(np.abs(y_arr) <= pos_bound + 1e-6)
-    return x_arr, y_arr, within
-
-
-def plot_trajectory_shapes():
-    """绘制五族参考轨迹完整形状对比图 (IEEE 论文标准)"""
-    import matplotlib.pyplot as plt
-
-    # ---- IEEE 论文标准字体 (局部作用，不污染全局) ----
-    import matplotlib as mpl
-    _rc_backup = {k: mpl.rcParams[k] for k in
-                  ['font.family', 'font.serif', 'mathtext.fontset',
-                   'font.size', 'axes.titlesize', 'axes.labelsize']}
-    plt.rcParams['font.sans-serif'] = ['Microsoft YaHei', 'SimHei']
-    plt.rcParams['font.size'] = 10
-    plt.rcParams['axes.titlesize'] = 11
-    plt.rcParams['axes.labelsize'] = 9
-
-    Ts = 0.05; T_sim = 50.0; pb = 2.5
-
-    # 五族轨迹配置
-    configs = [
-        ('Lissajous',       '#2196F3', LissajousTrajectory(Ts=Ts)),
-        ('Circular',        '#4CAF50', CircularTrajectory(Ts=Ts)),
-        ('Spiral',          '#FF9800', _force_rand_family('spiral', Ts)),
-        ('Random Waypoint', '#E91E63', _force_rand_family('random_waypoint', Ts)),
-        ('Square',          '#9C27B0', _force_rand_family('square', Ts)),
-    ]
-
-    fig, axes = plt.subplots(2, 3, figsize=(14, 9))
-    ax_flat = axes.flatten()
-    extents = {}
-
-    for idx, (name, color, traj) in enumerate(configs):
-        x, y, _ = _generate_trajectory_path(traj, pb, Ts, T_sim)
-        extents[name] = (np.max(np.abs(x)), np.max(np.abs(y)))
-
-        ax = ax_flat[idx]
-        ax.plot(x, y, color=color, linewidth=1.0, label='Reference path')
-        ax.plot(x[0], y[0], 'ko', markersize=5, label='Start')
-        ax.plot(x[-1], y[-1], 'r*', markersize=8, label='End')
-        # 空间边界
-        ax.plot([-pb, pb, pb, -pb, -pb], [-pb, -pb, pb, pb, -pb],
-                'gray', linewidth=0.6, alpha=0.5, linestyle=':', label='Boundary')
-        ax.set_xlim(-pb - 0.3, pb + 0.3)
-        ax.set_ylim(-pb - 0.3, pb + 0.3)
-        ax.set_aspect('equal')
-        ax.set_xlabel('X [m]')
-        ax.set_ylabel('Y [m]')
-        ax.set_title(name, fontsize=11, fontweight='bold', color=color)
-        ax.legend(loc='upper right', fontsize=7, framealpha=0.8, ncol=2)
-        ax.grid(True, alpha=0.2)
-
-    # 第6图: 汇总柱状图
-    ax6 = ax_flat[5]
-    names = list(extents.keys())
-    x_vals = [extents[n][0] for n in names]
-    y_vals = [extents[n][1] for n in names]
-    x_pos = np.arange(len(names))
-    w = 0.35
-    ax6.bar(x_pos - w / 2, x_vals, w, label='$|x|_{\\max}$', color='#2196F3', alpha=0.8)
-    ax6.bar(x_pos + w / 2, y_vals, w, label='$|y|_{\\max}$', color='#FF9800', alpha=0.8)
-    ax6.axhline(y=pb, color='gray', linestyle='--', linewidth=0.8, label=f'Boundary ($\\pm${pb} m)')
-    ax6.set_xticks(x_pos)
-    ax6.set_xticklabels(names, rotation=15, fontsize=9)
-    ax6.set_ylabel('Max absolute position [m]')
-    ax6.set_title('Spatial Extent', fontsize=11, fontweight='bold')
-    ax6.legend(loc='upper left', fontsize=7, framealpha=0.8)
-    ax6.grid(True, alpha=0.2, axis='y')
-
-    fig.suptitle('Reference Trajectory Families (50 s, ± 2.5 m boundary)',
-                 fontsize=13, fontweight='bold', y=0.98)
-    plt.tight_layout()
-    plt.show()
-
-    # 恢复全局 rcParams，避免污染其他模块的图表
-    for k, v in _rc_backup.items():
-        mpl.rcParams[k] = v
-
-
-def _force_rand_family(family: str, Ts: float):
-    """根据族名创建 RandomizedTrajectory (通过种子搜索，结果缓存)
-
-    由于 RandomizedTrajectory 使用种子随机选择族 (等概率 20%)，
-    这里通过搜索种子来获取指定族的实例。首次获取后缓存。
-    """
-    from generate_dataset import RandomizedTrajectory
-
-    # 高概率命中范围: 5 族 × 5倍冗余 = 前25个种子大概率覆盖全族
-    # 若未命中则逐种子搜索 (最多 5000 个)
-    for s in range(5000):
-        traj = RandomizedTrajectory(Ts=Ts, seed=s)
-        if traj.family == family:
-            return traj
-    raise RuntimeError(f'无法在 5000 个种子内找到 {family} 族轨迹')
-
-
-# ============================================================================
-# 主入口
-# ============================================================================
-
-if __name__ == "__main__":
-    import sys
-    if '--test' in sys.argv:
-        # 快速自测模式
-        print("=== model.py 自测 ===")
-        params = WMRParams()
-        traj = LissajousTrajectory(Ts=params.Ts)
-        robot = WMRKinematics(params)
-        sensor = SensorSimulator()
-
-        robot.reset()
-        u = np.array([0.3, 0.0])
-        for _ in range(10):
-            state = robot.step(u)
-        print(f"10步直行后: 位姿 = {state}")
-
-        traj.reset()
-        Ur, ur = traj.step(1.0)
-        print(f"t=1.0s 参考位姿: {Ur}, 指令: {ur}")
-
-        true_state = robot.state
-        y_meas = sensor.measure(true_state)
-        print(f"传感器测量: {y_meas}")
-
-        X_err = WMRKinematics.compute_error(Ur, robot.state)
-        print(f"跟踪误差: {X_err}")
-        print("=== 所有模块自测通过 ===")
-    else:
-        # 默认: 显示五族轨迹对比图
-        plot_trajectory_shapes()

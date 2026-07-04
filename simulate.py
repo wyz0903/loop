@@ -13,8 +13,6 @@ simulate.py — WMR 闭环仿真 (含 CFM 检测器集成)
 """
 
 import os
-import sys
-import time
 import argparse
 import numpy as np
 import pandas as pd
@@ -31,8 +29,8 @@ plt.rcParams['axes.unicode_minus'] = False
 from model import (WMRParams, WMRKinematics, SensorSimulator,
                    LissajousTrajectory, CircularTrajectory, SIM_STEPS)
 from controller import NMPCController, NMPCParams
-from attack import SensorAttack, AttackConfig, ALL_ATTACK_TYPES, ATTACK_NAMES
-from cfm_backend import CFMDetectorBackend
+from attack import SensorAttack, ALL_ATTACK_TYPES, ATTACK_NAMES
+from backend import CFMDetectorBackend
 
 # ============================================================================
 # 全局配置
@@ -648,7 +646,7 @@ def plot_all_trajectories():
     ax6.grid(True, alpha=0.3, axis='y')
     ax6.set_ylim(0, max(values) * 1.25)
 
-    fig.suptitle('Five Trajectory Families — No-Attack NMPC Tracking (35s)',
+    fig.suptitle('Five Trajectory Families — No-Attack NMPC Tracking (50s)',
                  fontsize=15, fontweight='bold', y=0.98)
     plt.tight_layout(rect=[0, 0, 1, 0.95])
     plt.show()

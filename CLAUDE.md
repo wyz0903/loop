@@ -4,7 +4,7 @@
 
 ## 项目概要
 
-这是一个用于**轮式移动机器人（WMR）传感器攻击检测与恢复**的研究仿真系统。一个类似TurtleBot4的差速驱动机器人在NMPC控制下跟踪参考轨迹，同时其传感器测量数据可能在随机时刻受到攻击。一个基于 SimpleConvBackbone + 通道自注意力的分类检测器（CFMDetector, cls-only）用于分类攻击类型（8类: A0-A7），检测到攻击时切换到运动学死推算作为位姿估计。本项目为一个科研项目，目标是在IEEE TIE上发表论文。
+这是一个用于**轮式移动机器人（WMR）传感器攻击检测与恢复**的研究仿真系统。一个类似TurtleBot4的差速驱动机器人在NMPC控制下跟踪参考轨迹，同时其传感器测量数据可能在随机时刻受到攻击。一个基于 MultiScaleDSConvBackbone + 运动学一致性偏置注意力的分类检测器（CFMDetector）用于分类攻击类型（8类: A0-A7），检测到攻击时通过解码器重建位姿估计（运动学递推 + 学习修正）。
 
 ## 工作习惯
 
@@ -35,8 +35,6 @@ python simulate.py --no-detector      # 无检测器基线
 python simulate.py --attack A0        # 无攻击正常运行
 python simulate.py --compare          # 五族轨迹无攻击跟踪对比图
 python simulate.py --all              # 批量所有8种攻击
-python attack.py                      # 打印攻击类型目录 + 攻击模块自检
-python model.py                       # 运行运动学 / 传感器模块自检
 ```
 
 ## 模型架构
@@ -55,7 +53,7 @@ ReferenceTrajectory(参考轨迹) → NMPC → u_cmd → WMRKinematics(RK4运动
                                  滑动窗口: [y_meas(3) + innov_anchored(3) + u_cmd(2)] = 8 通道
                                  MultiScaleDSConvBackbone (3块膨胀深度可分离卷积, 自适应K)
                                    → 运动学一致性偏置注意力 → 8 类 softmax (A0-A7)
-                                 恢复策略: A0/低置信度 → y_meas 直通; 攻击 → 运动学死推算
+                                 恢复策略: A0/低置信度 → y_meas 直通; 攻击 → 解码器重建 (y_kin + delta_pred)
                                         ↓
                                y_rec → 直接作为位姿估计 (替代 EKF)
                                         ↓
@@ -73,16 +71,14 @@ ReferenceTrajectory(参考轨迹) → NMPC → u_cmd → WMRKinematics(RK4运动
 | `attack.py` | 7 种传感器攻击类型 (A1–A7) + 正常情况 (A0)；统一的 `inject()` 注入接口 |
 | `simulate.py` | 统一闭环仿真：CFM检测器 / 无检测器基线 / 五族轨迹对比 |
 | `generate_dataset.py` | 开环数据生成：5 种随机轨迹系列 × 8 种攻击 |
-| `cfm_backend.py` | CFMDetectorBackend 推理包装器：滑动窗口缓冲 + 内部运动学 + 分类 + 恢复策略路由 |
-| `detector/cfm_detector.py` | KAD 模型定义：MultiScaleDSConvBackbone (膨胀深度可分离卷积) + 运动学一致性偏置注意力 |
+| `backend.py` | CFMDetectorBackend 推理包装器：滑动窗口缓冲 + 内部运动学 + 分类 + 恢复策略路由 |
+| `detector/cfm_detector.py` | CFMDetector 模型定义：MultiScaleDSConvBackbone (膨胀深度可分离卷积) + 运动学一致性偏置注意力 + 物理引导解码器 |
 | `detector/preprocess_data.py` | 100 步滑动窗口，物理锚点归一化 (RobustNormalizer)，防数据泄漏的文件级拆分 |
-| `detector/train.py` | CFMDetector 训练脚本：L = L_cls（纯交叉熵分类，label smoothing 0.05），A0 每 epoch 随机降采样 |
+| `detector/train.py` | CFMDetector 训练脚本：L = L_cls + λ_recon*L_recon（联合训练，λ_recon=0.3，warmup=20 epoch，label smoothing 0.0），A0 每 epoch 随机降采样 |
 | `detector/evaluate.py` | 测试集分类评估：混淆矩阵 + 逐类精度/召回/F1 + 置信度 + 汇总图 + Markdown 报告 |
 | `detector/models/` | 训练好的模型权重 (cfm_cls_best.pt, cfm_cls_config.npz) |
 
 | `app/interactive_app.py` | tkinter 交互式 GUI：轨迹/攻击自由组合 + 时间滑块回放 + 6面板实时显示 |
-| `app/plot_attack_demo.py` | 攻击演示图生成（3×3子图，论文用） |
-| `app/plot_trajectory_coverage.py` | 五族轨迹空间覆盖范围图 |
 
 ### 攻击类型
 
@@ -112,11 +108,11 @@ ReferenceTrajectory(参考轨迹) → NMPC → u_cmd → WMRKinematics(RK4运动
 - **多尺度膨胀深度可分离卷积骨干 (MultiScaleDSConvBackbone)**：3 块膨胀深度可分离卷积 (dilation=1,3,9)，每块 3 个并行膨胀深度卷积 + Pointwise Conv 混合。不同膨胀率对应不同运动学时间尺度 (0.35s / 0.95s / 2.75s)，Pointwise Conv 隐式学习最优尺度加权——自适应 K。通道 8→32→64→96，时序 100→50→25→12。骨干参数量 ~27K，远小于旧版 Standard Conv 骨干 ~76K。
 - **窗口锚定运动学新息 (Unified Anchored Innovation)**：`innov[t] = y_meas[t] - rollout(y_meas[0], u_cmd[0:t])[t]`。统一替代旧版 1-step innov + kin_res 双尺度，打破非加性攻击自指涉污染反馈环。归一化复用 y_meas 物理空间尺度 [2.5m, 2.5m, π]，简洁统一。
 - **运动学一致性偏置注意力 (Kinematics-Guided Attention Pooling)**：零参数物理先验——从 innov_anchored 的 L2 范数计算每时间步的运动学一致性偏置，注入注意力分数。攻击步 (innov 大 → bias < 0) 被抑制，正常步 (innov ≈ 0 → bias ≈ 0) 获得更多关注。可学习标量 α 控制物理先验强度。
-- **总参数量 ~28K**：46x 小于旧版 TCN (1.3M)，4x 小于 SimpleConvBackbone (~108K)，极轻量适合嵌入式部署。
+- **总参数量 ~64K**：骨干27K + 分类头1K + 解码器36K，极轻量适合嵌入式部署。
 - **物理锚点归一化 (Physical-Anchor Normalization)**：y_meas 用工作空间边界 [2.5m, 2.5m, π] 作为尺度锚点，创新通道用物理异常阈值 [0.5m, 0.5m, 0.3rad] 作为尺度。避免 IQR 归一化将常规攻击信号放大至 10³-10⁵ 导致梯度爆炸。物理含义清晰，论文可辩护。
 - **注意力池化分类头**：可学习的 attn_query 对特征序列加权求和，自适应地聚焦于攻击窗口最具判别力的时间步，替代简单的全局平均池化。
-- **纯分类训练**：单一交叉熵损失 + label smoothing 0.05，无类别权重，通过每 epoch 随机降采样 50% A0 窗口平衡类别分布。
-- **恢复策略路由**：A0 正常或低置信度 (<0.5) → y_meas 直通，避免注入估计误差；检测到攻击 (A1-A7) → 运动学死推算作为位姿估计。无信号重建能力，简洁可解释。
+- **联合训练**：L_cls + λ_recon * L_recon（λ_recon=0.3，warmup=20 epoch），label smoothing 0.0（关闭），无类别权重，通过每 epoch 随机降采样 50% A0 窗口平衡类别分布。
+- **恢复策略路由**：A0 正常或低置信度 (<0.5) → y_meas 直通；检测到攻击 (A1-A7) → 解码器重建 y_kin + delta_pred（物理引导：运动学递推 + 学习修正）。
 - **防泄漏分层 IID 拆分**：按轨迹族分层抽样为 train/val/test (70/15/15)，同一 config 的所有窗口整体进入同一划分，保证各划分同分布且无信息泄漏。
 
 ### 物理常量（TurtleBot4 安全模式设定）

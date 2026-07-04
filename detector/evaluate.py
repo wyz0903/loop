@@ -29,7 +29,6 @@ from datetime import datetime
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
-import matplotlib.ticker as mticker
 
 # IEEE 论文绘图样式 (支持中英文混排)
 plt.rcParams['font.sans-serif'] = ['Microsoft YaHei', 'SimHei']

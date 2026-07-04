@@ -100,14 +100,14 @@ class NMPCBuilder:
         X_dot = f_X + ca.MX(G_X) @ u_sym
 
         # 构建 CasADi Function: f_dyn(X, u, ur) -> X_dot
-        self._f_dyn = ca.Function('f_dyn', [X_sym, u_sym, ur_sym], [X_dot])
+        f_dyn = ca.Function('f_dyn', [X_sym, u_sym, ur_sym], [X_dot])
 
         # RK4 离散化: F_RK4(X, u, ur) -> X_next
         h = p.Ts
-        k1 = self._f_dyn(X_sym, u_sym, ur_sym)
-        k2 = self._f_dyn(X_sym + h/2 * k1, u_sym, ur_sym)
-        k3 = self._f_dyn(X_sym + h/2 * k2, u_sym, ur_sym)
-        k4 = self._f_dyn(X_sym + h * k3, u_sym, ur_sym)
+        k1 = f_dyn(X_sym, u_sym, ur_sym)
+        k2 = f_dyn(X_sym + h/2 * k1, u_sym, ur_sym)
+        k3 = f_dyn(X_sym + h/2 * k2, u_sym, ur_sym)
+        k4 = f_dyn(X_sym + h * k3, u_sym, ur_sym)
         X_next_raw = X_sym + h/6 * (k1 + 2*k2 + 2*k3 + k4)
         # 角度归一化: 防止 θ_e 在预测范围内偏离 [-π, π] 导致代价函数惩罚失准
         X_next = ca.vertcat(

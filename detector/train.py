@@ -14,7 +14,6 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import argparse
 import numpy as np
 from collections import defaultdict
-from typing import Tuple
 
 import torch
 import torch.nn as nn
@@ -24,12 +23,8 @@ from torch.optim import AdamW
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
-import warnings
-warnings.filterwarnings('ignore', message='Detected call of.*lr_scheduler.step.*before.*optimizer.step')
-warnings.filterwarnings('ignore', message='.*non-writable tensor.*')
 
 from detector.cfm_detector import (CFMDetector,
-                                    D_MODEL,
                                     CONV_CHANNELS, CONV_KERNEL_SIZES, CONV_DILATIONS,
                                     POOL_SIZE)
 
@@ -269,7 +264,7 @@ def evaluate(model, dataloader, device, epoch: int = 999):
 # ============================================================================
 
 def _save_model_config(model: CFMDetector):
-    """保存模型配置到 cfm_cls_config.npz (供 cfm_backend 加载使用)。"""
+    """保存模型配置到 cfm_cls_config.npz (供 backend 加载使用)。"""
     cfg = {
         'in_channels': int(model.in_channels),
         'window_size': int(model.window_size),
@@ -281,7 +276,7 @@ def _save_model_config(model: CFMDetector):
         'ymeas_median': model.ymeas_median.cpu().numpy(),
         'cmd_max': model.cmd_max.cpu().numpy(),
     }
-    if model.backbone_type == 'simple_conv':
+    if model.backbone_type == 'kad':
         backbone = model.backbone
         # KAD 骨干特定配置
         if hasattr(backbone, 'conv_channels'):

@@ -48,11 +48,10 @@ import tkinter as tk
 from tkinter import ttk, messagebox
 
 # ---- 项目模块 ----
-from model import (WMRParams, WMRKinematics, SensorSimulator,
-                   SIM_TIME, SIM_STEPS)
+from model import WMRParams, WMRKinematics, SensorSimulator
 from controller import NMPCController, NMPCParams
 from attack import SensorAttack, AttackConfig, ALL_ATTACK_TYPES, ATTACK_NAMES, ATK_COLORS
-from cfm_backend import CFMDetectorBackend
+from backend import CFMDetectorBackend
 
 # ============================================================================
 # 全局常量
@@ -133,16 +132,13 @@ class PerfectDetectorBackend:
     def __init__(self):
         self._attack_type = 'A0'
         self._attack_signal = np.zeros(3)
-        self._y_clean = np.zeros(3)
         self._internal_state = np.zeros(3)    # [x, y, theta] 用于运动学死推算
         self._u_cmd = np.zeros(2)             # [v, w] 控制指令缓存
 
-    def set_ground_truth(self, attack_type: str, attack_signal: np.ndarray,
-                         y_clean: np.ndarray):
+    def set_ground_truth(self, attack_type: str, attack_signal: np.ndarray):
         """每步调用: 传入当前步的真实攻击信息 (由仿真循环提供)。"""
         self._attack_type = attack_type
         self._attack_signal = np.asarray(attack_signal, dtype=float).ravel()
-        self._y_clean = np.asarray(y_clean, dtype=float).ravel()
 
     def detect(self, y_meas: np.ndarray) -> 'DetectionResult':
         """返回: 正确攻击类别 + 运动学死推算恢复 (不再使用 y_clean 作弊)。
@@ -150,7 +146,7 @@ class PerfectDetectorBackend:
         检测仍为 100% 准确 (基于 ground truth attack_signal)。
         恢复策略: 正常时信任传感器直通，攻击时完全开环运动学死推算。
         """
-        from cfm_backend import DetectionResult
+        from backend import DetectionResult
         y_meas = np.asarray(y_meas, dtype=float).ravel()
 
         # 根据真实攻击信号判断当前是否处于攻击中
@@ -293,9 +289,6 @@ class SimulationWorker(threading.Thread):
         }
 
         u_cmd = np.zeros(2)
-        internal_state = init_state.copy()
-        _recalib_interval = 200
-        _last_recalib_step = -_recalib_interval
 
         t_start_wall = time.time()
 
@@ -313,11 +306,7 @@ class SimulationWorker(threading.Thread):
             y_meas = attacker.inject(t, y_clean)
             attack_signal = y_meas - y_clean
 
-            # 3. 内部运动学新息
-            X_pred_internal = WMRKinematics.kinematic_predict(internal_state, u_cmd)
-            internal_state = y_meas.copy()  # 锚定到当前测量
-
-            # ---- 检测器 ----
+            # 3. 检测器
             if detector is None:
                 y_rec = y_meas.copy()
                 det_class = 'A0'
@@ -326,27 +315,18 @@ class SimulationWorker(threading.Thread):
             else:
                 # 理想检测器: 注入真实攻击信息
                 if isinstance(detector, PerfectDetectorBackend):
-                    detector.set_ground_truth(self._attack_type, attack_signal, y_clean)
+                    detector.set_ground_truth(self._attack_type, attack_signal)
                 detector.set_control(u_cmd)
                 result = detector.detect(y_meas)
                 y_rec = result.y_recovered.copy()
                 det_class = result.attack_class
                 det_conf = result.confidence
                 det_attack_est = result.attack_estimate.copy()
-                # 重校准: 锚定内部运动学状态到恢复测量
-                internal_state = y_rec.copy()
 
-            # 4. 状态估计 = 恢复后的测量
-
-            # 4.5 周期性重校准
-            if t < self._attack_onset and step - _last_recalib_step >= _recalib_interval:
-                internal_state = y_rec.copy()
-                _last_recalib_step = step
-
-            # 5. 跟踪误差
+            # 4. 跟踪误差
             X_error = WMRKinematics.compute_error(Upsilon_r, y_rec)
 
-            # 6. NMPC 控制
+            # 5. NMPC 控制
             u_cmd = ctrl.solve(X_error, Ur_seq)
             u_a = WMRKinematics.clamp_control(u_cmd)
 
@@ -1457,9 +1437,6 @@ class InteractiveApp(tk.Tk):
 
     def _on_close(self):
         self._stop_play()
-        if self._worker and self._worker.is_alive():
-            # 注意: daemon 线程会在主进程退出时自动终止
-            pass
         self.destroy()
 
 

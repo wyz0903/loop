@@ -26,8 +26,6 @@ generate_dataset.py — 多样化轨迹攻击数据集生成器
 """
 
 import os
-import sys
-import time
 import argparse
 import numpy as np
 import pandas as pd
@@ -431,9 +429,6 @@ def run_single_simulation(traj: RandomizedTrajectory,
     data = defaultdict(list)
     u_cmd = np.zeros(2)
 
-    # 内部运动学预测起点 — 第一步用初始位姿 (匹配推理端上一帧恢复测量锚定)
-    y_meas_prev = init_state.copy()
-
     for step in range(n_steps):
         t = step * Ts
 
@@ -448,26 +443,17 @@ def run_single_simulation(traj: RandomizedTrajectory,
         y_meas = attacker.inject(t, y_clean)
         attack_signal = y_meas - y_clean  # 等效攻击信号 (重放攻击下非加性)
 
-        # 3. 内部运动学新息 (锚定到上一帧测量)
-        X_pred_internal = WMRKinematics.kinematic_predict(y_meas_prev, u_cmd)
-        internal_innovation = y_meas - X_pred_internal
-        internal_innovation[2] = np.arctan2(np.sin(internal_innovation[2]),
-                                              np.cos(internal_innovation[2]))  # θ 包裹到[-π,π]
-
-        # 4. 锚定到当前测量 (供下一步运动学预测使用)
-        y_meas_prev = y_meas.copy()
-
-        # 5. 跟踪误差 (测量直接作为位姿估计)
+        # 3. 跟踪误差 (测量直接作为位姿估计)
         X_error = WMRKinematics.compute_error(Upsilon_r, y_meas)
 
-        # 6. NMPC 控制
+        # 4. NMPC 控制
         u_cmd = ctrl.solve(X_error, Ur_seq)
         u_a = WMRKinematics.clamp_control(u_cmd)
 
-        # 7. 机器人运动
+        # 5. 机器人运动
         robot.step(u_a)
 
-        # 8. 记录数据
+        # 6. 记录数据
         data['t'].append(t)
         data['true_state'].append(true_state.copy())       # 真实位姿 (3,)
         data['y_meas'].append(y_meas.copy())               # 含攻击测量 (3,)
@@ -477,7 +463,6 @@ def run_single_simulation(traj: RandomizedTrajectory,
         data['Upsilon_r'].append(Upsilon_r.copy())         # 参考位姿 (3,)
         data['u_r'].append(u_r.copy())                     # 参考指令 (2,)
         data['Upsilon_hat'].append(y_meas.copy())             # 状态估计 = 测量 (3,)
-        data['internal_innovation'].append(internal_innovation.copy())  # 内部运动学新息 (3,) ★ 键名与 preprocess_data.py INPUT_CHANNELS 对应
         data['X_error'].append(X_error.copy())             # 跟踪误差 (3,)
         data['u_cmd'].append(u_cmd.copy())                 # 控制指令 (2,)
         data['u_a'].append(u_a.copy())                     # 实际执行指令 (2,)
@@ -510,7 +495,7 @@ def run_single_simulation(traj: RandomizedTrajectory,
 
 
 # ============================================================================
-# 4. 数据集生成主循环
+# 3. 数据集生成主循环
 # ============================================================================
 
 # 轨迹族固定顺序 (确定性遍历)
@@ -671,7 +656,7 @@ def generate_dataset(num_configs: int = None,
 
 
 # ============================================================================
-# 5. 数据验证工具
+# 4. 数据验证工具
 # ============================================================================
 
 def validate_dataset(df: pd.DataFrame):

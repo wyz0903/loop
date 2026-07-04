@@ -1,5 +1,5 @@
 """
-cfm_backend.py — 攻击分类检测器推理后端 (编码器-解码器)
+backend.py — 攻击分类检测器推理后端 (编码器-解码器)
 ===========================================================
 推理: 滑动窗口 + 分类 + 物理引导解码器重建 → 恢复路由策略。
 
@@ -34,7 +34,6 @@ SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 # 模块常量
 # ============================================================================
 
-STATE_DIM = 3             # 传感器测量维度 [x, y, theta]
 NN_WINDOW_SIZE = 100      # 滑动窗口长度 (与 detector 一致)
 
 
@@ -148,7 +147,7 @@ class CFMDetectorBackend:
         self._ucmd_buffer.append(self._u_cmd.copy())
 
         # 2. 计算运动学死推算 (使用上一步恢复后的内部状态, 在覆盖前计算)
-        X_pred = WMRKinematics.kinematic_predict(self._internal_state, self._u_cmd)
+        y_kin_pred = WMRKinematics.kinematic_predict(self._internal_state, self._u_cmd)
 
         # 3. 更新内部运动学状态为当前测量 (用于 _compute_innovation_window)
         self._internal_state = y_meas.copy()
@@ -161,25 +160,25 @@ class CFMDetectorBackend:
                 features={'status': 'window_filling',
                           'readiness': self._window_readiness()})
 
-        # 4. 分类: 编码器+分类头
+        # 5. 分类: 编码器+分类头
         t0 = time.time()
         x_tensor = self._build_input_tensor()
-        attack_class, confidence, features = self._nn_classify(x_tensor)
+        attack_class, confidence, feat_tensor = self._nn_classify(x_tensor)
 
-        # 5. 按需解码: 仅检测到攻击时运行解码器
+        # 6. 按需解码: 仅检测到攻击时运行解码器
         y_decoded = None
         delta = np.zeros(3)
         need_reconstruct = (confidence >= self.CONFIDENCE_THRESHOLD
                             and attack_class != 'A0')
         if need_reconstruct:
-            y_decoded, delta = self._nn_reconstruct(features, x_tensor)
+            y_decoded, delta = self._nn_reconstruct(feat_tensor, x_tensor)
 
         self._inference_count += 1
         self._total_inference_time += time.time() - t0
 
-        # 6. 恢复: 正常→直通, 攻击→解码器重建 (X_pred 已在步骤 2 计算)
+        # 7. 恢复: 正常→直通, 攻击→解码器重建
         y_recovered = self._recover(y_meas, attack_class, confidence,
-                                    X_pred, y_decoded)
+                                    y_kin_pred, y_decoded)
 
         # 7. 锚定内部运动学状态到恢复测量
         self._internal_state = y_recovered.copy()
@@ -225,11 +224,7 @@ class CFMDetectorBackend:
         y = ymeas[0].copy()
         y_kin[0] = y
         for k in range(W - 1):
-            v, w = ucmd[k, 0], ucmd[k, 1]
-            cos_t, sin_t = np.cos(y[2]), np.sin(y[2])
-            dx = v * cos_t - 0.17 * w * sin_t
-            dy = v * sin_t + 0.17 * w * cos_t
-            y = y + 0.05 * np.array([dx, dy, w])
+            y = WMRKinematics.kinematic_predict(y, ucmd[k])
             y_kin[k + 1] = y
         innov = ymeas - y_kin
         innov[:, 2] = np.arctan2(np.sin(innov[:, 2]), np.cos(innov[:, 2]))
@@ -261,7 +256,7 @@ class CFMDetectorBackend:
         # ---- 向后兼容: 旧配置 → 新架构 ----
         if 'backbone_type' in cfg:
             old_bb = str(cfg['backbone_type'])
-            if old_bb not in ('simple_conv',):
+            if old_bb not in ('kad', 'simple_conv'):
                 print(f"  [WARN] 旧配置 backbone_type='{old_bb}' → KAD 多尺度骨干")
 
         in_channels = int(cfg.get('in_channels', IN_CHANNELS))
@@ -403,7 +398,7 @@ class CFMDetectorBackend:
     # ------------------------------------------------------------------
 
     def _recover(self, y_meas: np.ndarray, attack_class: str,
-                 confidence: float, X_pred: np.ndarray,
+                 confidence: float, y_kin_pred: np.ndarray,
                  y_decoded: Optional[np.ndarray] = None) -> np.ndarray:
         """恢复策略。
 
@@ -420,4 +415,4 @@ class CFMDetectorBackend:
         if y_decoded is not None:
             return y_decoded.copy()
 
-        return X_pred.copy()
+        return y_kin_pred.copy()

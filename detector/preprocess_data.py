@@ -7,16 +7,17 @@ preprocess_data.py — 密集滑动窗口 + 物理锚点归一化 + .npy 缓存
   - 窗口大小: 100 步 (5 秒 @ Ts=0.05)
   - 步长 stride=1: 密集采样最大化样本量
   - 物理锚点归一化: 创新通道用固定物理尺度 σ (非数据依赖的 IQR), u_cmd 用物理上限
-  - 输入通道: internal_innovation(3) + u_cmd(2) = 5 通道
+  - 输入通道: y_meas(3) + innov_anchored(3) + u_cmd(2) = 8 通道
   - 抗泄漏: 同一 .npz 文件的所有窗口始终整体进入同一划分
   - IID 分层划分: 按轨迹族分层抽样, 确保 train/val/test 同分布
 
 输出文件 (保存在 dataset_win/ 目录):
-  X_train.npy, X_val.npy, X_test.npy          — 输入窗口 (N, 100, 5) float32
+  X_train.npy, X_val.npy, X_test.npy              — 输入窗口 (N, 100, 8) float32
   Y_train_cls.npy, Y_val_cls.npy, Y_test_cls.npy  — 攻击分类标签 (N,) int64
-  Y_train_atk.npy, Y_val_atk.npy, Y_test_atk.npy  — 攻击信号窗口 (N, 100, 3) float32
-  split_info.npz                                — 划分信息 (train/val/test 文件列表)
-  normalizer.npz                                — 归一化参数
+  Y_train_clean.npy, Y_val_clean.npy, Y_test_clean.npy  — 干净信号窗口 (N, 100, 3) float32
+  Y_meas_train.npy, Y_meas_val.npy, Y_meas_test.npy    — 含攻击测量窗口 (N, 100, 3) float32
+  split_info.npz                                   — 划分信息 (train/val/test 文件列表)
+  normalizer.npz                                   — 归一化参数
 
 用法:
   python preprocess_data.py

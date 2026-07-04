@@ -5,7 +5,7 @@ detector/cfm_detector.py — KAD: Kinematics-Aware Detector
 
 输入: [y_meas(3) + innov_anchored(3) + u_cmd(2)] = 8 通道, 归一化后
   - y_meas (3):          传感器测量值 (含攻击)
-  - innov_anchored (3):  窗口锚定运动学残差 = y_meas - rollout(y_meas[0], u_cmd)
+  - innov_anchored (3):  窗口锚定运动学新息 = y_meas - rollout(y_meas[0], u_cmd)
                          (统一替代 1-step innov + kin_res, 打破非加性攻击自洽性)
   - u_cmd (2):           控制指令
 输出:
@@ -253,8 +253,8 @@ class KinematicConsistencyBias(nn.Module):
             innov_phys = (innov_norm * feat_scale.view(1, 1, 3)
                           + feat_median.view(1, 1, 3))          # 完整反归一化到物理单位
 
-            # 下采样到 12 个输出时间步 (每块中心)
-            t_idx = [4, 12, 20, 28, 36, 44, 52, 60, 68, 76, 84, 92]
+            # 下采样到 12 个输出时间步 (步长8, 偏移4: 对应3层池化后各时间步中心)
+            t_idx = list(range(4, 100, 8))
             innov_at_t = innov_phys[:, t_idx, :]                 # (B, 12, 3)
 
             # L2 范数 → 偏置 (高创新 → 低一致性 → 负偏置)
@@ -354,7 +354,7 @@ class CFMDetector(nn.Module):
         self.window_size = window_size
         self.d_model = d_model
         self.num_classes = num_classes
-        self.backbone_type = 'simple_conv'  # 向后兼容: 仅 KAD 多尺度骨干
+        self.backbone_type = 'kad'  # MultiScaleDSConvBackbone (唯一骨干)
         self.use_decoder = use_decoder
 
         # ---- 归一化参数 (buffer: 持久保存但不参与梯度) ----
