@@ -13,9 +13,40 @@
 3. 编写代码时，在顶端统一配置可调参数
 4. 以科研思维而不是项目思维思考，调整模型架构时需要考虑创新性、简洁性等，而不是通过补丁维护运行
 5. 总是给出面向论文读者和编辑的优秀IEEE标准可视化
-6. 在代码顶部编写使用说明，而不是修改CLAUDE.md加入说明
+6. 在代码顶部编写使用说明
 7. 每次调整完架构和关键设计，都要更新系统设计说明文档。说明文档应当简明扼要。避免防御性说明
 8. 任何时候，描述同一事物的术语必须统一，不得随意更改。
+
+## 编码标准
+
+**1. Think Before Coding — 先想再写**
+
+- 实现前先陈述假设，不确定就明确说出来。
+- 存在多种解释时列出所有选项，不静默选择。
+- 有更简单的方法就指出，必要时反对过度设计。
+- 遇到不清晰的地方立刻停下来，指出困惑点。
+
+**2. Simplicity First — 简洁优先**
+
+- 只写解决问题所需的最少代码，不做投机性设计。
+- 不为单一用途的代码创建抽象层。
+- 不添加未被要求的"灵活性"或"可配置性"。
+- 不可能发生的场景不需要写错误处理。
+- 200 行能搞定的事写成 50 行——重写。
+
+**3. Surgical Changes — 外科手术式修改**
+
+- 只碰必须改的部分，不顺手"改进"无关代码、注释、格式。
+- 不重构没有坏的东西。
+- 匹配已有代码风格，即使不是你偏好的风格。
+- 如果发现无关的死代码，口头提及即可——不要擅自删除。
+- 修改产生的 orphan（无用 import/变量/函数）必须清理。
+
+**4. Goal-Driven Execution — 目标驱动执行**
+
+- 把任务转化为可验证的目标（例如"修 bug"→"先写复现测试，再修"）。
+- 多步骤任务先给出简洁计划再执行。
+- 循环直至验证通过，不以"应该没问题"收尾。
 
 ## 工作流程与命令
 
@@ -64,19 +95,20 @@ ReferenceTrajectory(参考轨迹) → NMPC → u_cmd → WMRKinematics(RK4运动
 
 ### 模块映射表
 
-| 文件 | 作用 |
-| ---------------------- | ------------------------------------------------------------ |
-| `model.py` | WMR 运动学 (RK4)，李萨如 (Lissajous)/圆形 (Circular) 轨迹生成器，传感器模拟器 |
-| `controller/controller.py` | CasADi Opti NMPC：误差动力学 RK4 预测，菱形约束，控制增量代价函数，IPOPT 求解器 |
-| `attack.py` | 7 种传感器攻击类型 (A1–A7) + 正常情况 (A0)；统一的 `inject()` 注入接口 |
-| `simulate.py` | 统一闭环仿真：CFM检测器 / 无检测器基线 / 五族轨迹对比 |
-| `generate_dataset.py` | 开环数据生成：5 种随机轨迹系列 × 8 种攻击 |
-| `backend.py` | CFMDetectorBackend 推理包装器：滑动窗口缓冲 + 内部运动学 + 分类 + 恢复策略路由 |
-| `detector/cfm_detector.py` | CFMDetector 模型定义：MultiScaleDSConvBackbone (膨胀深度可分离卷积) + 运动学一致性偏置注意力 + 物理引导解码器 |
-| `detector/preprocess_data.py` | 100 步滑动窗口，物理锚点归一化 (RobustNormalizer)，防数据泄漏的文件级拆分 |
-| `detector/train.py` | CFMDetector 训练脚本：L = L_cls + λ_recon*L_recon（联合训练，λ_recon=0.3，warmup=20 epoch，label smoothing 0.0），A0 每 epoch 随机降采样 |
-| `detector/evaluate.py` | 测试集分类评估：混淆矩阵 + 逐类精度/召回/F1 + 置信度 + 汇总图 + Markdown 报告 |
-| `detector/models/` | 训练好的模型权重 (cfm_cls_best.pt, cfm_cls_config.npz) |
+
+| 文件                          | 作用                                                                                                                                       |
+| ----------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------ |
+| `model.py`                    | WMR 运动学 (RK4)，李萨如 (Lissajous)/圆形 (Circular) 轨迹生成器，传感器模拟器                                                              |
+| `controller/controller.py`    | CasADi Opti NMPC：误差动力学 RK4 预测，菱形约束，控制增量代价函数，IPOPT 求解器                                                            |
+| `attack.py`                   | 7 种传感器攻击类型 (A1–A7) + 正常情况 (A0)；统一的`inject()` 注入接口                                                                     |
+| `simulate.py`                 | 统一闭环仿真：CFM检测器 / 无检测器基线 / 五族轨迹对比                                                                                      |
+| `generate_dataset.py`         | 开环数据生成：5 种随机轨迹系列 × 8 种攻击                                                                                                 |
+| `backend.py`                  | CFMDetectorBackend 推理包装器：滑动窗口缓冲 + 内部运动学 + 分类 + 恢复策略路由                                                             |
+| `detector/cfm_detector.py`    | CFMDetector 模型定义：MultiScaleDSConvBackbone (膨胀深度可分离卷积) + 运动学一致性偏置注意力 + 物理引导解码器                              |
+| `detector/preprocess_data.py` | 100 步滑动窗口，物理锚点归一化 (RobustNormalizer)，防数据泄漏的文件级拆分                                                                  |
+| `detector/train.py`           | CFMDetector 训练脚本：L = L_cls + λ_recon*L_recon（联合训练，λ_recon=0.3，warmup=20 epoch，label smoothing 0.0），A0 每 epoch 随机降采样 |
+| `detector/evaluate.py`        | 测试集分类评估：混淆矩阵 + 逐类精度/召回/F1 + 置信度 + 汇总图 + Markdown 报告                                                              |
+| `detector/models/`            | 训练好的模型权重 (cfm_cls_best.pt, cfm_cls_config.npz)                                                                                     |
 
 | `app/interactive_app.py` | tkinter 交互式 GUI：轨迹/攻击自由组合 + 时间滑块回放 + 6面板实时显示 |
 
@@ -84,16 +116,17 @@ ReferenceTrajectory(参考轨迹) → NMPC → u_cmd → WMRKinematics(RK4运动
 
 每种攻击具有严格的物理含义：
 
-| 标签 | 名称 | 类型 |
-| ---- | ---- | ---- |
-| A0 | Normal (正常) | — |
-| A1 | Constant Bias (恒定偏移) | 加性 |
-| A2 | Sinusoidal (正弦注入) | 加性 |
-| A3 | Drift (斜坡漂移) | 加性 |
-| A4 | Replay Attack (重放攻击) | 非加性 |
-| A5 | Intermittent Dropout (信号丢失) | 非加性 |
-| A6 | Scaling (缩放攻击) | 乘性 |
-| A7 | Sensor Freeze (传感器冻结) | 非加性 |
+
+| 标签 | 名称                            | 类型   |
+| ---- | ------------------------------- | ------ |
+| A0   | Normal (正常)                   | —     |
+| A1   | Constant Bias (恒定偏移)        | 加性   |
+| A2   | Sinusoidal (正弦注入)           | 加性   |
+| A3   | Drift (斜坡漂移)                | 加性   |
+| A4   | Replay Attack (重放攻击)        | 非加性 |
+| A5   | Intermittent Dropout (信号丢失) | 非加性 |
+| A6   | Scaling (缩放攻击)              | 乘性   |
+| A7   | Sensor Freeze (传感器冻结)      | 非加性 |
 
 ### 轨迹系列
 
