@@ -39,7 +39,7 @@ class WMRParams:
 
 
 # ============================================================================
-# 2. 参考轨迹生成器 — 8字形 Lissajous + 圆形
+# 2. 参考轨迹生成器 — 5族统一 (Lissajous / Circular / Spiral / RandomWaypoint / Square)
 # ============================================================================
 
 def _rk4_front_axle(x: float, y: float, theta: float, v: float, w: float, Ts: float,
@@ -69,169 +69,318 @@ def _rk4_front_axle(x: float, y: float, theta: float, v: float, w: float, Ts: fl
     return xn, yn, tn
 
 
-class LissajousTrajectory:
-    """8字形(Lissajous)参考轨迹生成器
+class RandomizedTrajectory:
+    """5族随机参数参考轨迹生成器（数据集生成 + 仿真统一入口）
 
-    轨迹参数:
-      v_const  : 恒定线速度 [m/s] (< v_max=0.3)
-      w_freq   : 角速度交变频率 [rad/s]
-      w_amp    : 角速度幅值 = 2.4048 * w_freq
+    每次初始化随机采样轨迹类型和参数，确保训练数据覆盖广泛的运动模式。
+    当指定 family 且 use_defaults=True 时使用默认参数（向后兼容）。
 
-    使用前端偏置运动学 (与 WMRKinematics 一致) 生成参考轨迹，
-    保证参考轨迹对机器人物理可行。
+    轨迹族:
+      'lissajous'       : 8字形 Lissajous (光滑曲线)
+      'circular'        : 定曲率圆形 (光滑曲线)
+      'spiral'          : 阿基米德螺旋线 — 半径线性外扩 (光滑曲线)
+      'random_waypoint' : 随机路径点 — ω_r 方波切换，产生折线/锯齿形轨迹
+      'square'          : 正方形(圆角) — 边长随机，直行+90°圆弧转弯
     """
 
-    def __init__(self, Ts: float = 0.05, pos_bound: float = 2.5):
+    # 默认参数（use_defaults=True 时使用，对应旧 LissajousTrajectory / CircularTrajectory 行为）
+    _DEFAULTS = {
+        'lissajous':       dict(v_const=0.15, w_freq=0.3),
+        'circular':        dict(v_const=0.15, w_const=0.2),
+        'spiral':          dict(_spiral_R0=0.10, _spiral_Rmax=1.5, _spiral_v=0.20, _spiral_dir=1),
+        'random_waypoint': dict(v_const=0.20),
+        'square':          dict(_sq_side=2.0, _sq_v_straight=0.25, _sq_v_turn=0.15, _sq_w_turn=1.0),
+    }
+
+    def __init__(self, Ts: float = 0.05, seed: int = None, pos_bound: float = 2.5,
+                 family: str = None, use_defaults: bool = False):
         self.Ts = Ts
         self.pos_bound = pos_bound
-        self.v_const = 0.15       # 降低速度以适应 ±2.5m 边界
-        self.w_freq = 0.3         # 提高频率使 8 字形更紧凑
-        self.w_amp = 2.4048 * self.w_freq  # ~0.7214 rad/s
+        self.use_defaults = use_defaults
+        self.rng = np.random.RandomState(seed)
 
-        # 预计算居中偏移 (使轨迹中心对齐原点)
-        self._cx, self._cy = self._compute_center_offset()
-        # 参考位姿初始值
-        self._x_r = self._cx
-        self._y_r = self._cy
-        self._theta_r = 0.0
+        if family is not None:
+            self.family = family
+        else:
+            self.family = self.rng.choice(
+                ['lissajous', 'circular', 'spiral', 'random_waypoint', 'square'])
+        self._init_params()
+        self._init_theta = 0.0 if use_defaults else self.rng.uniform(-0.1, 0.1)
+        self._verify_and_center_trajectory()
+        self.reset()
 
-    def _compute_center_offset(self) -> Tuple[float, float]:
-        """预模拟 50s 轨迹，计算使 bounding box 中心对齐原点的偏移量"""
-        x, y, theta = 0.0, 0.0, 0.0
-        x_min, x_max = 0.0, 0.0
-        y_min, y_max = 0.0, 0.0
-        for i in range(SIM_STEPS):
-            t_i = i * self.Ts
-            v_r = self.v_const
-            w_r = self.w_amp * np.cos(self.w_freq * t_i)
-            x, y, theta = _rk4_front_axle(x, y, theta, v_r, w_r, self.Ts)
-            x_min, x_max = min(x_min, x), max(x_max, x)
-            y_min, y_max = min(y_min, y), max(y_max, y)
-        cx = -(x_min + x_max) / 2.0
-        cy = -(y_min + y_max) / 2.0
-        return cx, cy
+    def _init_params(self):
+        """随机采样轨迹参数（宽范围 + 自动过滤确保覆盖）"""
+        if self.use_defaults:
+            self._init_default_params()
+            return
+        pb = self.pos_bound  # 2.5
+
+        if self.family == 'lissajous':
+            self.v_const = self.rng.uniform(0.10, 0.30)
+            self.w_freq = self.rng.uniform(0.04, 0.35)
+            self.w_amp = 2.4048 * self.w_freq
+            self._gen_func = self._step_lissajous
+
+        elif self.family == 'circular':
+            self.v_const = self.rng.uniform(0.08, 0.30)
+            R_target = self.rng.uniform(0.40, 2.40)
+            direction = self.rng.choice([-1, 1])
+            self.w_const = direction * (self.v_const / R_target)
+            self.w_const = float(np.clip(self.w_const, -1.70, 1.70))
+            if abs(self.w_const) < 0.03:
+                self.w_const = direction * 0.03
+            self._gen_func = self._step_circular
+
+        elif self.family == 'spiral':
+            self._spiral_R0 = self.rng.uniform(0.03, 0.25)
+            self._spiral_Rmax = self.rng.uniform(0.80, 2.30)
+            self._spiral_v = self.rng.uniform(0.15, 0.30)
+            self._spiral_dir = self.rng.choice([-1, 1])
+            self._spiral_alpha = (self._spiral_Rmax / self._spiral_R0 - 1.0) / SIM_TIME
+            self._gen_func = self._step_spiral
+
+        elif self.family == 'random_waypoint':
+            self.v_const = self.rng.uniform(0.12, 0.30)
+            self._waypoint_w_values = []
+            self._waypoint_intervals = []
+            t_now = 0.0
+            while t_now < SIM_TIME:
+                self._waypoint_w_values.append(self.rng.uniform(-0.50, 0.50))
+                dt = self.rng.uniform(1.5, 5.5)
+                self._waypoint_intervals.append(dt)
+                t_now += dt
+            self._waypoint_next_switch = 0.0
+            self._waypoint_idx = -1
+            self._gen_func = self._step_random_waypoint
+
+        elif self.family == 'square':
+            self._sq_side = self.rng.uniform(1.5, 3.0)
+            self._sq_v_straight = self.rng.uniform(0.20, 0.30)
+            self._sq_v_turn = self.rng.uniform(0.08, 0.24)
+            self._sq_w_turn = self.rng.uniform(0.70, 1.60)
+            self._sq_n_straight = max(1, int(np.round(
+                self._sq_side / (self._sq_v_straight * self.Ts))))
+            self._sq_n_turn = max(1, int(np.round(
+                (0.5 * np.pi) / (self._sq_w_turn * self.Ts))))
+            n_cycle = 4 * (self._sq_n_straight + self._sq_n_turn)
+            if n_cycle > SIM_STEPS:
+                s = float(SIM_STEPS) / n_cycle
+                self._sq_n_straight = max(10, int(self._sq_n_straight * s))
+                self._sq_n_turn = max(10, int(self._sq_n_turn * s))
+                while 4 * (self._sq_n_straight + self._sq_n_turn) > SIM_STEPS:
+                    self._sq_n_straight = max(10, self._sq_n_straight - 1)
+            self._sq_v_straight = self._sq_side / (self._sq_n_straight * self.Ts)
+            self._sq_w_turn = (0.5 * np.pi) / (self._sq_n_turn * self.Ts)
+            self._sq_phase = 0
+            self._sq_step_cnt = 0
+            self._sq_edge_count = 0
+            self._gen_func = self._step_square
+
+    def _init_default_params(self):
+        """使用族默认参数（指定 family 且 use_defaults=True 时）"""
+        d = self._DEFAULTS[self.family]
+        if self.family == 'lissajous':
+            self.v_const = d['v_const']
+            self.w_freq = d['w_freq']
+            self.w_amp = 2.4048 * self.w_freq
+        elif self.family == 'circular':
+            self.v_const = d['v_const']
+            self.w_const = d['w_const']
+        elif self.family == 'spiral':
+            for k, v in d.items():
+                setattr(self, k, v)
+            self._spiral_alpha = (self._spiral_Rmax / self._spiral_R0 - 1.0) / SIM_TIME
+        elif self.family == 'random_waypoint':
+            self.v_const = d['v_const']
+            self._waypoint_w_values = [0.3, -0.3, 0.2, -0.2]
+            self._waypoint_intervals = [3.0, 3.0, 3.0, 3.0]
+            self._waypoint_next_switch = 0.0
+            self._waypoint_idx = -1
+        elif self.family == 'square':
+            for k, v in d.items():
+                setattr(self, k, v)
+            self._sq_n_straight = max(1, int(np.round(
+                self._sq_side / (self._sq_v_straight * self.Ts))))
+            self._sq_n_turn = max(1, int(np.round(
+                (0.5 * np.pi) / (self._sq_w_turn * self.Ts))))
+        self._gen_func = getattr(self, f'_step_{self.family}')
+
+    def _verify_and_center_trajectory(self, max_attempts: int = 100):
+        """预模拟完整轨迹，计算居中偏移并验证边界。
+
+        use_defaults 模式下只做验证（失败则抛异常），不重采样。
+        """
+        for attempt in range(1 if self.use_defaults else max_attempts):
+            if self.family == 'circular':
+                R = self.v_const / abs(self.w_const)
+                if R > self.pos_bound or R < 0.4 * self.pos_bound:
+                    if self.use_defaults:
+                        raise ValueError(f'circular defaults exceed pos_bound={self.pos_bound}')
+                    self._init_params()
+                    self._init_theta = self.rng.uniform(-0.1, 0.1)
+                    continue
+                self._cx = self.v_const * np.sin(self._init_theta) / self.w_const
+                self._cy = -self.v_const * np.cos(self._init_theta) / self.w_const
+                return
+
+            x, y, theta = 0.0, 0.0, self._init_theta
+            x_min, x_max = 0.0, 0.0
+            y_min, y_max = 0.0, 0.0
+            for step_idx in range(SIM_STEPS):
+                u_r = self._gen_func(step_idx * self.Ts)
+                x, y, theta = _rk4_front_axle(x, y, theta, u_r[0], u_r[1], self.Ts)
+                x_min, x_max = min(x_min, x), max(x_max, x)
+                y_min, y_max = min(y_min, y), max(y_max, y)
+            self._cx = -(x_min + x_max) / 2.0
+            self._cy = -(y_min + y_max) / 2.0
+            hw = (x_max - x_min) / 2.0
+            hh = (y_max - y_min) / 2.0
+
+            if hw > self.pos_bound or hh > self.pos_bound:
+                if self.use_defaults:
+                    raise ValueError(f'{self.family} defaults exceed pos_bound={self.pos_bound}')
+                self._init_params()
+                self._init_theta = self.rng.uniform(-0.1, 0.1)
+                continue
+            if max(hw, hh) < 0.4 * self.pos_bound:
+                if self.use_defaults:
+                    raise ValueError(f'{self.family} defaults too small for pos_bound={self.pos_bound}')
+                self._init_params()
+                self._init_theta = self.rng.uniform(-0.1, 0.1)
+                continue
+            if self.family == 'spiral':
+                N_turns = (SIM_TIME * self._spiral_v
+                           * np.log(self._spiral_Rmax / self._spiral_R0)
+                           / (2.0 * np.pi * (self._spiral_Rmax - self._spiral_R0)))
+                if N_turns < 1.8:
+                    if self.use_defaults:
+                        raise ValueError(f'spiral defaults: N_turns={N_turns:.1f} < 1.8')
+                    self._init_params()
+                    self._init_theta = self.rng.uniform(-0.1, 0.1)
+                    continue
+            return
+
+        raise RuntimeError(
+            f'{self.family}: 无法在 {max_attempts} 次内生成不超界的轨迹参数')
 
     def reset(self):
-        """重置参考位姿到居中起始点"""
+        """重置位姿到居中起始点（轨迹 bounding box 中心对齐原点）"""
         self._x_r = self._cx
         self._y_r = self._cy
-        self._theta_r = 0.0
+        self._theta_r = self._init_theta
+        if self.family == 'random_waypoint':
+            self._waypoint_next_switch = 0.0
+            self._waypoint_idx = -1
+        elif self.family == 'square':
+            self._sq_phase = 0
+            self._sq_step_cnt = 0
+            self._sq_edge_count = 0
 
-    def step(self, t: float) -> Tuple[np.ndarray, np.ndarray]:
-        """单步推进参考轨迹
-        
-        Args:
-            t: 当前仿真时间 [s]
-            
-        Returns:
-            Upsilon_r: 参考位姿 [x_r, y_r, theta_r] (3,)
-            u_r:       参考控制指令 [v_r, w_r] (2,)
-        """
-        # 当前时刻参考指令 (配置文档 Eq.2.1)
+    # ---- 各轨迹族的 step 实现 ----
+
+    def _step_lissajous(self, t: float):
         v_r = self.v_const
         w_r = self.w_amp * np.cos(self.w_freq * t)
-        u_r = np.array([v_r, w_r])
+        return np.array([v_r, w_r])
 
-        # RK4 积分 (前端偏置运动学，与 WMRKinematics 一致)
-        self._x_r, self._y_r, self._theta_r = _rk4_front_axle(
-            self._x_r, self._y_r, self._theta_r, v_r, w_r, self.Ts)
+    def _step_circular(self, t: float):
+        return np.array([self.v_const, self.w_const])
 
-        Upsilon_r = np.array([self._x_r, self._y_r, self._theta_r])
-        return Upsilon_r, u_r
+    def _step_spiral(self, t: float):
+        """阿基米德螺旋线: R(t)=R0*(1+alpha*t), w(t)=v/R(t)"""
+        R = self._spiral_R0 * (1.0 + self._spiral_alpha * t)
+        v_r = self._spiral_v
+        w_r = self._spiral_dir * v_r / R
+        w_r = float(np.clip(w_r, -1.50, 1.50))
+        return np.array([v_r, w_r])
 
-    def generate_sequence(self, t_start: float, N: int) -> np.ndarray:
-        """生成未来 N 步的参考指令序列 (用于 MPC)
-        
-        Args:
-            t_start: 起始时间
-            N:       预测步长
-            
-        Returns:
-            Ur_seq: (2, N) 参考指令序列
-        """
-        Ur_seq = np.zeros((2, N))
-        for k in range(N):
-            t_k = t_start + k * self.Ts
-            Ur_seq[0, k] = self.v_const
-            Ur_seq[1, k] = self.w_amp * np.cos(self.w_freq * t_k)
-        return Ur_seq
+    def _step_random_waypoint(self, t: float):
+        """ω_r 方波切换，模拟路径点之间的折线运动"""
+        if t >= self._waypoint_next_switch:
+            self._waypoint_idx += 1
+            while self._waypoint_idx >= len(self._waypoint_w_values):
+                self._waypoint_w_values.append(
+                    self.rng.uniform(-0.50, 0.50))
+                self._waypoint_intervals.append(
+                    self.rng.uniform(1.0, 3.5))
+            self._waypoint_next_switch = t + self._waypoint_intervals[self._waypoint_idx]
+        w_r = self._waypoint_w_values[self._waypoint_idx]
+        return np.array([self.v_const, w_r])
 
+    def _step_square(self, t: float):
+        """正方形(圆角)轨迹: 步数计数器精确控制"""
+        if self._sq_phase == 0:
+            v_r = self._sq_v_straight
+            w_r = 0.0
+        else:
+            v_r = self._sq_v_turn
+            w_r = -self._sq_w_turn
+        self._sq_step_cnt += 1
+        if self._sq_phase == 0:
+            if self._sq_step_cnt >= self._sq_n_straight:
+                self._sq_phase = 1
+                self._sq_step_cnt = 0
+        else:
+            if self._sq_step_cnt >= self._sq_n_turn:
+                self._sq_phase = 0
+                self._sq_step_cnt = 0
+                self._sq_edge_count += 1
+                if self._sq_edge_count >= 4:
+                    self._sq_edge_count = 0
+        return np.array([v_r, w_r])
 
-class CircularTrajectory:
-    """圆形参考轨迹生成器 (Zhang et al. 2026, Section IV 实验设置)
+    # ---- 统一接口 ----
 
-    轨迹参数:
-      v_r : 恒定线速度 [m/s]
-      w_r : 恒定角速度 [rad/s]
-      R   : 圆半径 = |v_r/w_r|
-
-    使用前端偏置运动学 (与 WMRKinematics 一致) 生成参考轨迹，
-    保证参考轨迹对机器人物理可行。
-    """
-
-    def __init__(self, Ts: float = 0.05, pos_bound: float = 2.5):
-        self.Ts = Ts
-        self.pos_bound = pos_bound
-        self.v_const = 0.15      # R=v/w=0.75m，距原点最大 1.5m < 2.5m
-        self.w_const = 0.2
-
-        # 预计算居中偏移
-        self._cx, self._cy = self._compute_center_offset()
-        self._x_r = self._cx
-        self._y_r = self._cy
-        self._theta_r = 0.0
-
-    def _compute_center_offset(self) -> Tuple[float, float]:
-        """预模拟 50s 圆形轨迹，计算居中偏移"""
-        x, y, theta = 0.0, 0.0, 0.0
-        x_min, x_max = 0.0, 0.0
-        y_min, y_max = 0.0, 0.0
-        v_r, w_r = self.v_const, self.w_const
-        for i in range(SIM_STEPS):
-            x, y, theta = _rk4_front_axle(x, y, theta, v_r, w_r, self.Ts)
-            x_min, x_max = min(x_min, x), max(x_max, x)
-            y_min, y_max = min(y_min, y), max(y_max, y)
-        cx = -(x_min + x_max) / 2.0
-        cy = -(y_min + y_max) / 2.0
-        return cx, cy
-
-    def reset(self):
-        """重置参考位姿到居中起始点"""
-        self._x_r = self._cx
-        self._y_r = self._cy
-        self._theta_r = 0.0
-
-    def step(self, t: float) -> Tuple[np.ndarray, np.ndarray]:
-        """单步推进圆形参考轨迹
+    def step(self, t: float):
+        """单步推进参考轨迹
 
         Returns:
             Upsilon_r: 参考位姿 [x_r, y_r, theta_r] (3,)
-            u_r:       参考控制指令 [v_r, w_r] (2,)
+            u_r:       参考指令 [v_r, w_r] (2,)
         """
-        v_r = self.v_const
-        w_r = self.w_const
-        u_r = np.array([v_r, w_r])
-
-        # RK4 积分 (前端偏置运动学，与 WMRKinematics 一致)
+        u_r = self._gen_func(t)
         self._x_r, self._y_r, self._theta_r = _rk4_front_axle(
-            self._x_r, self._y_r, self._theta_r, v_r, w_r, self.Ts)
-
-        Upsilon_r = np.array([self._x_r, self._y_r, self._theta_r])
-        return Upsilon_r, u_r
+            self._x_r, self._y_r, self._theta_r,
+            u_r[0], u_r[1], self.Ts)
+        return np.array([self._x_r, self._y_r, self._theta_r]), u_r
 
     def generate_sequence(self, t_start: float, N: int) -> np.ndarray:
-        """生成未来 N 步的参考指令序列 (用于 MPC)
-
-        Returns:
-            Ur_seq: (2, N) 参考指令序列
-        """
+        """生成未来 N 步参考指令序列 (用于 MPC)"""
         Ur_seq = np.zeros((2, N))
-        Ur_seq[0, :] = self.v_const
-        Ur_seq[1, :] = self.w_const
+        saved = {}
+        if self.family == 'random_waypoint':
+            saved = {'idx': self._waypoint_idx, 'next': self._waypoint_next_switch}
+        elif self.family == 'square':
+            saved = {'phase': self._sq_phase, 'cnt': self._sq_step_cnt,
+                     'edge': self._sq_edge_count}
+        for k in range(N):
+            Ur_seq[:, k] = self._gen_func(t_start + k * self.Ts)
+        if self.family == 'random_waypoint':
+            self._waypoint_idx = saved['idx']
+            self._waypoint_next_switch = saved['next']
+        elif self.family == 'square':
+            self._sq_phase = saved['phase']
+            self._sq_step_cnt = saved['cnt']
+            self._sq_edge_count = saved['edge']
         return Ur_seq
 
-
-# (ReferenceTrajectory 别名已移除 — 直接使用 LissajousTrajectory)
+    def get_info(self) -> dict:
+        """返回轨迹元信息"""
+        info = {'trajectory_family': self.family}
+        if self.family == 'lissajous':
+            info.update(v_r=self.v_const, w_freq=self.w_freq, w_amp=self.w_amp)
+        elif self.family == 'circular':
+            info.update(v_r=self.v_const, w_r=self.w_const)
+        elif self.family == 'spiral':
+            info.update(v=self._spiral_v, R0=self._spiral_R0, Rmax=self._spiral_Rmax,
+                       direction=self._spiral_dir)
+        elif self.family == 'random_waypoint':
+            info.update(v_r=self.v_const)
+        elif self.family == 'square':
+            info.update(side=self._sq_side, v_straight=self._sq_v_straight,
+                       v_turn=self._sq_v_turn, w_turn=self._sq_w_turn)
+        return info
 
 # ============================================================================
 # 3. WMR 前端位姿运动学

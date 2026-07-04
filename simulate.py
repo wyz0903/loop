@@ -27,7 +27,7 @@ plt.rcParams['font.size'] = 10
 plt.rcParams['axes.unicode_minus'] = False
 
 from model import (WMRParams, WMRKinematics, SensorSimulator,
-                   LissajousTrajectory, CircularTrajectory, SIM_STEPS)
+                   RandomizedTrajectory, SIM_STEPS)
 from controller import NMPCController, NMPCParams
 from attack import SensorAttack, ALL_ATTACK_TYPES, ATTACK_NAMES
 from backend import DetectorBackend
@@ -65,13 +65,10 @@ def _get_onset_idx(data: dict) -> int:
 
 
 def _create_trajectory(traj_type: str, Ts: float, seed: int):
-    from generate_dataset import RandomizedTrajectory
-    if traj_type == 'lissajous':
-        return LissajousTrajectory(Ts=Ts)
-    elif traj_type == 'circular':
-        return CircularTrajectory(Ts=Ts)
-    else:
-        return RandomizedTrajectory(Ts=Ts, family=traj_type, seed=seed)
+    # lissajous/circular 使用默认参数（向后兼容旧 LissajousTrajectory / CircularTrajectory）
+    use_defaults = traj_type in ('lissajous', 'circular')
+    return RandomizedTrajectory(Ts=Ts, family=traj_type, seed=seed,
+                                use_defaults=use_defaults)
 
 
 # ============================================================================
@@ -538,16 +535,14 @@ def run_single_track(traj, robot, sensor, ctrl, nmpc_params, Ts, n_steps):
 
 def plot_all_trajectories():
     """五族轨迹无攻击跟踪对比图"""
-    from generate_dataset import RandomizedTrajectory
-
     wmr_params = WMRParams()
     Ts = wmr_params.Ts
     n_steps = SIM_STEPS
     nmpc_params = NMPCParams()
 
     TRAJ_CONFIGS = [
-        ('Lissajous',       '#2196F3', lambda: LissajousTrajectory(Ts=Ts)),
-        ('Circular',        '#4CAF50', lambda: CircularTrajectory(Ts=Ts)),
+        ('Lissajous',       '#2196F3', lambda: RandomizedTrajectory(Ts=Ts, family='lissajous', use_defaults=True)),
+        ('Circular',        '#4CAF50', lambda: RandomizedTrajectory(Ts=Ts, family='circular', use_defaults=True)),
         ('Spiral',          '#FF9800', lambda: RandomizedTrajectory(Ts=Ts, family='spiral', seed=0)),
         ('Random Waypoint', '#E91E63', lambda: RandomizedTrajectory(Ts=Ts, family='random_waypoint', seed=500)),
         ('Square',          '#9C27B0', lambda: RandomizedTrajectory(Ts=Ts, family='square', seed=1500)),

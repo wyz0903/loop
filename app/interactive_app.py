@@ -217,7 +217,7 @@ class SimulationWorker(threading.Thread):
 
     def _run_simulation(self):
         # ---- 延迟导入重型模块 ----
-        from generate_dataset import RandomizedTrajectory
+        from model import RandomizedTrajectory
 
         Ts = DEFAULT_TS
         n_steps = int(self._sim_time / Ts)

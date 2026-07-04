@@ -4,7 +4,7 @@ generate_dataset.py — 多样化轨迹攻击数据集生成器
 生成 WMR 在多种路径和攻击下的运行数据，供神经网络训练使用。
 
 关键设计：
-  1. 随机化参考轨迹参数 — 确保模型泛化性（不再是固定 8 字形）
+  1. 随机化参考轨迹参数 — 确保模型泛化性
   2. 记录详尽信号 — 内部运动学新息、控制指令、测量值、攻击真值等
   3. 静态分布 — 不引入检测器反馈，仅记录开环观测数据
   4. 输出格式 — 每轮仿真一个 .npz 文件 + 全局 metadata.csv 索引
@@ -26,15 +26,15 @@ generate_dataset.py — 多样化轨迹攻击数据集生成器
 """
 
 import os
+import time
 import argparse
 import numpy as np
 import pandas as pd
 from collections import defaultdict
-from typing import Tuple
 
 from model import (WMRParams, WMRKinematics, SensorSimulator,
-                   SIM_STEPS,
-                   _rk4_front_axle)
+                   RandomizedTrajectory,
+                   SIM_TIME, SIM_STEPS)
 from controller import NMPCController, NMPCParams
 from attack import SensorAttack, AttackConfig, ALL_ATTACK_TYPES, ATTACK_NAMES
 
@@ -42,343 +42,12 @@ from attack import SensorAttack, AttackConfig, ALL_ATTACK_TYPES, ATTACK_NAMES
 # 全局配置
 # ============================================================================
 
-SIM_TIME = 50.0
 DEFAULT_ATTACK_ONSET = 15.0      # 默认攻击开始时间
 RESULT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'dataset')
 os.makedirs(RESULT_DIR, exist_ok=True)
 
 # ============================================================================
-# 1. 多样化参考轨迹生成器
-# ============================================================================
-
-class RandomizedTrajectory:
-    """随机参数参考轨迹生成器
-
-    每次初始化随机采样轨迹类型和参数，确保训练数据覆盖广泛的运动模式。
-
-    轨迹族:
-      'lissajous'       : 8字形 Lissajous (光滑曲线)
-      'circular'        : 定曲率圆形 (光滑曲线)
-      'spiral'          : 阿基米德螺旋线 — 半径线性外扩 (光滑曲线)
-      'random_waypoint' : 随机路径点 — ω_r 方波切换，产生折线/锯齿形轨迹
-      'square'          : 正方形(圆角) — 边长随机，直行+90°圆弧转弯
-    """
-
-    def __init__(self, Ts: float = 0.05, seed: int = None, pos_bound: float = 2.5,
-                 family: str = None):
-        self.Ts = Ts
-        self.pos_bound = pos_bound
-        self.rng = np.random.RandomState(seed)
-
-        # 指定族或随机选择
-        if family is not None:
-            self.family = family
-        else:
-            self.family = self.rng.choice(
-                ['lissajous', 'circular', 'spiral', 'random_waypoint', 'square'])
-        self._init_params()
-        # 固定初始朝向 (验证与实际运行共用，确保一致性)
-        self._init_theta = self.rng.uniform(-0.1, 0.1)
-        # 预验证 + 居中: 确保完整轨迹自然不超界且中心对齐原点
-        self._verify_and_center_trajectory()
-        self.reset()
-
-    def _init_params(self):
-        """随机采样轨迹参数 (宽范围 + 自动过滤确保 40-95% 覆盖 ±2.5m)"""
-        pb = self.pos_bound  # 2.5
-
-        if self.family == 'lissajous':
-            # 8字形: 包络半径 ≈ v / w_freq
-            # 宽范围采样 → 由 _verify_and_center_trajectory 过滤 v/w_freq∈[1.0,2.5]
-            self.v_const = self.rng.uniform(0.10, 0.30)
-            self.w_freq = self.rng.uniform(0.04, 0.35)
-            self.w_amp = 2.4048 * self.w_freq
-            self._gen_func = self._step_lissajous
-
-        elif self.family == 'circular':
-            # 圆形: 解析居中保证圆心在原点, R_target 直接控制覆盖
-            # 宽范围 → 由解析居中和最小覆盖检查过滤
-            self.v_const = self.rng.uniform(0.08, 0.30)
-            R_target = self.rng.uniform(0.40, 2.40)          # 圆半径 [m]
-            direction = self.rng.choice([-1, 1])
-            self.w_const = direction * (self.v_const / R_target)
-            # 限幅角速度在合理范围 (w_max=1.76)
-            self.w_const = float(np.clip(self.w_const, -1.70, 1.70))
-            if abs(self.w_const) < 0.03:
-                self.w_const = direction * 0.03
-            self._gen_func = self._step_circular
-
-        elif self.family == 'spiral':
-            # 阿基米德螺旋线: R(t) = R0 * (1 + alpha*t), 半径线性外扩
-            # 宽范围 → 圈数检查 N≥1.8 自动过滤
-            self._spiral_R0 = self.rng.uniform(0.03, 0.25)     # 初始半径 [m]
-            self._spiral_Rmax = self.rng.uniform(0.80, 2.30)   # 终点半径 [m]
-            self._spiral_v = self.rng.uniform(0.15, 0.30)      # 线速度 [m/s]
-            self._spiral_dir = self.rng.choice([-1, 1])         # 旋转方向
-            # 增长率: R(T_sim) = Rmax => alpha = (Rmax/R0 - 1)/T_sim
-            self._spiral_alpha = (self._spiral_Rmax / self._spiral_R0 - 1.0) / SIM_TIME
-            self._gen_func = self._step_spiral
-
-        elif self.family == 'random_waypoint':
-            # 随机航点: 宽速度范围 + 长直行段 → 最小覆盖检查过滤
-            # 预生成全部 SIM_TIME 内的切换序列 (保证预验证与实际一致)
-            self.v_const = self.rng.uniform(0.12, 0.30)
-            self._waypoint_w_values = []
-            self._waypoint_intervals = []
-            t_now = 0.0
-            while t_now < SIM_TIME:
-                self._waypoint_w_values.append(self.rng.uniform(-0.50, 0.50))
-                dt = self.rng.uniform(1.5, 5.5)
-                self._waypoint_intervals.append(dt)
-                t_now += dt
-            self._waypoint_next_switch = 0.0
-            self._waypoint_idx = -1
-            self._gen_func = self._step_random_waypoint
-
-        elif self.family == 'square':
-            # 正方形(圆角): 宽范围 → 约束完整周期 ≤ SIM_STEPS 步
-            self._sq_side = self.rng.uniform(1.5, 3.0)
-            self._sq_v_straight = self.rng.uniform(0.20, 0.30)
-            self._sq_v_turn = self.rng.uniform(0.08, 0.24)
-            self._sq_w_turn = self.rng.uniform(0.70, 1.60)
-            # 步数取整
-            self._sq_n_straight = max(1, int(np.round(
-                self._sq_side / (self._sq_v_straight * self.Ts))))
-            self._sq_n_turn = max(1, int(np.round(
-                (0.5 * np.pi) / (self._sq_w_turn * self.Ts))))
-            # 约束: 完整周期 ≤ SIM_STEPS 步 (保证居中)
-            n_cycle = 4 * (self._sq_n_straight + self._sq_n_turn)
-            if n_cycle > SIM_STEPS:
-                s = float(SIM_STEPS) / n_cycle
-                self._sq_n_straight = max(10, int(self._sq_n_straight * s))
-                self._sq_n_turn = max(10, int(self._sq_n_turn * s))
-                # 缩放取整后可能还有 1-2 步超出，微调
-                while 4 * (self._sq_n_straight + self._sq_n_turn) > SIM_STEPS:
-                    self._sq_n_straight = max(10, self._sq_n_straight - 1)
-            # 反算 v/ω 保证精确边长和精确 90° (RK4 下无漂移)
-            self._sq_v_straight = self._sq_side / (self._sq_n_straight * self.Ts)
-            self._sq_w_turn = (0.5 * np.pi) / (self._sq_n_turn * self.Ts)
-            self._sq_phase = 0
-            self._sq_step_cnt = 0
-            self._sq_edge_count = 0
-            self._gen_func = self._step_square
-
-    def _verify_and_center_trajectory(self, max_attempts: int = 100):
-        """预模拟完整轨迹，计算居中偏移并验证边界。
-
-        1. circular 族: 解析几何计算圆心 (无需完整一圈即可正确居中)
-        2. 其他族: 从 (0,0) 出发模拟，记录 x/y 的 min/max
-        3. 边界检查: 居中后半宽 ≤ pos_bound
-        4. 最小覆盖检查: 居中后半宽 ≥ 0.4*pos_bound (1.0m)
-        5. 螺旋圈数检查: N ≥ 1.8
-        6. 不通过则重新采样参数
-        """
-        n_steps = SIM_STEPS  # 1000
-
-        for attempt in range(max_attempts):
-            # ---- circular 族: 解析居中 ----
-            if self.family == 'circular':
-                R = self.v_const / abs(self.w_const)
-                if R > self.pos_bound:
-                    self._init_params()
-                    self._init_theta = self.rng.uniform(-0.1, 0.1)
-                    continue
-                # 最小覆盖检查
-                if R < 0.4 * self.pos_bound:
-                    self._init_params()
-                    self._init_theta = self.rng.uniform(-0.1, 0.1)
-                    continue
-                # 解析圆心: 使圆心在原点
-                self._cx = self.v_const * np.sin(self._init_theta) / self.w_const
-                self._cy = -self.v_const * np.cos(self._init_theta) / self.w_const
-                return  # 通过
-
-            # ---- 其他族: 预模拟居中 ----
-            x, y, theta = 0.0, 0.0, self._init_theta
-            x_min, x_max = 0.0, 0.0
-            y_min, y_max = 0.0, 0.0
-            for step_idx in range(n_steps):
-                u_r = self._gen_func(step_idx * self.Ts)
-                x, y, theta = _rk4_front_axle(x, y, theta, u_r[0], u_r[1], self.Ts)
-                x_min, x_max = min(x_min, x), max(x_max, x)
-                y_min, y_max = min(y_min, y), max(y_max, y)
-            # 居中偏移量 (使轨迹 bounding box 中心对齐原点)
-            self._cx = -(x_min + x_max) / 2.0
-            self._cy = -(y_min + y_max) / 2.0
-            # 居中后的半宽
-            hw = (x_max - x_min) / 2.0
-            hh = (y_max - y_min) / 2.0
-
-            # ---- 边界检查 ----
-            if hw > self.pos_bound or hh > self.pos_bound:
-                self._init_params()
-                self._init_theta = self.rng.uniform(-0.1, 0.1)
-                continue
-
-            # ---- 最小覆盖检查 (≥ 40% pos_bound = 1.0m) ----
-            if max(hw, hh) < 0.4 * self.pos_bound:
-                self._init_params()
-                self._init_theta = self.rng.uniform(-0.1, 0.1)
-                continue
-
-            # ---- 螺旋圈数检查 ----
-            if self.family == 'spiral':
-                N_turns = (SIM_TIME * self._spiral_v
-                           * np.log(self._spiral_Rmax / self._spiral_R0)
-                           / (2.0 * np.pi * (self._spiral_Rmax - self._spiral_R0)))
-                if N_turns < 1.8:
-                    self._init_params()
-                    self._init_theta = self.rng.uniform(-0.1, 0.1)
-                    continue
-
-            return  # 通过
-
-        raise RuntimeError(
-            f'{self.family}: 无法在 {max_attempts} 次内生成不超界的轨迹参数，'
-            f'请检查参数范围设置')
-
-    def reset(self):
-        """重置位姿到居中起始点 (轨迹 bounding box 中心对齐原点)"""
-        self._x_r = self._cx
-        self._y_r = self._cy
-        self._theta_r = self._init_theta  # 使用与预验证相同的初始朝向
-        # 重置状态机变量
-        if self.family == 'random_waypoint':
-            self._waypoint_next_switch = 0.0
-            self._waypoint_idx = -1
-        elif self.family == 'square':
-            self._sq_phase = 0
-            self._sq_step_cnt = 0
-            self._sq_edge_count = 0
-
-    # ---- 各轨迹族的 step 实现 ----
-
-    def _step_lissajous(self, t: float) -> Tuple[np.ndarray, np.ndarray]:
-        v_r = self.v_const
-        w_r = self.w_amp * np.cos(self.w_freq * t)
-        return np.array([v_r, w_r])
-
-    def _step_circular(self, t: float) -> Tuple[np.ndarray, np.ndarray]:
-        return np.array([self.v_const, self.w_const])
-
-    def _step_spiral(self, t: float) -> Tuple[np.ndarray, np.ndarray]:
-        """阿基米德螺旋线: R(t)=R0*(1+alpha*t), w(t)=v/R(t), 半径线性外扩"""
-        R = self._spiral_R0 * (1.0 + self._spiral_alpha * t)
-        v_r = self._spiral_v
-        w_r = self._spiral_dir * v_r / R
-        # 限幅角速度以保证可跟踪性
-        w_r = float(np.clip(w_r, -1.50, 1.50))
-        return np.array([v_r, w_r])
-
-    def _step_random_waypoint(self, t: float) -> Tuple[np.ndarray, np.ndarray]:
-        """ω_r 方波切换，模拟路径点之间的折线运动"""
-        if t >= self._waypoint_next_switch:
-            self._waypoint_idx += 1
-            # 按需扩展预生成序列
-            while self._waypoint_idx >= len(self._waypoint_w_values):
-                self._waypoint_w_values.append(
-                    self.rng.uniform(-0.50, 0.50))
-                self._waypoint_intervals.append(
-                    self.rng.uniform(1.0, 3.5))
-            self._waypoint_next_switch = t + self._waypoint_intervals[self._waypoint_idx]
-        w_r = self._waypoint_w_values[self._waypoint_idx]
-        return np.array([self.v_const, w_r])
-
-    def _step_square(self, t: float) -> Tuple[np.ndarray, np.ndarray]:
-        """正方形(圆角)轨迹: 步数计数器精确控制 (无 fence-post 误差)
-
-        直行: _sq_n_straight 步, w=0
-        转弯: _sq_n_turn 步, w=-w_turn (精确 90°)
-        """
-        # 1. 基于当前 phase 选择控制
-        if self._sq_phase == 0:
-            v_r = self._sq_v_straight
-            w_r = 0.0
-        else:
-            v_r = self._sq_v_turn
-            w_r = -self._sq_w_turn
-
-        # 2. 步数计数 → phase 切换
-        self._sq_step_cnt += 1
-        if self._sq_phase == 0:
-            if self._sq_step_cnt >= self._sq_n_straight:
-                self._sq_phase = 1
-                self._sq_step_cnt = 0
-        else:
-            if self._sq_step_cnt >= self._sq_n_turn:
-                self._sq_phase = 0
-                self._sq_step_cnt = 0
-                self._sq_edge_count += 1
-                if self._sq_edge_count >= 4:
-                    self._sq_edge_count = 0  # 循环
-
-        return np.array([v_r, w_r])
-
-    # ---- 统一接口 ----
-
-    def step(self, t: float) -> Tuple[np.ndarray, np.ndarray]:
-        """单步推进
-
-        Returns:
-            Upsilon_r: 参考位姿 (3,)
-            u_r:       参考指令 [v_r, w_r] (2,)
-        """
-        u_r = self._gen_func(t)
-
-        # RK4 积分 (前端偏置运动学，与 WMRKinematics 一致)
-        self._x_r, self._y_r, self._theta_r = _rk4_front_axle(
-            self._x_r, self._y_r, self._theta_r,
-            u_r[0], u_r[1], self.Ts)
-
-        return np.array([self._x_r, self._y_r, self._theta_r]), u_r
-
-    def generate_sequence(self, t_start: float, N: int) -> np.ndarray:
-        """生成未来 N 步参考指令序列 (MPC 用)
-
-        注意: 对于有状态机的轨迹族 (random_waypoint, square),
-        保存并恢复状态以避免影响主仿真循环。
-        """
-        Ur_seq = np.zeros((2, N))
-        # 保存状态机变量 (如有)
-        saved = {}
-        if self.family == 'random_waypoint':
-            saved = {'idx': self._waypoint_idx, 'next': self._waypoint_next_switch}
-        elif self.family == 'square':
-            saved = {'phase': self._sq_phase, 'cnt': self._sq_step_cnt,
-                     'edge': self._sq_edge_count}
-        # 生成序列
-        for k in range(N):
-            Ur_seq[:, k] = self._gen_func(t_start + k * self.Ts)
-        # 恢复状态
-        if self.family == 'random_waypoint':
-            self._waypoint_idx = saved['idx']
-            self._waypoint_next_switch = saved['next']
-        elif self.family == 'square':
-            self._sq_phase = saved['phase']
-            self._sq_step_cnt = saved['cnt']
-            self._sq_edge_count = saved['edge']
-        return Ur_seq
-
-    def get_info(self) -> dict:
-        """返回轨迹元信息"""
-        info = {'trajectory_family': self.family}
-        if self.family == 'lissajous':
-            info.update(v_r=self.v_const, w_freq=self.w_freq, w_amp=self.w_amp)
-        elif self.family == 'circular':
-            info.update(v_r=self.v_const, w_r=self.w_const)
-        elif self.family == 'spiral':
-            info.update(v=self._spiral_v, R0=self._spiral_R0, Rmax=self._spiral_Rmax,
-                       direction=self._spiral_dir)
-        elif self.family == 'random_waypoint':
-            info.update(v_r=self.v_const)
-        elif self.family == 'square':
-            info.update(side=self._sq_side, v_straight=self._sq_v_straight,
-                       v_turn=self._sq_v_turn, w_turn=self._sq_w_turn)
-        return info
-
-
-# ============================================================================
-# 2. 单轮仿真运行器
+# 1. 单轮仿真运行器
 # ============================================================================
 
 def run_single_simulation(traj: RandomizedTrajectory,
@@ -495,7 +164,7 @@ def run_single_simulation(traj: RandomizedTrajectory,
 
 
 # ============================================================================
-# 3. 数据集生成主循环
+# 2. 数据集生成主循环
 # ============================================================================
 
 # 轨迹族固定顺序 (确定性遍历)
@@ -656,7 +325,7 @@ def generate_dataset(num_configs: int = None,
 
 
 # ============================================================================
-# 4. 数据验证工具
+# 3. 数据验证工具
 # ============================================================================
 
 def validate_dataset(df: pd.DataFrame):
