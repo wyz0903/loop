@@ -81,40 +81,51 @@ plt.rcParams['axes.unicode_minus'] = False
 # 辅助函数
 # ============================================================================
 
+def _latest_dataset_dir() -> str:
+    """取 dataset/ 下最新的时间戳子目录（按创建时间排序）"""
+    base = os.path.join(PROJECT_ROOT, 'dataset')
+    if not os.path.exists(base):
+        return base
+    subs = [d for d in os.listdir(base) if os.path.isdir(os.path.join(base, d))]
+    if not subs:
+        return base
+    subs.sort(key=lambda d: os.path.getctime(os.path.join(base, d)), reverse=True)
+    return os.path.join(base, subs[0])
+
+
 def load_dataset_configs(metadata_path: str) -> list[dict]:
-    """从 metadata.csv 加载全部轨迹配置"""
+    """从 metadata.csv 加载每条仿真记录（含攻击参数）"""
     df = pd.read_csv(metadata_path)
-    configs = []
-    for config_id in sorted(df['config_id'].unique()):
-        row = df[df['config_id'] == config_id].iloc[0]
-        cfg = {
-            'config_id': int(config_id),
+    runs = []
+    for _, row in df.iterrows():
+        run = {
+            'config_id': int(row['config_id']),
             'family': str(row['trajectory_family']),
             'traj_seed': int(row['traj_seed']),
+            'attack_type': str(row['attack_type']),
+            'attack_onset': float(row['attack_onset']),
+            'attack_duration': float(row.get('attack_duration', 0.0)),
         }
-        # 解析各族的参数
-        family = cfg['family']
+        family = run['family']
         if family == 'lissajous':
-            cfg['v_r'] = float(row.get('traj_v_r', 0.15))
-            cfg['w_freq'] = float(row.get('traj_w_freq', 0.14))
-            cfg['w_amp'] = float(row.get('traj_w_amp', 2.4048 * cfg['w_freq']))
+            run['v_r'] = float(row.get('traj_v_r', 0.15))
+            run['w_freq'] = float(row.get('traj_w_freq', 0.14))
         elif family == 'circular':
-            cfg['v_r'] = float(row.get('traj_v_r', 0.15))
-            cfg['w_r'] = float(row.get('traj_w_r', 0.3))
+            run['v_r'] = float(row.get('traj_v_r', 0.15))
+            run['w_r'] = float(row.get('traj_w_r', 0.3))
         elif family == 'spiral':
-            cfg['v'] = float(row.get('traj_v', 0.20))
-            cfg['R0'] = float(row.get('traj_R0', 0.10))
-            cfg['Rmax'] = float(row.get('traj_Rmax', 1.50))
-            cfg['direction'] = int(row.get('traj_direction', 1))
+            run['v'] = float(row.get('traj_v', 0.20))
+            run['R0'] = float(row.get('traj_R0', 0.10))
+            run['Rmax'] = float(row.get('traj_Rmax', 1.50))
+            run['direction'] = int(row.get('traj_direction', 1))
         elif family == 'random_waypoint':
-            cfg['v_r'] = float(row.get('traj_v_r', 0.20))
+            run['v_r'] = float(row.get('traj_v_r', 0.20))
         elif family == 'square':
-            cfg['side'] = float(row.get('traj_side', 2.0))
-            cfg['v_straight'] = float(row.get('traj_v_straight', 0.25))
-            cfg['v_turn'] = float(row.get('traj_v_turn', 0.15))
-            cfg['w_turn'] = float(row.get('traj_w_turn', 1.0))
-        configs.append(cfg)
-    return configs
+            run['side'] = float(row.get('traj_side', 2.0))
+            run['v'] = float(row.get('traj_v', 0.25))
+            run['R'] = float(row.get('traj_R', 0.35))
+        runs.append(run)
+    return runs
 
 
 # ============================================================================
@@ -197,7 +208,7 @@ class SimulationWorker(threading.Thread):
                  traj_family: str, traj_seed: int,
                  attack_type: str, attack_onset: float,
                  attack_duration: float, sim_time: float,
-                 detector_mode: str = 'cfm'):
+                 detector_mode: str = 'nn'):
         super().__init__(daemon=True)
         self._q = result_queue
         self._traj_family = traj_family
@@ -206,7 +217,7 @@ class SimulationWorker(threading.Thread):
         self._attack_onset = attack_onset
         self._attack_duration = attack_duration
         self._sim_time = sim_time
-        self._detector_mode = detector_mode  # 'cfm' | 'perfect' | 'none'
+        self._detector_mode = detector_mode  # 'nn' | 'perfect' | 'none'
 
     def run(self):
         try:
@@ -255,15 +266,19 @@ class SimulationWorker(threading.Thread):
         # ---- 检测器 ----
         detector_mode = self._detector_mode
         model_dir = os.path.join(PROJECT_ROOT, 'detector', 'models')
-        norm_dir = os.path.join(PROJECT_ROOT, 'dataset_win', 'normalizer.npz')
-        cfm_model = os.path.join(model_dir, 'cfm_cls_best.pt')
+        # 取 dataset_win 下最新的时间戳子目录
+        win_base = os.path.join(PROJECT_ROOT, 'dataset_win')
+        win_dirs = [d for d in os.listdir(win_base) if os.path.isdir(os.path.join(win_base, d))] if os.path.exists(win_base) else []
+        win_dirs.sort(key=lambda d: os.path.getctime(os.path.join(win_base, d)), reverse=True)
+        norm_dir = os.path.join(win_base, win_dirs[0], 'normalizer.npz') if win_dirs else os.path.join(win_base, 'normalizer.npz')
+        nn_model = os.path.join(model_dir, 'nn_cls_best.pt')
 
         detector = None
-        if detector_mode == 'cfm':
-            if not os.path.exists(cfm_model):
-                self._q.put(('warning', f'CFM模型未找到: {cfm_model}\n回退为无检测器'))
+        if detector_mode == 'nn':
+            if not os.path.exists(nn_model):
+                self._q.put(('warning', f'NN模型未找到: {nn_model}\n回退为无检测器'))
             else:
-                detector = DetectorBackend(model_path=cfm_model, norm_path=norm_dir)
+                detector = DetectorBackend(model_path=nn_model, norm_path=norm_dir)
                 detector.reset()
         elif detector_mode == 'perfect':
             detector = PerfectDetectorBackend()
@@ -429,8 +444,15 @@ class ControlPanel(ttk.Frame):
         self._ds_combo.grid(row=0, column=0, sticky='ew', padx=5, pady=3)
         self._ds_combo.bind('<<ComboboxSelected>>', self._on_dataset_select)
 
-        ttk.Label(self._frame_dataset, text='(从 dataset/metadata.csv 加载)',
-                  font=('', 8)).grid(row=1, column=0, sticky='w', padx=5)
+        # 数据集目录选择
+        ttk.Label(self._frame_dataset, text='目录:').grid(row=1, column=0, sticky='w', padx=5, pady=2)
+        self._ds_dir_var = tk.StringVar()
+        self._ds_dir_combo = ttk.Combobox(self._frame_dataset, textvariable=self._ds_dir_var,
+                                          state='readonly', width=50)
+        self._ds_dir_combo.grid(row=2, column=0, sticky='ew', padx=5, pady=2)
+        self._ds_dir_combo.bind('<<ComboboxSelected>>', self._on_ds_dir_change)
+        ttk.Button(self._frame_dataset, text='刷新', command=self._refresh_ds_dirs).grid(
+            row=2, column=1, padx=3, pady=2, sticky='w')
         row += 1
 
         # ---- 自定义参数面板 ----
@@ -467,7 +489,7 @@ class ControlPanel(ttk.Frame):
 
         ttk.Label(self._frame_attack, text='攻击类型:').grid(
             row=0, column=0, padx=5, pady=3, sticky='w')
-        self._atk_var = tk.StringVar(value='A1  Constant Bias (恒定偏移)')
+        self._atk_var = tk.StringVar(value='A1  Constant Bias')
         atk_values = [f'{a}  {ATTACK_NAMES[a]}' for a in ALL_ATTACK_TYPES]
         self._atk_combo = ttk.Combobox(self._frame_attack, textvariable=self._atk_var,
                                         values=atk_values, state='readonly', width=40)
@@ -490,9 +512,9 @@ class ControlPanel(ttk.Frame):
         # 检测器选择
         ttk.Label(self._frame_attack, text='检测器:').grid(
             row=1, column=0, padx=5, pady=3, sticky='w')
-        self._detector_var = tk.StringVar(value='cfm')
-        ttk.Radiobutton(self._frame_attack, text='CFM (NN)',
-                        variable=self._detector_var, value='cfm').grid(
+        self._detector_var = tk.StringVar(value='nn')
+        ttk.Radiobutton(self._frame_attack, text='NN',
+                        variable=self._detector_var, value='nn').grid(
             row=1, column=1, padx=2, pady=2, sticky='w')
         ttk.Radiobutton(self._frame_attack, text='Perfect (理想)',
                         variable=self._detector_var, value='perfect').grid(
@@ -650,18 +672,27 @@ class ControlPanel(ttk.Frame):
         if mode == 'dataset':
             self._frame_dataset.grid()
             self._frame_custom.grid_remove()
-            if not self._dataset_configs:
-                self._load_dataset()
+            # 数据集模式下攻击参数来自记录，禁用手动编辑
+            for w in self._frame_attack.winfo_children():
+                if isinstance(w, (ttk.Combobox, ttk.Spinbox)):
+                    w.configure(state='disabled')
+            if not self._ds_dir_var.get():
+                self._refresh_ds_dirs()
         else:
             self._frame_dataset.grid_remove()
             self._frame_custom.grid()
+            for w in self._frame_attack.winfo_children():
+                if isinstance(w, (ttk.Combobox, ttk.Spinbox)):
+                    w.configure(state='readonly' if isinstance(w, ttk.Combobox) else 'normal')
 
     def _load_dataset(self):
-        """加载 metadata.csv 并填充下拉列表"""
-        metadata_path = os.path.join(PROJECT_ROOT, 'dataset', 'metadata.csv')
+        """加载数据集 metadata.csv 并填充下拉列表"""
+        ds_dir = self._ds_dir_var.get()
+        if not ds_dir:
+            return
+        metadata_path = os.path.join(ds_dir, 'metadata.csv')
         if not os.path.exists(metadata_path):
-            messagebox.showwarning('数据集未找到',
-                                    f'metadata.csv 不存在:\n{metadata_path}\n\n请先运行 generate_dataset.py')
+            self._ds_combo['values'] = []
             return
         try:
             self._dataset_configs = load_dataset_configs(metadata_path)
@@ -673,51 +704,75 @@ class ControlPanel(ttk.Frame):
         for cfg in self._dataset_configs:
             cid = cfg['config_id']
             fam = cfg['family']
-            # 简要参数
-            if fam == 'lissajous':
-                params_str = f'v_r={cfg["v_r"]:.2f} w_freq={cfg["w_freq"]:.2f}'
-            elif fam == 'circular':
-                params_str = f'v_r={cfg["v_r"]:.2f} w_r={cfg["w_r"]:.3f}'
-            elif fam == 'spiral':
-                params_str = f'v={cfg["v"]:.2f} R0={cfg["R0"]:.2f} Rmax={cfg["Rmax"]:.2f}'
-            elif fam == 'random_waypoint':
-                params_str = f'v_r={cfg["v_r"]:.2f}'
-            elif fam == 'square':
-                params_str = f'side={cfg["side"]:.1f} v={cfg["v_straight"]:.2f}'
-            else:
-                params_str = ''
-            items.append(f'config_{cid:02d} | {fam:16s} | seed={cfg["traj_seed"]:4d} | {params_str}')
+            atk = cfg['attack_type']
+            atk_name = ATTACK_NAMES.get(atk, atk)
+            onset = cfg['attack_onset']
+            items.append(f'config_{cid:02d} | {fam:16s} | {atk} ({atk_name:15s}) | onset={onset:5.1f}s')
         self._ds_combo['values'] = items
         self._ds_combo.current(0)
+
+    def _refresh_ds_dirs(self):
+        """刷新 dataset/ 目录列表"""
+        base = os.path.join(PROJECT_ROOT, 'dataset')
+        if not os.path.exists(base):
+            self._ds_dir_combo['values'] = []
+            return
+        dirs = sorted(
+            [os.path.join(base, d) for d in os.listdir(base)
+             if os.path.isdir(os.path.join(base, d))],
+            key=os.path.getctime, reverse=True)
+        self._ds_dir_combo['values'] = dirs
+        if dirs:
+            self._ds_dir_combo.current(0)
+        self._on_ds_dir_change()
+
+    def _on_ds_dir_change(self, event=None):
+        """数据集目录切换时重新加载记录列表"""
+        self._load_dataset()
 
     def _on_dataset_select(self, event=None):
         idx = self._ds_combo.current()
         if idx >= 0 and idx < len(self._dataset_configs):
             cfg = self._dataset_configs[idx]
+            atk = cfg['attack_type']
+            atk_name = ATTACK_NAMES.get(atk, atk)
             self._status_var.set(
-                f'已选: config_{cfg["config_id"]:02d} | {cfg["family"]} | seed={cfg["traj_seed"]}')
+                f'已选: config_{cfg["config_id"]:02d} | {cfg["family"]} | '
+                f'{atk} ({atk_name}) | onset={cfg["attack_onset"]:.1f}s')
 
     def get_selected_config(self) -> dict:
-        """获取当前选择的轨迹配置 (数据集模式)"""
+        """获取当前选择的数据集仿真记录"""
         idx = self._ds_combo.current()
         if idx >= 0 and idx < len(self._dataset_configs):
             return self._dataset_configs[idx]
         return None
 
     def get_attack_type(self) -> str:
+        if self._src_var.get() == 'dataset':
+            cfg = self.get_selected_config()
+            if cfg:
+                return cfg['attack_type']
         return self._atk_var.get().split('  ')[0].strip()
 
     def get_attack_onset(self) -> float:
+        if self._src_var.get() == 'dataset':
+            cfg = self.get_selected_config()
+            if cfg:
+                return cfg['attack_onset']
         return self._onset_var.get()
 
     def get_attack_duration(self) -> float:
+        if self._src_var.get() == 'dataset':
+            cfg = self.get_selected_config()
+            if cfg:
+                return cfg['attack_duration']
         return self._dur_var.get()
 
     def get_sim_time(self) -> float:
         return self._simtime_var.get()
 
     def get_detector_mode(self) -> str:
-        return self._detector_var.get()  # 'cfm' | 'perfect' | 'none'
+        return self._detector_var.get()  # 'nn' | 'perfect' | 'none'
 
     def set_progress(self, step: int, total: int, t: float, elapsed: float):
         self._progress['maximum'] = total
@@ -787,8 +842,8 @@ class InteractiveApp(tk.Tk):
         # 窗口关闭时清理
         self.protocol('WM_DELETE_WINDOW', self._on_close)
 
-        # 加载数据集
-        self._panel._load_dataset()
+        # 加载数据集目录列表
+        self._panel._refresh_ds_dirs()
 
     def _build_control_panel(self):
         self._panel = ControlPanel(self, self)
@@ -950,7 +1005,7 @@ class InteractiveApp(tk.Tk):
                     self._update_cursor(0)
                     atk = data.get('attack_type_label', 'A0')
                     det_mode = data.get('detector_mode', 'none')
-                    det_label = {'cfm': 'CFM', 'perfect': 'Perfect', 'none': 'None'}.get(det_mode, det_mode)
+                    det_label = {'nn': 'NN', 'perfect': 'Perfect', 'none': 'None'}.get(det_mode, det_mode)
                     rmse = data.get('pos_rmse', 0)
                     self._detail_var.set(
                         f'仿真完成 | 攻击={atk} | 检测器={det_label} | RMSE={rmse:.4f}m | '

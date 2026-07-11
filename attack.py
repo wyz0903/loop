@@ -45,8 +45,8 @@ class AttackConfig:
 
     # —— A3 斜坡漂移 (Drift) ——
     # 来源: MEMS 传感器温升导致信号基线缓慢漂移
-    ramp_rate_xy: float = 0.020                       # 位置漂移率 [m/s]
-    ramp_rate_theta: float = 0.010                    # 角度漂移率 [rad/s]
+    ramp_rate_xy: float = 0.100                       # 位置漂移率 [m/s] (5s→0.5m)
+    ramp_rate_theta: float = 0.050                    # 角度漂移率 [rad/s] (5s→0.25rad)
 
     # —— A4 重放攻击 (Replay Attack) ——
     # 来源: 攻击者录制历史测量值后回放
@@ -54,17 +54,17 @@ class AttackConfig:
 
     # —— A5 信号丢失 (Intermittent Dropout) ——
     # 来源: 接线松动、连接器氧化，传感器间歇性开路 → 输出为零
-    # Gilbert-Elliott 双状态 Markov 模型
-    dropout_p_gf: float = 0.02                        # P(good→fault) 每步转移概率 (稳态故障率~20%)
-    dropout_p_fg: float = 0.08                        # P(fault→good) 每步转移概率 (平均故障持续~12.5步)
+    # 固定模式: 在攻击窗口内等间隔插入 N 段固定长度的丢包
+    dropout_burst_count: int = 4                       # 丢包段数
+    dropout_burst_length: int = 10                     # 每段丢包步数 (0.5s)
     dropout_zero_output: bool = True                   # True=输出归零, False=保持末值
 
     # —— A6 缩放攻击 (Scaling) ——
     # 来源: 传感器信号调理电路被篡改，增益偏移或ADC参考电压被修改
     # 唯一乘性攻击: y_att = diag(s) @ y_clean
-    scale_x: float = 1.4                               # x通道缩放因子 (>1=放大)
-    scale_y: float = 0.6                               # y通道缩放因子 (<1=缩小)
-    scale_theta: float = -0.5                          # θ通道缩放因子 (<0=反向)
+    scale_x: float = 0.6                                # x通道缩放因子 (<1=缩小)
+    scale_y: float = 0.8                                # y通道缩放因子 (<1=轻微缩小)
+    scale_theta: float = 0.5                            # θ通道缩放因子 (<1=缩小)
 
     # —— A7 传感器冻结 (Sensor Freeze) ——
     # 来源: 固件死锁、ADC锁存、I²C总线卡死导致传感器不再更新
@@ -118,8 +118,6 @@ class SensorAttack:
         # ---- 攻击类型特定状态 ----
         self._replay_buffer = []           # A4 录制缓冲
         self._replay_idx = 0               # A4 回放指针
-        self._dropout_state = 0            # A5 Markov状态: 0=good, 1=fault
-        self._last_good_value = None       # A5 故障前最后有效值 (用于保持末值模式)
         self._frozen_value = None          # A7 冻结值
         self._scaling_diag = None          # A6 缩放对角矩阵 (缓存)
 
@@ -127,8 +125,6 @@ class SensorAttack:
         """重置攻击状态 (每次新仿真前调用)"""
         self._replay_buffer = []
         self._replay_idx = 0
-        self._dropout_state = 0
-        self._last_good_value = None
         self._frozen_value = None
         self._scaling_diag = None
 
@@ -226,33 +222,33 @@ class SensorAttack:
     # ==================================================================
     # A5: 信号丢失 — 接线松动/连接器氧化，传感器间歇性开路
     #
-    # Gilbert-Elliott 双状态 Markov 模型:
-    #   State 0 (good):  正常输出
-    #   State 1 (fault): 传感器输出归零 (open circuit = 0V)
+    # 固定模式: 在攻击窗口内等间隔插入 N 段固定长度的丢包。
+    #   每段丢包: 传感器输出归零 (open circuit = 0V)
+    #   段间恢复: 正常输出
     #
-    # 转移概率:
-    #   P(0→1) = dropout_p_gf : 突发故障概率 (小)
-    #   P(1→0) = dropout_p_fg : 恢复概率     (大)
-    #
-    # 产生突发的、间歇性的信号丢失，具有工业传感器连接故障的特征
+    # 示例: 4 段 × 10 步 = 40 步丢包 / 100 步攻击 = 40% 丢包率
     # ==================================================================
     def _inject_A5(self, t: float, y_clean: np.ndarray) -> np.ndarray:
-        # Markov 状态转移
-        if self._dropout_state == 0:
-            self._last_good_value = y_clean.copy()  # 记录故障前最后有效值
-            if self.rng.rand() < self.cfg.dropout_p_gf:
-                self._dropout_state = 1
-        else:
-            if self.rng.rand() < self.cfg.dropout_p_fg:
-                self._dropout_state = 0
+        step_in_attack = int(round((t - self.onset_time) / 0.05))
+        burst_len = self.cfg.dropout_burst_length
+        num_bursts = self.cfg.dropout_burst_count
+        # 用缓存的 attack_duration 计算总攻击步数
+        total_atk_steps = int(round(self.cfg.attack_duration / 0.05))
+        # 等间隔排布丢包段
+        total_gap = max(0, total_atk_steps - num_bursts * burst_len)
+        gap = total_gap // (num_bursts + 1)
+        extra = total_gap % (num_bursts + 1)
 
-        if self._dropout_state == 1:
-            if self.cfg.dropout_zero_output:
-                return np.zeros(3)                       # 开路 → 零输出
-            else:
-                if self._last_good_value is not None:
-                    return self._last_good_value.copy()  # 保持故障前末值
-                return y_clean.copy()                    # 兜底 (无缓存时)
+        pos = 0
+        for i in range(num_bursts):
+            eff_gap = gap + (1 if i < extra else 0)
+            pos += eff_gap
+            if pos <= step_in_attack < pos + burst_len:
+                if self.cfg.dropout_zero_output:
+                    return np.zeros(3)
+                return y_clean.copy()  # 保持末值模式暂用 clean
+            pos += burst_len
+
         return y_clean.copy()
 
     # ==================================================================
@@ -306,18 +302,6 @@ ALL_ATTACK_TYPES = SensorAttack.ATTACK_TYPES
 
 # 攻击英文名称 (论文用)
 ATTACK_NAMES = SensorAttack.ATTACK_NAMES
-
-# 攻击中文名称 (图表标注用)
-ATTACK_NAMES_CN = {
-    'A0': '正常',
-    'A1': '恒定偏移',
-    'A2': '正弦注入',
-    'A3': '斜坡漂移',
-    'A4': '重放攻击',
-    'A5': '信号丢失',
-    'A6': '缩放攻击',
-    'A7': '传感器冻结',
-}
 
 # 攻击颜色方案 (8 类统一配色)
 ATK_COLORS = {

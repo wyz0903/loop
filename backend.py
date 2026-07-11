@@ -21,7 +21,7 @@ from model import WMRKinematics
 from attack import ALL_ATTACK_TYPES
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-WINDOW_SIZE = 100
+WINDOW_SIZE = 128
 
 
 @dataclass
@@ -50,7 +50,7 @@ class DetectorBackend:
     def __init__(self, model_path: str = None, norm_path: str = None,
                  window_size: int = WINDOW_SIZE, device: str = None):
         if model_path is None:
-            model_path = os.path.join(SCRIPT_DIR, 'detector', 'models', 'cfm_cls_best.pt')
+            model_path = os.path.join(SCRIPT_DIR, 'detector', 'models', 'nn_cls_best.pt')
         if norm_path is None:
             norm_path = os.path.join(SCRIPT_DIR, 'dataset_win', 'normalizer.npz')
 

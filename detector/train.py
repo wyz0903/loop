@@ -5,12 +5,16 @@ train.py — 攻击检测器训练脚本
 
 用法:
   python train.py                    # 默认训练
-  python train.py --eval-only detector/models/cfm_cls_best.pt
+  python train.py --eval-only detector/models/nn_cls_best.pt
 """
 
 import os, sys, argparse
 import numpy as np
 from collections import defaultdict
+
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+PROJECT_ROOT = os.path.dirname(SCRIPT_DIR)
+sys.path.insert(0, PROJECT_ROOT)
 
 import torch, torch.nn as nn, torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
@@ -20,9 +24,7 @@ matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 
 from detector.detector import Detector
-from attack import ALL_ATTACK_TYPES, ATTACK_NAMES_CN
-
-SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+from attack import ALL_ATTACK_TYPES, ATTACK_NAMES
 DATA_DIR = os.path.join(SCRIPT_DIR, '..', 'dataset_win')
 MODEL_DIR = os.path.join(SCRIPT_DIR, 'models')
 os.makedirs(MODEL_DIR, exist_ok=True)
@@ -196,6 +198,8 @@ def evaluate(model, dataloader, device, epoch=999):
 def main():
     global RECON_LAMBDA, RECON_WARMUP, LABEL_SMOOTHING
     parser = argparse.ArgumentParser(description='分类检测器训练')
+    parser.add_argument('--data-dir', type=str, default=DATA_DIR,
+                        help='预处理后的数据目录')
     parser.add_argument('--eval-only', type=str, default=None)
     parser.add_argument('--epochs', type=int, default=NUM_EPOCHS)
     parser.add_argument('--lr', type=float, default=LEARNING_RATE)
@@ -215,15 +219,15 @@ def main():
     print(f"解码器: {'禁用' if args.no_decoder else '启用'} (λ={RECON_LAMBDA}, warmup={RECON_WARMUP})")
 
     # ---- 归一化参数 ----
-    norm_data = np.load(os.path.join(DATA_DIR, 'normalizer.npz'))
+    norm_data = np.load(os.path.join(args.data_dir, 'normalizer.npz'))
     norm_params = {k: norm_data[k] for k in
                    ['ymeas_scale', 'ymeas_median', 'cmd_max', 'feat_scale', 'feat_median']}
 
     # ---- 数据集 ----
     load_clean = not args.no_decoder
-    train_dataset = PreprocessedDataset(split='train', downsample_a0=args.downsample_a0, load_clean=load_clean)
-    val_dataset = PreprocessedDataset(split='val', load_clean=load_clean)
-    test_dataset = PreprocessedDataset(split='test', load_clean=load_clean)
+    train_dataset = PreprocessedDataset(args.data_dir, split='train', downsample_a0=args.downsample_a0, load_clean=load_clean)
+    val_dataset = PreprocessedDataset(args.data_dir, split='val', load_clean=load_clean)
+    test_dataset = PreprocessedDataset(args.data_dir, split='test', load_clean=load_clean)
 
     def _make_loader(ds, bs, shuffle):
         return DataLoader(ds, batch_size=bs, shuffle=shuffle, num_workers=NUM_WORKERS,
@@ -256,7 +260,7 @@ def main():
         if 'recon_loss' in result:
             print(f"  重建 Loss: {result['recon_loss']:.6f}")
         for atk in ALL_ATTACK_TYPES:
-            print(f"  {atk} ({ATTACK_NAMES_CN[atk]}): {result['per_class_acc'].get(atk, 0):.4f}")
+            print(f"  {atk} ({ATTACK_NAMES[atk]}): {result['per_class_acc'].get(atk, 0):.4f}")
         return
 
     # ---- 训练 ----
@@ -267,7 +271,8 @@ def main():
     best_val_acc = 0.0
     best_epoch = 0
     patience_counter = 0
-    history = {'train_loss': [], 'train_acc': [], 'val_loss': [], 'val_acc': []}
+    history = {'train_loss': [], 'train_acc': [], 'val_loss': [], 'val_acc': [],
+               'train_recon': [], 'val_recon': []}
 
     for epoch in range(1, args.epochs + 1):
         train_dataset.resample_a0()
@@ -279,6 +284,8 @@ def main():
         history['train_acc'].append(train_m['acc'])
         history['val_loss'].append(val_m['loss'])
         history['val_acc'].append(val_m['acc'])
+        history['train_recon'].append(train_m.get('recon_loss', 0.0))
+        history['val_recon'].append(val_m.get('recon_loss', 0.0))
 
         lr_now = optimizer.param_groups[0]['lr']
         recon_str = f" | R T={train_m['recon_loss']:.4f} V={val_m['recon_loss']:.4f}" if 'recon_loss' in train_m else ""
@@ -291,7 +298,7 @@ def main():
             best_val_acc = val_m['acc']
             best_epoch = epoch
             patience_counter = 0
-            torch.save(model.state_dict(), os.path.join(MODEL_DIR, 'cfm_cls_best.pt'))
+            torch.save(model.state_dict(), os.path.join(MODEL_DIR, 'nn_cls_best.pt'))
             print("  *", end='')
         else:
             patience_counter += 1
@@ -303,7 +310,7 @@ def main():
 
     # ---- 最终测试 ----
     print(f"\n加载最佳模型 (epoch {best_epoch}, Val Acc={best_val_acc:.4f})")
-    model.load_state_dict(torch.load(os.path.join(MODEL_DIR, 'cfm_cls_best.pt'),
+    model.load_state_dict(torch.load(os.path.join(MODEL_DIR, 'nn_cls_best.pt'),
                                      map_location=DEVICE, weights_only=True))
     test_m = evaluate(model, test_loader, DEVICE, epoch=RECON_WARMUP + 1)
     print(f"\n{'='*60}")
@@ -312,7 +319,7 @@ def main():
     if 'recon_loss' in test_m:
         print(f"  重建 Loss: {test_m['recon_loss']:.6f}")
     for atk in ALL_ATTACK_TYPES:
-        print(f"    {atk} ({ATTACK_NAMES_CN[atk]}): {test_m['per_class_acc'].get(atk, 0):.4f}")
+        print(f"    {atk} ({ATTACK_NAMES[atk]}): {test_m['per_class_acc'].get(atk, 0):.4f}")
     print(f"{'='*60}")
 
     # ---- 训练曲线 ----

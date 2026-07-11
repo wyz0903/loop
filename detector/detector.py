@@ -19,7 +19,7 @@ ALPHA = 0.17
 D_MODEL = 96
 NUM_CLASSES = 8
 IN_CHANNELS = 8
-WINDOW_SIZE = 100
+WINDOW_SIZE = 128
 CONV_CHANNELS = [32, 64, 96]
 CONV_KERNEL_SIZES = [7, 5, 3]
 CONV_DILATIONS = [1, 3, 9]
@@ -108,7 +108,7 @@ class KinematicConsistencyBias(nn.Module):
         with torch.no_grad():
             innov_phys = (x_norm[:, :, 3:6] * feat_scale.view(1, 1, 3)
                           + feat_median.view(1, 1, 3))
-            t_idx = list(range(4, 100, 8))
+            t_idx = list(range(4, WINDOW_SIZE, 8))
             innov_l2 = torch.norm(innov_phys[:, t_idx, :], dim=-1)
             bias = -innov_l2 / self.sigma
             return bias - bias.mean(dim=-1, keepdim=True)
@@ -135,7 +135,8 @@ class PhysicsGuidedDecoder(nn.Module):
     def forward(self, features):
         h = features.permute(0, 2, 1)
         h = self.upsample(h)
-        return F.interpolate(h, size=100, mode='linear', align_corners=False).permute(0, 2, 1)
+        return F.interpolate(h, size=WINDOW_SIZE,
+                             mode='linear', align_corners=False).permute(0, 2, 1)
 
 
 # ============================================================================
@@ -159,7 +160,7 @@ class Detector(nn.Module):
         self.register_buffer('cmd_max', torch.tensor(
             cmd_max or [0.3, 1.76], dtype=torch.float32))
         self.register_buffer('feat_scale', torch.tensor(
-            feat_scale or [2.5, 2.5, 3.141592653589793], dtype=torch.float32))
+            feat_scale or [0.5, 0.5, 0.3], dtype=torch.float32))
         self.register_buffer('feat_median', torch.tensor(
             feat_median or [0., 0., 0.], dtype=torch.float32))
 

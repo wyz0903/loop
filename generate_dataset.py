@@ -19,15 +19,16 @@ generate_dataset.py — 多样化轨迹攻击数据集生成器
 每条轨迹 × 8 种攻击 (A0~A7) × N 组随机参数 = 多样化训练集
 
 用法:
-  python generate_dataset.py                           # 默认: 50 组轨迹 × 8 攻击 = 400 轮
-  python generate_dataset.py --num-configs 100         # 100 组轨迹参数
-  python generate_dataset.py --quick                   # 快速测试: 3 组 × 3 攻击
-  python generate_dataset.py --attack A1               # 只生成一种攻击的数据,以A1为例。
+  python generate_dataset.py                                 # 默认: 输出到 dataset/YYYYMMDD_HHMMSS/
+  python generate_dataset.py --num-configs 100               # 100 组轨迹参数
+  python generate_dataset.py --attack A1                     # 只生成一种攻击的数据,以A1为例。
+  python generate_dataset.py --output-dir dataset/my_exp     # 指定输出目录 (替代自动时间戳)
 """
 
 import os
 import time
 import argparse
+from datetime import datetime
 import numpy as np
 import pandas as pd
 from collections import defaultdict
@@ -43,8 +44,8 @@ from attack import SensorAttack, AttackConfig, ALL_ATTACK_TYPES, ATTACK_NAMES
 # ============================================================================
 
 DEFAULT_ATTACK_ONSET = 15.0      # 默认攻击开始时间
-RESULT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'dataset')
-os.makedirs(RESULT_DIR, exist_ok=True)
+BASE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'dataset')
+os.makedirs(BASE_DIR, exist_ok=True)
 
 # ============================================================================
 # 1. 单轮仿真运行器
@@ -170,14 +171,60 @@ def run_single_simulation(traj: RandomizedTrajectory,
 # 轨迹族固定顺序 (确定性遍历)
 FAMILIES_ORDER = ['lissajous', 'circular', 'spiral', 'random_waypoint', 'square']
 
+# 攻击默认参数摘要（供 README 使用）
+_ATTACK_PARAMS_SUMMARY = """
+  A0 Normal:             无攻击
+  A1 Constant Bias:      bias_xy=(0.15, -0.12)m, bias_theta=0.10rad
+  A2 Sinusoidal:         amp=0.12m, freq=0.8Hz
+  A3 Drift:              slope=0.008m/s
+  A4 Replay Attack:      record_gap=1.0s before onset, loop playback
+  A5 Intermittent Dropout: p_gf=0.02, p_fg=0.08
+  A6 Scaling:            diag(0.35, 0.35, 1.0)
+  A7 Sensor Freeze:      holds last value before onset
+"""
 
-def generate_dataset(num_configs: int = None,
+
+def _write_readme(output_dir: str, n_configs: int, total_runs: int,
+                  num_per_family: int, attack_types: list,
+                  config_families: list):
+    """写数据集说明文件"""
+    lines = [
+        "# Dataset Description",
+        "",
+        f"**Generated:** {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+        f"**Script:** `generate_dataset.py`",
+        "",
+        "## Configuration",
+        "",
+        f"- Trajectory families: 5 (lissajous, circular, spiral, random_waypoint, square)",
+        f"- Configs per family: {num_per_family if config_families else 'random'}",
+        f"- Total configs: {n_configs}",
+        f"- Attack types: {', '.join(attack_types)}",
+        f"- Total simulation runs: {total_runs}",
+        f"- Simulation time: {SIM_TIME}s, Ts=0.05s, {SIM_STEPS} steps/run",
+        f"- Reference trajectory: centered to origin (centering offset applied)",
+        f"- Initial robot pose: centered trajectory start + uniform noise (±0.3m, ±0.2rad)",
+        f"- Attack onset: uniform random [5.0, 35.0]s (A0: never)",
+        f"- Attack duration: uniform random [5.0, min(20.0, remaining)]s",
+        "",
+        "## Attack Parameters",
+        _ATTACK_PARAMS_SUMMARY,
+    ]
+    readme_path = os.path.join(output_dir, 'README.md')
+    with open(readme_path, 'w', encoding='utf-8') as f:
+        f.write('\n'.join(lines))
+    print(f"  说明文件:     {readme_path}")
+
+
+def generate_dataset(output_dir: str,
+                     num_configs: int = None,
                      num_per_family: int = 12,
                      attack_types: list = None,
                      seed: int = 42) -> pd.DataFrame:
     """生成完整训练数据集
 
     Args:
+        output_dir:     输出目录（时间戳子目录，由调用方创建）
         num_configs:   轨迹参数组数 (向后兼容，随机选族)
         num_per_family: 每族轨迹条数 (默认 12, 5族×12=60配置)
         attack_types:  要生成的攻击列表，默认全部 8 种
@@ -206,6 +253,10 @@ def generate_dataset(num_configs: int = None,
     rng = np.random.RandomState(seed)
     seeds = rng.randint(0, 2**31 - 1, size=total_runs)
 
+    # ---- 写 README ----
+    _write_readme(output_dir, n_configs, total_runs, num_per_family,
+                  attack_types, config_families)
+
     print("=" * 65)
     print("数据集生成器 — 多样化轨迹 + 攻击")
     print("=" * 65)
@@ -216,7 +267,7 @@ def generate_dataset(num_configs: int = None,
     print(f"  攻击类型:     {attack_types}")
     print(f"  总仿真轮数:   {total_runs}")
     print(f"  仿真时长:     {SIM_TIME}s, Ts=0.05s, {SIM_STEPS}步/轮")
-    print(f"  输出目录:     {RESULT_DIR}")
+    print(f"  输出目录:     {output_dir}")
     print("=" * 65)
 
     metadata_rows = []
@@ -245,10 +296,8 @@ def generate_dataset(num_configs: int = None,
                 attack_duration = None
                 attack_offset = SIM_TIME + 1.0
             else:
-                attack_onset = float(rng.uniform(5.0, 35.0))
-                # 攻击持续时间在 [5, 20]s 内随机，但不晚于仿真结束
-                max_dur = SIM_TIME - attack_onset
-                attack_duration = float(rng.uniform(5.0, min(20.0, max_dur)))
+                attack_onset = float(rng.uniform(10.0, 40.0))
+                attack_duration = 5.0                       # 固定 5s (100 步) < 窗口 128 步
                 attack_offset = attack_onset + attack_duration
 
             print(f"  [{run_idx+1:4d}/{total_runs}] "
@@ -265,7 +314,7 @@ def generate_dataset(num_configs: int = None,
 
             # 保存 .npz
             fname = f'sim_{cfg_idx:04d}_{atk_type}.npz'
-            filepath = os.path.join(RESULT_DIR, fname)
+            filepath = os.path.join(output_dir, fname)
             # 保存时去掉 traj_info (dict 无法直接存入 npz)
             traj_info_copy = data.pop('traj_info', {})
             np.savez_compressed(filepath, **{k: v for k, v in data.items()
@@ -310,7 +359,7 @@ def generate_dataset(num_configs: int = None,
 
     # 保存 metadata
     df = pd.DataFrame(metadata_rows)
-    csv_path = os.path.join(RESULT_DIR, 'metadata.csv')
+    csv_path = os.path.join(output_dir, 'metadata.csv')
     df.to_csv(csv_path, index=False)
 
     print(f"\n{'='*65}")
@@ -318,7 +367,7 @@ def generate_dataset(num_configs: int = None,
     print(f"  总轮数:     {total_runs}")
     print(f"  总时间步:   {total_runs * SIM_STEPS:,}")
     print(f"  Metadata:   {csv_path}")
-    print(f"  数据文件:   {RESULT_DIR}/sim_*.npz")
+    print(f"  数据文件:   {output_dir}/sim_*.npz")
     print(f"{'='*65}")
 
     return df
@@ -328,14 +377,14 @@ def generate_dataset(num_configs: int = None,
 # 3. 数据验证工具
 # ============================================================================
 
-def validate_dataset(df: pd.DataFrame):
+def validate_dataset(df: pd.DataFrame, data_dir: str):
     """验证生成的数据集完整性"""
     print("\n=== 数据集验证 ===")
 
     # 文件存在性
     missing = []
     for fname in df['filename']:
-        path = os.path.join(RESULT_DIR, fname)
+        path = os.path.join(data_dir, fname)
         if not os.path.exists(path):
             missing.append(fname)
     if missing:
@@ -381,8 +430,6 @@ def main():
                         help='轨迹参数组数 (旧模式: 随机选族)')
     parser.add_argument('--attack', type=str, default=None,
                         help='只生成指定攻击类型 (如 A1), 默认全部')
-    parser.add_argument('--quick', action='store_true',
-                        help='快速测试: 每族2条 × 3攻击 (A0,A1,A2)')
     parser.add_argument('--output-dir', type=str, default=None,
                         help='输出目录 (默认 ./dataset/)')
     parser.add_argument('--seed', type=int, default=42,
@@ -390,36 +437,29 @@ def main():
 
     args = parser.parse_args()
 
+    # 时间戳子目录
+    ts = datetime.now().strftime('%Y%m%d_%H%M%S')
     if args.output_dir:
-        global RESULT_DIR
-        RESULT_DIR = args.output_dir
-        os.makedirs(RESULT_DIR, exist_ok=True)
+        out_dir = args.output_dir
+    else:
+        out_dir = os.path.join(BASE_DIR, ts)
+    os.makedirs(out_dir, exist_ok=True)
 
-    if args.quick:
-        num_per_family = 2
-        attack_types = ['A0', 'A1', 'A2']
-        print(f"[快速模式] 每族 {num_per_family} 条 × 3 种攻击 = "
-              f"{num_per_family * 5 * 3} 轮")
-        df = generate_dataset(
-            num_per_family=num_per_family,
-            attack_types=attack_types,
-            seed=args.seed
-        )
-    elif args.num_configs is not None:
-        df = generate_dataset(
+    if args.num_configs is not None:
+        df = generate_dataset(out_dir,
             num_configs=args.num_configs,
             attack_types=[args.attack] if args.attack else ALL_ATTACK_TYPES,
             seed=args.seed
         )
     else:
         attack_types = [args.attack] if args.attack else ALL_ATTACK_TYPES
-        df = generate_dataset(
+        df = generate_dataset(out_dir,
             num_per_family=args.num_per_family,
             attack_types=attack_types,
             seed=args.seed
         )
 
-    validate_dataset(df)
+    validate_dataset(df, out_dir)
 
 
 if __name__ == "__main__":

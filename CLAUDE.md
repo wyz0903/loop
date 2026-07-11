@@ -51,17 +51,17 @@
 ## 工作流程与命令
 
 1. 通过controller.py编译 NMPC 求解器（仅限首次运行，需要 CasADi + IPOPT）
-2. 数据集通过generate_dataset.py生成数据集。将生成 `.npz` 文件输出到 `dataset/` 目录中，并生成一个 `metadata.csv`
-3. 通过detector/preprocess_data.py对数据进行预处理。输出 `dataset_win/X_train.npy`、`Y_train_cls.npy`、`Y_train_atk.npy`、`normalizer.npz` 等文件。默认按轨迹族分层 IID 划分为 train/val/test (70/15/15)
-4. 训练CFM检测器，通过detector/train.py。保存模型至 `detector/models/cfm_cls_best.pt`
-5. 运行检测器仿真，通过simulate.py。输出 `results/sim_*.npz` 和图表
+2. 数据集通过generate_dataset.py生成数据集。输出到 `dataset/YYYYMMDD_HHMMSS/` 时间戳子目录，内含 `.npz` 文件、`metadata.csv` 和 `README.md`
+3. 通过detector/preprocess_data.py对数据进行预处理。默认输入 `dataset/<ts>/`，输出自动推导为 `dataset_win/<ts>/`。输出 `X_*.npy`、`Y_*_cls.npy`、`Y_*_clean.npy`、`normalizer.npz` 等文件。默认按轨迹族分层 IID 划分为 train/val/test (70/15/15)
+4. 训练NN检测器，通过detector/train.py。保存模型至 `detector/models/nn_cls_best.pt`
+5. 运行检测器仿真，通过simulate.py。输出到 `simulate_results/` 目录（`.npz` 数据和 `.png` 图表）
 6. 运行测试集评估，通过detector/evaluate.py。输出 `eval/{model_name}_{timestamp}/` 含混淆矩阵、分类指标、Markdown 报告
 7. 通过app/interactive_app.py启动交互式可视化GUI
 
 ### 独立测试脚本
 
 ```
-python simulate.py                    # CFM模式闭环仿真（默认A1+lissajous）
+python simulate.py                    # NN模式闭环仿真（默认A1+lissajous）
 python simulate.py --no-detector      # 无检测器基线
 python simulate.py --attack A0        # 无攻击正常运行
 python simulate.py --compare          # 五族轨迹无攻击跟踪对比图
@@ -101,14 +101,14 @@ ReferenceTrajectory(参考轨迹) → NMPC → u_cmd → WMRKinematics(RK4运动
 | `model.py`                    | WMR 运动学 (RK4)，李萨如 (Lissajous)/圆形 (Circular) 轨迹生成器，传感器模拟器                                                              |
 | `controller/controller.py`    | CasADi Opti NMPC：误差动力学 RK4 预测，菱形约束，控制增量代价函数，IPOPT 求解器                                                            |
 | `attack.py`                   | 7 种传感器攻击类型 (A1–A7) + 正常情况 (A0)；统一的`inject()` 注入接口                                                                     |
-| `simulate.py`                 | 统一闭环仿真：CFM检测器 / 无检测器基线 / 五族轨迹对比                                                                                      |
+| `simulate.py`                 | 统一闭环仿真：NN检测器 / 无检测器基线 / 五族轨迹对比                                                                                      |
 | `generate_dataset.py`         | 开环数据生成：5 种随机轨迹系列 × 8 种攻击                                                                                                 |
 | `backend.py`                  | DetectorBackend 推理包装器：滑动窗口缓冲 + 内部运动学 + 分类 + 恢复策略路由                                                             |
 | `detector/detector.py`        | 检测模型定义：膨胀深度可分离卷积骨干 + 运动学一致性偏置注意力 + 物理引导解码器                              |
-| `detector/preprocess_data.py` | 100 步滑动窗口，物理锚点归一化 (RobustNormalizer)，防数据泄漏的文件级拆分                                                                  |
+| `detector/preprocess_data.py` | 128 步滑动窗口，物理锚点归一化 (RobustNormalizer)，防数据泄漏的文件级拆分                                                                  |
 | `detector/train.py`           | 检测模型训练脚本：L = L_cls + λ_recon*L_recon（联合训练，λ_recon=0.3，warmup=20 epoch，label smoothing 0.0），A0 每 epoch 随机降采样 |
 | `detector/evaluate.py`        | 测试集分类评估：混淆矩阵 + 逐类精度/召回/F1 + 置信度 + 汇总图 + Markdown 报告                                                              |
-| `detector/models/`            | 训练好的模型权重 (cfm_cls_best.pt, cfm_cls_config.npz)                                                                                     |
+| `detector/models/`            | 训练好的模型权重 (nn_cls_best.pt, nn_cls_config.npz)                                                                                     |
 
 | `app/interactive_app.py` | tkinter 交互式 GUI：轨迹/攻击自由组合 + 时间滑块回放 + 6面板实时显示 |
 
@@ -138,7 +138,7 @@ ReferenceTrajectory(参考轨迹) → NMPC → u_cmd → WMRKinematics(RK4运动
 
 ### 关键设计决策
 
-- **多尺度膨胀深度可分离卷积骨干 (MultiScaleDSConvBackbone)**：3 块膨胀深度可分离卷积 (dilation=1,3,9)，每块 3 个并行膨胀深度卷积 + Pointwise Conv 混合。不同膨胀率对应不同运动学时间尺度 (0.35s / 0.95s / 2.75s)，Pointwise Conv 隐式学习最优尺度加权——自适应 K。通道 8→32→64→96，时序 100→50→25→12。骨干参数量 ~27K，远小于旧版 Standard Conv 骨干 ~76K。
+- **多尺度膨胀深度可分离卷积骨干 (MultiScaleDSConvBackbone)**：3 块膨胀深度可分离卷积 (dilation=1,3,9)，每块 3 个并行膨胀深度卷积 + Pointwise Conv 混合。不同膨胀率对应不同运动学时间尺度 (0.35s / 0.95s / 2.75s)，Pointwise Conv 隐式学习最优尺度加权——自适应 K。通道 8→32→64→96，时序 128→64→32→16。骨干参数量 ~27K，远小于旧版 Standard Conv 骨干 ~76K。
 - **窗口锚定运动学新息 (Unified Anchored Innovation)**：`innov[t] = y_meas[t] - rollout(y_meas[0], u_cmd[0:t])[t]`。统一替代旧版 1-step innov + kin_res 双尺度，打破非加性攻击自指涉污染反馈环。归一化复用 y_meas 物理空间尺度 [2.5m, 2.5m, π]，简洁统一。
 - **运动学一致性偏置注意力 (Kinematics-Guided Attention Pooling)**：零参数物理先验——从 innov_anchored 的 L2 范数计算每时间步的运动学一致性偏置，注入注意力分数。攻击步 (innov 大 → bias < 0) 被抑制，正常步 (innov ≈ 0 → bias ≈ 0) 获得更多关注。可学习标量 α 控制物理先验强度。
 - **总参数量 ~64K**：骨干27K + 分类头1K + 解码器36K，极轻量适合嵌入式部署。

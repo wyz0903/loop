@@ -28,10 +28,9 @@ plt.rcParams['axes.unicode_minus'] = False
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 PROJECT_ROOT = os.path.abspath(os.path.join(SCRIPT_DIR, '..'))
 sys.path.insert(0, PROJECT_ROOT)
-sys.path.insert(0, SCRIPT_DIR)
 
 from sklearn.metrics import classification_report
-from attack import ALL_ATTACK_TYPES, ATTACK_NAMES_CN, ATK_COLORS
+from attack import ALL_ATTACK_TYPES, ATTACK_NAMES, ATK_COLORS
 
 DEFAULT_BATCH_SIZE = 2048
 
@@ -39,7 +38,7 @@ DEFAULT_BATCH_SIZE = 2048
 def parse_args():
     parser = argparse.ArgumentParser(description='检测器 测试集分类评估')
     parser.add_argument('--model-path', type=str,
-                        default=os.path.join(PROJECT_ROOT, 'detector', 'models', 'cfm_cls_best.pt'))
+                        default=os.path.join(PROJECT_ROOT, 'detector', 'models', 'nn_cls_best.pt'))
     parser.add_argument('--data-dir', type=str,
                         default=os.path.join(PROJECT_ROOT, 'dataset_win'))
     parser.add_argument('--output-dir', type=str, default=None)
@@ -93,7 +92,7 @@ def compute_per_class_metrics(y_true, y_pred, y_conf, class_names):
         recall = tp / max(n_true, 1)
         f1 = 2 * precision * recall / max(precision + recall, 1e-10)
         mean_conf = float(np.mean(y_conf[true_mask])) if n_true > 0 else 0.0
-        rows.append({'attack_type': atk, 'name_cn': ATTACK_NAMES_CN.get(atk, ''),
+        rows.append({'attack_type': atk, 'name_en': ATTACK_NAMES.get(atk, ''),
                      'accuracy': accuracy, 'precision': precision, 'recall': recall,
                      'f1_score': f1, 'mean_confidence': mean_conf, 'n_samples': n_true})
     return pd.DataFrame(rows)
@@ -102,7 +101,7 @@ def compute_per_class_metrics(y_true, y_pred, y_conf, class_names):
 def generate_classification_report(y_true, y_pred, class_names, save_path):
     present = sorted(set(y_true.flat) | set(y_pred.flat))
     present = [i for i in present if i < len(class_names)]
-    present_names = [f'{class_names[i]} ({ATTACK_NAMES_CN.get(class_names[i], "")})' for i in present]
+    present_names = [f'{class_names[i]} ({ATTACK_NAMES.get(class_names[i], "")})' for i in present]
     cr_text = classification_report(y_true, y_pred, labels=present,
                                      target_names=present_names, digits=4, zero_division=0)
     with open(save_path, 'w', encoding='utf-8') as f:
@@ -112,7 +111,7 @@ def generate_classification_report(y_true, y_pred, class_names, save_path):
 
 def plot_confusion_matrix(cm_counts, cm_norm, class_names, save_path):
     n = len(class_names)
-    labels_cn = [f'{a}\n{ATTACK_NAMES_CN[a]}' for a in class_names]
+    labels = [f'{a}\n{ATTACK_NAMES[a]}' for a in class_names]
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(18, 7.5))
     fig.suptitle('攻击分类混淆矩阵', fontsize=13, fontweight='bold')
 
@@ -125,7 +124,7 @@ def plot_confusion_matrix(cm_counts, cm_norm, class_names, save_path):
                 ax1.text(j, i, str(val), ha='center', va='center', fontsize=8,
                         color=color, fontweight='bold' if i == j else 'normal')
     ax1.set_xticks(range(n)); ax1.set_yticks(range(n))
-    ax1.set_xticklabels(labels_cn, fontsize=7); ax1.set_yticklabels(labels_cn, fontsize=7)
+    ax1.set_xticklabels(labels, fontsize=7); ax1.set_yticklabels(labels, fontsize=7)
     ax1.set_xlabel('预测类别'); ax1.set_ylabel('真实类别')
     ax1.set_title('原始计数', fontweight='bold')
     plt.colorbar(im1, ax=ax1, fraction=0.046, pad=0.04, label='样本数')
@@ -139,7 +138,7 @@ def plot_confusion_matrix(cm_counts, cm_norm, class_names, save_path):
                 ax2.text(j, i, f'{val_pct:.1f}%', ha='center', va='center', fontsize=8,
                         color=color, fontweight='bold' if i == j else 'normal')
     ax2.set_xticks(range(n)); ax2.set_yticks(range(n))
-    ax2.set_xticklabels(labels_cn, fontsize=7); ax2.set_yticklabels(labels_cn, fontsize=7)
+    ax2.set_xticklabels(labels, fontsize=7); ax2.set_yticklabels(labels, fontsize=7)
     ax2.set_xlabel('预测类别'); ax2.set_ylabel('真实类别')
     ax2.set_title('行归一化 [%]', fontweight='bold')
     plt.colorbar(im2, ax=ax2, fraction=0.046, pad=0.04, label='百分比 [%]')
@@ -167,7 +166,7 @@ def plot_per_class_metrics(df, save_path):
         ax1_f1.annotate(f'{f1:.3f}', (i, f1), textcoords="offset points",
                        xytext=(0, 10), ha='center', fontsize=6.5, color='#BF360C')
     ax1.set_xticks(x)
-    ax1.set_xticklabels([f'{a}\n{ATTACK_NAMES_CN[a]}' for a in atks], fontsize=7)
+    ax1.set_xticklabels([f'{a}\n{ATTACK_NAMES[a]}' for a in atks], fontsize=7)
     ax1.set_ylabel('准确率 [%]'); ax1_f1.set_ylabel('F1'); ax1_f1.set_ylim(0, 1.05)
     ax1.set_title('各类别准确率 & F1', fontweight='bold')
     ax1.grid(True, alpha=0.3, axis='y')
@@ -180,7 +179,7 @@ def plot_per_class_metrics(df, save_path):
         ax2.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 0.02,
                  f'{v:.3f}', ha='center', fontsize=7.5, fontweight='bold')
     ax2.set_xticks(x)
-    ax2.set_xticklabels([f'{a}\n{ATTACK_NAMES_CN[a]}' for a in atks], fontsize=7)
+    ax2.set_xticklabels([f'{a}\n{ATTACK_NAMES[a]}' for a in atks], fontsize=7)
     ax2.set_ylabel('平均 softmax 置信度'); ax2.set_ylim(0, 1.1)
     ax2.set_title('各类别平均置信度', fontweight='bold')
     ax2.grid(True, alpha=0.3, axis='y')
@@ -207,7 +206,7 @@ def write_metrics_txt(output_dir, model_name, model_path, n_samples, cm_counts, 
         header = f"{'攻击':>6}  {'名称':<12}  {'准确率':>8}  {'精确率':>8}  {'召回率':>8}  {'F1':>8}  {'置信度':>8}  {'样本数':>8}"
         f.write(header + "\n" + "-" * 70 + "\n")
         for _, row in df.iterrows():
-            f.write(f"{row['attack_type']:>6}  {row['name_cn']:<12}  "
+            f.write(f"{row['attack_type']:>6}  {row['name_en']:<12}  "
                     f"{row['accuracy']*100:>7.1f}%  {row['precision']:>7.4f}  "
                     f"{row['recall']:>7.4f}  {row['f1_score']:>7.4f}  "
                     f"{row['mean_confidence']:>7.3f}  {int(row['n_samples']):>8,}\n")
@@ -240,7 +239,7 @@ def generate_markdown_report(output_dir, model_name, model_path, n_samples, cm_c
         "|------|------|--------|--------|--------|-----|--------|--------|",
     ]
     for _, row in df.iterrows():
-        lines.append(f"| {row['attack_type']} | {row['name_cn']} | "
+        lines.append(f"| {row['attack_type']} | {row['name_en']} | "
                      f"{row['accuracy']*100:.1f}% | {row['precision']:.4f} | "
                      f"{row['recall']:.4f} | {row['f1_score']:.4f} | "
                      f"{row['mean_confidence']:.3f} | {int(row['n_samples']):,} |")
@@ -258,9 +257,9 @@ def generate_markdown_report(output_dir, model_name, model_path, n_samples, cm_c
     worst_idx = df['f1_score'].idxmin()
     lines.extend(["", "## 关键发现", "",
                   f"- **最佳分类**: {df.loc[best_idx, 'attack_type']} "
-                  f"({df.loc[best_idx, 'name_cn']}), F1={df.loc[best_idx, 'f1_score']:.4f}",
+                  f"({df.loc[best_idx, 'name_en']}), F1={df.loc[best_idx, 'f1_score']:.4f}",
                   f"- **最差分类**: {df.loc[worst_idx, 'attack_type']} "
-                  f"({df.loc[worst_idx, 'name_cn']}), F1={df.loc[worst_idx, 'f1_score']:.4f}", ""])
+                  f"({df.loc[worst_idx, 'name_en']}), F1={df.loc[worst_idx, 'f1_score']:.4f}", ""])
 
     with open(save_path, 'w', encoding='utf-8') as f:
         f.write('\n'.join(lines))

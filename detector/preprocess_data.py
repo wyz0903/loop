@@ -10,7 +10,8 @@ preprocess_data.py — 滑动窗口 + 归一化 + .npy 缓存
   - 抗泄漏: 同一 config 的所有窗口整体进入同一划分
   - IID 分层: 按轨迹族分层抽样 train/val/test = 70/15/15
 
-输出: dataset_win/X_*.npy, Y_*_cls.npy, Y_*_clean.npy, normalizer.npz, split_info.npz
+输出: dataset_win/<ts>/X_*.npy, Y_*_cls.npy, Y_*_clean.npy, normalizer.npz, split_info.npz
+      (output-dir 自动从 input-dir 推导: dataset/<ts>/ → dataset_win/<ts>/)
 """
 
 import os, sys, argparse
@@ -26,15 +27,26 @@ DATASET_DIR = os.path.join(PROJECT_ROOT, 'dataset')
 OUTPUT_DIR = os.path.join(PROJECT_ROOT, 'dataset_win')
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
+def _auto_output_dir(input_dir: str) -> str:
+    """从 input-dir 自动推断 output-dir: dataset/<ts>/ → dataset_win/<ts>/"""
+    input_abs = os.path.abspath(input_dir)
+    dataset_abs = os.path.abspath(DATASET_DIR)
+    if input_abs.startswith(dataset_abs) and len(input_abs) > len(dataset_abs):
+        suffix = input_abs[len(dataset_abs):].lstrip(os.sep)
+        if suffix:
+            return os.path.join(OUTPUT_DIR, suffix)
+    return OUTPUT_DIR
+
 from attack import ALL_ATTACK_TYPES, ATTACK_NAMES
 
-WINDOW_SIZE = 100
-STRIDE = 1
+WINDOW_SIZE = 128
+STRIDE = 10
 TRAIN_RATIO = 0.70
 VAL_RATIO = 0.15
 SPLIT_SEED = 42
 
 Y_MEAS_SCALE = np.array([2.5, 2.5, np.pi], dtype=np.float32)
+INNOV_SCALE = np.array([0.5, 0.5, 0.3], dtype=np.float32)    # 物理异常阈值
 PHYSICAL_MAX = np.array([0.3, 1.76], dtype=np.float32)
 
 ATTACK_EPS = 1e-6
@@ -42,13 +54,13 @@ MIN_ACTIVE_RATIO = 0.05
 
 
 class RobustNormalizer:
-    """物理锚点归一化器: y_meas/innov → 工作空间尺度, u_cmd → 控制上限"""
+    """物理锚点归一化器: y_meas→工作空间尺度, innov→异常阈值, u_cmd→控制上限"""
 
     def __init__(self):
         self.ymeas_median = None
         self.ymeas_scale = Y_MEAS_SCALE.copy()
         self.feat_median = None
-        self.feat_scale = Y_MEAS_SCALE.copy()
+        self.feat_scale = INNOV_SCALE.copy()
         self.cmd_max = PHYSICAL_MAX.copy()
 
     def fit(self, X):
@@ -115,11 +127,14 @@ def main():
     parser.add_argument('--window', type=int, default=WINDOW_SIZE)
     parser.add_argument('--stride', type=int, default=STRIDE)
     parser.add_argument('--input-dir', type=str, default=DATASET_DIR)
-    parser.add_argument('--output-dir', type=str, default=OUTPUT_DIR)
+    parser.add_argument('--output-dir', type=str, default=None,
+                        help='输出目录 (默认: 从 input-dir 自动推导)')
     parser.add_argument('--train-ratio', type=float, default=TRAIN_RATIO)
     parser.add_argument('--val-ratio', type=float, default=VAL_RATIO)
     parser.add_argument('--split-seed', type=int, default=SPLIT_SEED)
     args = parser.parse_args()
+    if args.output_dir is None:
+        args.output_dir = _auto_output_dir(args.input_dir)
     os.makedirs(args.output_dir, exist_ok=True)
 
     df = pd.read_csv(os.path.join(args.input_dir, 'metadata.csv'))
@@ -190,7 +205,10 @@ def main():
                 w_end = w * args.stride + args.window
                 if w_end > onset and w * args.stride < offset:
                     mag = np.linalg.norm(y_clean_w[w] - X_w[w, :, :3], axis=1)
-                    if np.mean(mag > ATTACK_EPS) >= MIN_ACTIVE_RATIO:
+                    if atk_type == 'A5':
+                        if np.any(mag > ATTACK_EPS):
+                            cls_arr[w] = atk_label
+                    elif np.mean(mag > ATTACK_EPS) >= MIN_ACTIVE_RATIO:
                         cls_arr[w] = atk_label
 
         bucket_X.append(X_w)
