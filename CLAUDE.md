@@ -104,7 +104,7 @@ ReferenceTrajectory(参考轨迹) → NMPC → u_cmd → WMRKinematics(RK4运动
 | `simulate.py`                 | 统一闭环仿真：NN检测器 / 无检测器基线 / 五族轨迹对比                                                                                      |
 | `generate_dataset.py`         | 开环数据生成：5 种随机轨迹系列 × 8 种攻击                                                                                                 |
 | `backend.py`                  | DetectorBackend 推理包装器：滑动窗口缓冲 + 内部运动学 + 分类 + 恢复策略路由                                                             |
-| `detector/detector.py`        | 检测模型定义：膨胀深度可分离卷积骨干 + 运动学一致性偏置注意力 + 物理引导解码器                              |
+| `detector/classifier.py`      | 检测模型定义：膨胀深度可分离卷积骨干 + 运动学一致性偏置注意力 + 物理引导解码器                              |
 | `detector/preprocess_data.py` | 128 步滑动窗口，物理锚点归一化 (RobustNormalizer)，防数据泄漏的文件级拆分                                                                  |
 | `detector/train.py`           | 检测模型训练脚本：L = L_cls + λ_recon*L_recon（联合训练，λ_recon=0.3，warmup=20 epoch，label smoothing 0.0），A0 每 epoch 随机降采样 |
 | `detector/evaluate.py`        | 测试集分类评估：混淆矩阵 + 逐类精度/召回/F1 + 置信度 + 汇总图 + Markdown 报告                                                              |

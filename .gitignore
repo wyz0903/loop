@@ -48,14 +48,12 @@ review/
 eval/
 detector/eval/
 
-# Literature PDF stash (all files — research content, not code)
-papers/
-
-# Utility scripts (Zotero import, bib manager, etc.)
-tools/
-
-# Knowledge base (literature notes, synthesis, workflow — research content, not code)
-knowledge/
+# Archive (research content — literature, tools, knowledge)
+_archive/
 
 # Persistent memory (Claude session memory)
 memory/
+
+# Simulation and recovery artifacts
+simulate_results/
+detector/recovery_models/

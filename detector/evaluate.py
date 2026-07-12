@@ -48,7 +48,7 @@ def parse_args():
 
 
 def load_model(weight_path: str, device: torch.device):
-    from detector.detector import Detector
+    from detector.classifier import Detector
     model = Detector().to(device)
     model.load_state_dict(torch.load(weight_path, map_location=device, weights_only=True), strict=False)
     model.eval()

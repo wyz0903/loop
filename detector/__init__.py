@@ -7,6 +7,6 @@ detector — 攻击检测器模型定义与训练评估
   Detector — 攻击分类检测器
 """
 
-from detector.detector import Detector
+from detector.classifier import Detector
 
 __all__ = ['Detector']

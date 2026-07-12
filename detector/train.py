@@ -23,7 +23,7 @@ import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 
-from detector.detector import Detector
+from detector.classifier import Detector
 from attack import ALL_ATTACK_TYPES, ATTACK_NAMES
 DATA_DIR = os.path.join(SCRIPT_DIR, '..', 'dataset_win')
 MODEL_DIR = os.path.join(SCRIPT_DIR, 'models')

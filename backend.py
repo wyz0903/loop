@@ -146,7 +146,7 @@ class DetectorBackend:
     # ------------------------------------------------------------------
 
     def _load_model(self, model_path: str):
-        from detector.detector import Detector
+        from detector.classifier import Detector
 
         model = Detector()
         state_dict = torch.load(model_path, map_location=self._device, weights_only=True)

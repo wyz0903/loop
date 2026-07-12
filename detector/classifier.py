@@ -1,5 +1,5 @@
 """
-detector/detector.py — 攻击检测模型
+detector/classifier.py — 攻击检测模型
 ====================================
 8 通道输入: [y_meas(3) + innov_anchored(3) + u_cmd(2)]
 输出: cls_logits (B,8), y_pred (B,100,3)
