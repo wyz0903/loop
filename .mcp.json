@@ -1,0 +1,40 @@
+{
+  "mcpServers": {
+    "sequential-thinking": {
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-sequential-thinking"]
+    },
+    "context7": {
+      "command": "npx",
+      "args": ["-y", "@upstash/context7-mcp"]
+    },
+    "arxiv-mcp-server": {
+      "command": "uvx",
+      "args": ["arxiv-mcp-server"]
+    },
+    "filesystem": {
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-filesystem", "D:\\AAAmyProject"]
+    },
+    "fetch": {
+      "command": "npx",
+      "args": ["-y", "mcp-fetch-server"]
+    },
+    "memory": {
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-memory"]
+    },
+    "time": {
+      "command": "npx",
+      "args": ["-y", "@guanxiong/mcp-server-time"]
+    },
+    "zotero": {
+      "command": "D:\\anaconda\\envs\\learning&control\\Scripts\\zotero-mcp.exe",
+      "env": {
+        "ZOTERO_LOCAL": "true",
+        "NO_PROXY": "localhost,127.0.0.1",
+        "no_proxy": "localhost,127.0.0.1"
+      }
+    }
+  }
+}
