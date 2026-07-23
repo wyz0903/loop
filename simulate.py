@@ -1,10 +1,10 @@
 """
-simulate.py — WMR 闭环仿真 (含 CFM 检测器集成)
+simulate.py — WMR 闭环仿真 (含检测器集成)
 ================================================
-统一的闭环仿真脚本，支持: 正常运行 / 攻击场景 / CFM 检测器介入。
+统一的闭环仿真脚本，支持: 正常运行 / 攻击场景 / 检测器介入。
 
 模式:
-  python simulate.py                        # CFM 模式 (默认 A1, lissajous)
+  python simulate.py                        # 检测器模式 (默认 A1, lissajous)
   python simulate.py --no-detector          # 无检测器基线
   python simulate.py --attack A1            # 指定攻击类型
   python simulate.py --all                  # 批量所有 8 种攻击
@@ -29,7 +29,7 @@ plt.rcParams['axes.unicode_minus'] = False
 from model import (WMRParams, WMRKinematics, SensorSimulator,
                    RandomizedTrajectory, SIM_STEPS)
 from controller import NMPCController, NMPCParams
-from attack import SensorAttack, ALL_ATTACK_TYPES, ATTACK_NAMES
+from attack import SensorAttack, AttackConfig, ALL_ATTACK_TYPES, ATTACK_NAMES
 from backend import DetectorBackend
 
 # ============================================================================
@@ -39,8 +39,11 @@ from backend import DetectorBackend
 # 仿真总时长与步数严格对齐 model.SIM_STEPS，避免标签与实际不一致
 SIM_TIME = SIM_STEPS * WMRParams().Ts   # = 1000 * 0.05 = 50.0 s
 ATTACK_ONSET_DEFAULT = 15.0
-ATTACK_ONSET_MIN = 5.0
-ATTACK_ONSET_MAX = 30.0
+ATTACK_ONSET_MIN = 10.0
+ATTACK_ONSET_MAX = 40.0
+# 攻击协议与数据集生成 (generate_dataset.py) 完全统一: 时长 5.0s (100 步 < 窗口 128 步)
+# → 任何窗口恒含干净步; onset ∈ [10, 40]s
+ATTACK_DURATION = 5.0
 RESULT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'results')
 os.makedirs(RESULT_DIR, exist_ok=True)
 
@@ -90,8 +93,8 @@ def run_simulation(attack_type: str = 'A1',
         use_detector:    True=DetectorBackend, False=y_meas 直送 NMPC
         trajectory_type: 轨迹类型 lissajous/circular/spiral/random_waypoint/square
         seed:            随机种子
-        attack_onset:    攻击起始时间 [s] (None=随机[5,30]s, A0=永不攻击)
-        model_path:      CFM 模型权重路径
+        attack_onset:    攻击起始时间 [s] (None=随机[10,40]s, A0=永不攻击)
+        model_path:      检测器模型权重路径
         norm_path:       归一化参数路径
 
     Returns:
@@ -111,6 +114,7 @@ def run_simulation(attack_type: str = 'A1',
         attack_onset = float(rng.uniform(ATTACK_ONSET_MIN, ATTACK_ONSET_MAX))
     if attack_type == 'A0':
         attack_onset = SIM_TIME + 1.0  # 永不攻击
+    attack_offset = attack_onset + ATTACK_DURATION
 
     robot = WMRKinematics(wmr_params)
     sensor = SensorSimulator()
@@ -118,7 +122,9 @@ def run_simulation(attack_type: str = 'A1',
     ctrl.load_or_build()
 
     attacker = SensorAttack(attack_type=attack_type,
-                            onset_time=attack_onset, seed=seed)
+                            onset_time=attack_onset,
+                            config=AttackConfig(attack_duration=ATTACK_DURATION),
+                            seed=seed)
 
     # 检测器
     detector = None
@@ -171,7 +177,7 @@ def run_simulation(attack_type: str = 'A1',
             det_conf = result.confidence
             det_attack_est = result.attack_estimate
 
-        # 4. 状态估计 = 恢复后的测量 (替代 EKF)
+        # 4. 状态估计 = 检测器输出 (测量直通)
         # y_rec 直接作为位姿估计，送入 NMPC
 
         # 5. 跟踪误差
@@ -204,12 +210,12 @@ def run_simulation(attack_type: str = 'A1',
         data['det_class'].append(det_class)
         data['det_conf'].append(det_conf)
         data['det_attack_est'].append(det_attack_est.copy())
-        data['attack_active'].append(1.0 if (t >= attack_onset and attack_type != 'A0') else 0.0)
+        data['attack_active'].append(1.0 if (attack_onset <= t < attack_offset and attack_type != 'A0') else 0.0)
 
         # 进度
         if show_progress and (step % 200 == 0 or step == n_steps - 1):
             pos_err = np.linalg.norm(X_error[:2])
-            det_str = 'CFM' if use_detector else 'NONE'
+            det_str = 'DET' if use_detector else 'NONE'
             print(f"  [{det_str:3s}] t={t:5.1f}s | "
                   f"|e_xy|={pos_err:.4f}m | "
                   f"det={det_class} conf={det_conf:.2f}", flush=True)
@@ -227,6 +233,7 @@ def run_simulation(attack_type: str = 'A1',
     result['use_detector'] = use_detector
     result['trajectory_type'] = trajectory_type
     result['attack_onset'] = attack_onset
+    result['attack_offset'] = attack_offset
     return result
 
 
@@ -244,7 +251,10 @@ def compute_metrics(data: dict) -> dict:
     steady_start = max(int(5.0 / data['Ts']), 100)
     steady_end = onset_idx
 
-    post_pos = pos_err[onset_idx:] if onset_idx < len(pos_err) else pos_err[-100:]
+    # 攻击期窗口 [onset, offset): 与 generate_dataset 约定一致, 避免恢复期稀释
+    offset_idx = min(int(float(data.get('attack_offset', data['t'][-1] + 1.0)) / data['Ts']),
+                     len(pos_err))
+    post_pos = pos_err[onset_idx:offset_idx] if onset_idx < offset_idx else pos_err[-100:]
 
     return {
         'attack_type': data['attack_type'],
@@ -254,8 +264,8 @@ def compute_metrics(data: dict) -> dict:
                           if steady_end > steady_start else 0.0,
         'post_pos_rmse': float(np.sqrt(np.mean(post_pos ** 2))) if len(post_pos) > 0 else 0.0,
         'post_pos_max': float(np.max(post_pos)) if len(post_pos) > 0 else 0.0,
-        'post_ang_rmse': float(np.sqrt(np.mean(ang_err[onset_idx:] ** 2)))
-                        if onset_idx < len(ang_err) else 0.0,
+        'post_ang_rmse': float(np.sqrt(np.mean(ang_err[onset_idx:offset_idx] ** 2)))
+                        if onset_idx < offset_idx else 0.0,
         'use_detector': data.get('use_detector', True),
     }
 
@@ -263,17 +273,19 @@ def compute_metrics(data: dict) -> dict:
 def compute_detector_metrics(data: dict) -> dict:
     """计算检测器 DL 指标"""
     onset_idx = _get_onset_idx(data)
+    offset_idx = min(int(float(data.get('attack_offset', data['t'][-1] + 1.0)) / data['Ts']),
+                     len(data['det_class']))
     attack_type = data['attack_type']
     det_classes = data['det_class']
     det_confs = data['det_conf']
 
-    post_classes = det_classes[onset_idx:]
-    post_confs = det_confs[onset_idx:]
+    post_classes = det_classes[onset_idx:offset_idx]
+    post_confs = det_confs[onset_idx:offset_idx]
 
     if len(post_classes) == 0:
         return {'detection_accuracy': 0.0, 'mean_confidence': 0.0,
                 'detection_latency_steps': 999, 'detection_latency_sec': 99.0,
-                'false_alarm_rate': 0.0, 'recovery_rmse': 0.0}
+                'false_alarm_rate': 0.0}
 
     correct = sum(1 for c in post_classes if str(c) == attack_type)
     accuracy = correct / len(post_classes)
@@ -293,17 +305,12 @@ def compute_detector_metrics(data: dict) -> dict:
     else:
         far = 0.0
 
-    y_rec_arr = data['y_rec'][onset_idx:]
-    true_arr = data['true_state'][onset_idx:]
-    recovery_rmse = float(np.sqrt(np.mean(np.sum((y_rec_arr - true_arr) ** 2, axis=1))))
-
     return {
         'detection_accuracy': accuracy,
         'mean_confidence': mean_conf,
         'detection_latency_steps': latency_steps,
         'detection_latency_sec': latency_steps * data['Ts'],
         'false_alarm_rate': far,
-        'recovery_rmse': recovery_rmse,
     }
 
 
@@ -348,7 +355,7 @@ def plot_results(data: dict, save_path: str = None):
             alpha=0.9, label='Robot (actual)')
     if use_det:
         ax.plot(est[:, 0], est[:, 1], color='#9467bd', linewidth=1.0, alpha=0.6,
-                label='Estimate (recovered)')
+                label='Measurement (detector)')
     # 起点 / 终点标记
     ax.scatter(true_state[0, 0], true_state[0, 1], c='#2ca02c', s=110, marker='o',
                zorder=6, edgecolors='white', linewidths=1.3, label='Start')
@@ -651,7 +658,7 @@ def run_batch(attack_types: list = None,
         )
 
         # 保存 NPZ
-        det_str = 'cfm' if use_detector else 'none'
+        det_str = 'det' if use_detector else 'none'
         fname = f'sim_{atk}_{trajectory_type}_{det_str}.npz'
         save_dict = {}
         for k, v in data.items():
@@ -667,7 +674,7 @@ def run_batch(attack_types: list = None,
             metrics.update(compute_detector_metrics(data))
         all_metrics.append(metrics)
 
-        print(f"  Post-Attack RMSE: {metrics['post_pos_rmse']:.4f}m", end='')
+        print(f"  Attack-Phase RMSE: {metrics['post_pos_rmse']:.4f}m", end='')
         if use_detector and 'detection_accuracy' in metrics:
             print(f" | Det Acc: {metrics['detection_accuracy']:.1%}", end='')
         print()
@@ -695,14 +702,14 @@ def run_batch(attack_types: list = None,
 
 def main():
     parser = argparse.ArgumentParser(
-        description='WMR Closed-Loop Simulation with CFM Detector')
+        description='WMR Closed-Loop Simulation with Detector')
 
     parser.add_argument('--attack', type=str, default='A1',
                         help='Attack type A0-A7 (default: A1)')
     parser.add_argument('--all', action='store_true',
                         help='Run all 8 attack types')
     parser.add_argument('--no-detector', action='store_true',
-                        help='Disable CFM detector (direct y_meas to NMPC)')
+                        help='Disable detector (direct y_meas to NMPC)')
     parser.add_argument('--trajectory', type=str, default='lissajous',
                         choices=TRAJECTORY_FAMILIES,
                         help='Reference trajectory type (default: lissajous)')
@@ -713,9 +720,9 @@ def main():
     parser.add_argument('--seed', type=int, default=42,
                         help='Random seed (default: 42)')
     parser.add_argument('--no-randomize-onset', action='store_true',
-                        help='Use fixed onset (15s) instead of randomized [5,30]s')
+                        help='Use fixed onset (15s) instead of randomized [10,40]s')
     parser.add_argument('--model-path', type=str, default=None,
-                        help='CFM model weights path')
+                        help='Detector model weights path')
     parser.add_argument('--norm-path', type=str, default=None,
                         help='Normalizer params path')
 
@@ -729,7 +736,7 @@ def main():
     print("=" * 60)
     print(f"  Sim Time: {SIM_TIME}s")
     print(f"  Trajectory: {args.trajectory}")
-    print(f"  Detector: {'CFM' if use_detector else 'None (baseline)'}")
+    print(f"  Detector: {'Enabled' if use_detector else 'None (baseline)'}")
     print(f"  Seed: {args.seed}")
 
     # 五族轨迹对比
@@ -741,7 +748,7 @@ def main():
     # 批量模式
     if args.all:
         print(f"  Mode: BATCH (all attacks)")
-        print(f"  Attack Onset: {'randomized [5,30]s' if randomize_onset else f'{ATTACK_ONSET_DEFAULT}s (fixed)'}")
+        print(f"  Attack Onset: {'randomized [10,40]s' if randomize_onset else f'{ATTACK_ONSET_DEFAULT}s (fixed)'}")
         run_batch(trajectory_type=args.trajectory, seed=args.seed,
                   use_detector=use_detector, randomize_onset=randomize_onset,
                   do_plot=not args.no_plot,
@@ -773,8 +780,9 @@ def main():
     X_err = data['X_error']
     if _has_attack(data):
         onset_idx = _get_onset_idx(data)
-        seg = np.sqrt(X_err[onset_idx:, 0] ** 2 + X_err[onset_idx:, 1] ** 2)
-        rmse_label = 'Post-attack RMSE'
+        offset_idx = min(int(float(data['attack_offset']) / data['Ts']), len(X_err))
+        seg = np.sqrt(X_err[onset_idx:offset_idx, 0] ** 2 + X_err[onset_idx:offset_idx, 1] ** 2)
+        rmse_label = 'Attack-phase RMSE'
     else:
         steady = max(int(5.0 / data['Ts']), 100)
         seg = np.sqrt(X_err[steady:, 0] ** 2 + X_err[steady:, 1] ** 2)
@@ -785,17 +793,17 @@ def main():
     print(f"\n{'='*60}")
     print("RESULTS SUMMARY")
     print(f"{'='*60}")
-    print(f"  Detector: {'CFM' if use_detector else 'None'}")
+    print(f"  Detector: {'Enabled' if use_detector else 'None'}")
     print(f"  {rmse_label}: {rmse:.4f}m, Max: {max_err:.4f}m")
 
     if use_detector:
         det_m = compute_detector_metrics(data)
         print(f"  Detection Acc: {det_m['detection_accuracy']:.1%}, "
               f"Latency: {det_m['detection_latency_sec']:.2f}s, "
-              f"Recovery RMSE: {det_m['recovery_rmse']:.4f}m")
+              f"False Alarm: {det_m['false_alarm_rate']:.1%}")
 
     # 保存 NPZ
-    det_str = 'cfm' if use_detector else 'none'
+    det_str = 'det' if use_detector else 'none'
     fname = f'sim_{args.attack}_{args.trajectory}_{det_str}.npz'
     save_dict = {}
     for k, v in data.items():

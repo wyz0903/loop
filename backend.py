@@ -1,19 +1,14 @@
 """
 backend.py — 攻击检测器推理后端
 ================================
-推理: 滑动窗口 + 分类 + 物理引导解码器重建 → 恢复路由策略。
-
-恢复策略:
-  - A0 (正常) → y_meas 直通
-  - 低置信度 → y_meas 直通
-  - 检测到攻击 → 解码器重建 (运动学递推 + 学习修正)
+推理: 滑动窗口 + 8 类攻击分类 (A0-A7)，纯检测，无恢复。
 """
 
 import os
 import numpy as np
 from dataclasses import dataclass, field
 from collections import deque
-from typing import Dict, Optional, Tuple
+from typing import Dict
 
 import torch
 
@@ -42,17 +37,19 @@ class DetectorBackend:
     """攻击检测器推理后端 — 对控制系统透明。
 
     8 通道输入: [y_meas(3) + innov(3) + u_cmd(2)]
-    检测到攻击时通过解码器重建位姿估计。
+    纯检测: 输出攻击类别与置信度，测量值直通。
     """
-
-    CONFIDENCE_THRESHOLD = 0.5
 
     def __init__(self, model_path: str = None, norm_path: str = None,
                  window_size: int = WINDOW_SIZE, device: str = None):
         if model_path is None:
             model_path = os.path.join(SCRIPT_DIR, 'detector', 'models', 'nn_cls_best.pt')
         if norm_path is None:
-            norm_path = os.path.join(SCRIPT_DIR, 'dataset_win', 'normalizer.npz')
+            # 自动解析最新预处理批次 dataset_win/<ts>/normalizer.npz
+            win_root = os.path.join(SCRIPT_DIR, 'dataset_win')
+            batches = sorted(d for d in os.listdir(win_root)
+                             if os.path.exists(os.path.join(win_root, d, 'normalizer.npz')))
+            norm_path = os.path.join(win_root, batches[-1], 'normalizer.npz')
 
         self.window_size = window_size
         self._device = torch.device(device or ('cuda' if torch.cuda.is_available() else 'cpu'))
@@ -67,9 +64,6 @@ class DetectorBackend:
             cmd_max=self._cmd_max, feat_median=self._feat_median,
             feat_scale=self._feat_scale)
 
-        self._has_decoder = self._model.use_decoder and self._model.decoder is not None
-
-        self._internal_state = np.array([0.0, 0.1, 0.0])
         self._u_cmd = np.zeros(2)
         self._step_count = 0
         self._ymeas_buffer = deque(maxlen=window_size)
@@ -86,36 +80,26 @@ class DetectorBackend:
         self._ymeas_buffer.append(y_meas.copy())
         self._ucmd_buffer.append(self._u_cmd.copy())
 
-        y_kin_pred = WMRKinematics.kinematic_predict(self._internal_state, self._u_cmd)
-        self._internal_state = y_meas.copy()
-
         if not self._is_window_ready():
             return DetectionResult(
                 attack_class='A0', confidence=0.0,
                 y_recovered=y_meas.copy(), attack_estimate=np.zeros(3),
                 features={'status': 'window_filling'})
 
-        x_tensor = self._build_input_tensor()
-        attack_class, confidence, feat_tensor = self._classify(x_tensor)
-
-        delta = np.zeros(3)
-        y_decoded = None
-        if confidence >= self.CONFIDENCE_THRESHOLD and attack_class != 'A0':
-            y_decoded, delta = self._reconstruct(feat_tensor, x_tensor)
-
-        y_recovered = self._recover(y_meas, attack_class, confidence, y_kin_pred, y_decoded)
-        self._internal_state = y_recovered.copy()
+        ymeas_window = np.array(list(self._ymeas_buffer))
+        ucmd_window = np.array(list(self._ucmd_buffer))
+        x_tensor = self._build_input_tensor(ymeas_window, ucmd_window)
+        attack_class, confidence = self._classify(x_tensor)
 
         return DetectionResult(
             attack_class=attack_class, confidence=confidence,
-            y_recovered=y_recovered, attack_estimate=delta,
+            y_recovered=y_meas.copy(), attack_estimate=np.zeros(3),
             features={'step': self._step_count})
 
     def set_control(self, u_cmd: np.ndarray) -> None:
         self._u_cmd = np.asarray(u_cmd, dtype=float).ravel()
 
     def reset(self) -> None:
-        self._internal_state = np.array([0.0, 0.1, 0.0])
         self._u_cmd = np.zeros(2)
         self._step_count = 0
         self._ymeas_buffer.clear()
@@ -172,45 +156,20 @@ class DetectorBackend:
         ucmd_norm = ucmd_window / self._cmd_max
         return np.concatenate([ymeas_norm, innov_norm, ucmd_norm], axis=1)
 
-    def _build_input_tensor(self) -> torch.Tensor:
-        ymeas_window = np.array(list(self._ymeas_buffer))
-        ucmd_window = np.array(list(self._ucmd_buffer))
+    def _build_input_tensor(self, ymeas_window: np.ndarray,
+                            ucmd_window: np.ndarray) -> torch.Tensor:
         innov_window = self._compute_innovation_window(ymeas_window, ucmd_window)
         x_norm = self._normalize(ymeas_window, innov_window, ucmd_window)
         return torch.from_numpy(x_norm.astype(np.float32)).unsqueeze(0).to(self._device)
 
     # ------------------------------------------------------------------
-    # 内部: 分类 + 重建
+    # 内部: 分类
     # ------------------------------------------------------------------
 
     def _classify(self, x_tensor: torch.Tensor):
         with torch.no_grad():
-            cls_logits, features = self._model(x_tensor, return_recon=False)
+            cls_logits, _ = self._model(x_tensor, return_recon=False)
         probs = torch.softmax(cls_logits, dim=1).cpu().numpy()[0]
         pred_cls = int(probs.argmax())
-        return ALL_ATTACK_TYPES[pred_cls], float(probs[pred_cls]), features
+        return ALL_ATTACK_TYPES[pred_cls], float(probs[pred_cls])
 
-    def _reconstruct(self, features: torch.Tensor, x_tensor: torch.Tensor
-                     ) -> Tuple[np.ndarray, np.ndarray]:
-        """解码器重建, 返回 (y_decoded(3,), delta(3,))"""
-        if not self._has_decoder:
-            return None, np.zeros(3)
-        with torch.no_grad():
-            y_pred, delta_pred = self._model.decode(features, x_tensor)
-            y_decoded = y_pred[0, -1, :].cpu().numpy()
-            delta = delta_pred[0, -1, :].cpu().numpy()
-            y_decoded[2] = np.arctan2(np.sin(y_decoded[2]), np.cos(y_decoded[2]))
-        return y_decoded, delta
-
-    # ------------------------------------------------------------------
-    # 内部: 恢复路由
-    # ------------------------------------------------------------------
-
-    def _recover(self, y_meas: np.ndarray, attack_class: str,
-                 confidence: float, y_kin_pred: np.ndarray,
-                 y_decoded: Optional[np.ndarray] = None) -> np.ndarray:
-        if confidence < self.CONFIDENCE_THRESHOLD or attack_class == 'A0':
-            return y_meas.copy()
-        if y_decoded is not None:
-            return y_decoded.copy()
-        return y_kin_pred.copy()

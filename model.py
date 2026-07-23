@@ -30,7 +30,7 @@ class WMRParams:
       v_max = 0.3  : 最大线速度 m/s (配置文档 Section 3.1)
       w_max = 1.76 : 最大角速度 rad/s (配置文档 Section 3.1)
     """
-    # TurtleBot4 安全模式 (Section IV): v_max = 0.3 m/s, ω_max = b = a/α ≈ 1.76 rad/s
+    # TurtleBot4 安全模式: v_max = 0.3 m/s, ω_max = b = a/α ≈ 1.76 rad/s
     alpha: float = 0.17        # 前端偏置距离 [m] (α = a/b = 0.3/1.76)
     Ts: float = 0.05           # 采样时间 [s]
     v_max: float = 0.3         # 线速度上限 [m/s] (= a, 论文 U 约束)
@@ -68,7 +68,6 @@ def _rk4_front_axle(x: float, y: float, theta: float, v: float, w: float, Ts: fl
     tn = np.arctan2(np.sin(tn), np.cos(tn))
     return xn, yn, tn
 
-
 class RandomizedTrajectory:
     """5族随机参数参考轨迹生成器（数据集生成 + 仿真统一入口）
 
@@ -83,10 +82,10 @@ class RandomizedTrajectory:
       'square'          : 正方形(圆角) — 边长随机，直行+90°圆弧转弯
     """
 
-    # 默认参数（use_defaults=True 时使用，对应旧 LissajousTrajectory / CircularTrajectory 行为）
+    # 默认参数（use_defaults=True 时使用，满足 _verify_and_center_trajectory 边界门限 [1.0, 2.5]m）
     _DEFAULTS = {
-        'lissajous':       dict(v_const=0.15, w_freq=0.3),
-        'circular':        dict(v_const=0.15, w_const=0.2),
+        'lissajous':       dict(v_const=0.15, w_freq=0.16),
+        'circular':        dict(v_const=0.15, w_const=0.10),
         'spiral':          dict(_spiral_R0=0.10, _spiral_Rmax=1.5, _spiral_v=0.20, _spiral_dir=1),
         'random_waypoint': dict(v_const=0.20),
         'square':          dict(_sq_side=2.0, _sq_v_straight=0.25, _sq_v_turn=0.15, _sq_w_turn=1.0),
@@ -392,13 +391,13 @@ class WMRKinematics:
     状态: Upsilon_h = [x_h, y_h, theta_h]
     控制: u = [v_c, w_c]
     
-    连续运动学方程 (论文 Eq.1-2):
+    连续运动学方程:
       d(Upsilon_h)/dt = F_h(theta_h) * u
       F_h = [cos(th)  -alpha*sin(th)
              sin(th)   alpha*cos(th)
              0         1            ]
     
-    误差动力学 (论文 Eq.7-10):
+    误差动力学:
       X = [x_e, y_e, theta_e] 在机器人本体坐标系下
       dX/dt = f(X, u_r) + G(X) * u
     """
@@ -411,7 +410,7 @@ class WMRKinematics:
         """重置机器人状态~
         
         Args:
-            init_state: 初始位姿 [x, y, theta]，默认 [0, 0.1, 0] (配置文档 2.3)
+            init_state: 初始位姿 [x, y, theta]，默认 [0, 0.1, 0]
         """
         if init_state is None:
             self.state = np.array([0.0, 0.1, 0.0])
@@ -503,7 +502,7 @@ class WMRKinematics:
 
     @staticmethod
     def compute_error(Upsilon_r: np.ndarray, Upsilon_h: np.ndarray) -> np.ndarray:
-        """计算机器人本体坐标系下的跟踪误差 (论文 Eq.5-6)
+        """计算机器人本体坐标系下的跟踪误差
         
         Args:
             Upsilon_r: 参考位姿 [x_r, y_r, theta_r]

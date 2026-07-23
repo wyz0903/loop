@@ -4,7 +4,7 @@
 
 ## 项目概要
 
-这是一个用于**轮式移动机器人（WMR）传感器攻击检测与恢复**的研究仿真系统。一个类似TurtleBot4的差速驱动机器人在NMPC控制下跟踪参考轨迹，同时其传感器测量数据可能在随机时刻受到攻击。一个基于膨胀深度可分离卷积骨干 + 运动学一致性偏置注意力的分类检测器用于分类攻击类型（8类: A0-A7），检测到攻击时通过解码器重建位姿估计（运动学递推 + 学习修正）。
+这是一个用于**轮式移动机器人（WMR）传感器攻击检测**的研究仿真系统。一个类似TurtleBot4的差速驱动机器人在NMPC控制下跟踪参考轨迹，同时其传感器测量数据可能在随机时刻受到攻击。一个基于膨胀深度可分离卷积骨干 + 运动学一致性偏置注意力的分类检测器用于分类攻击类型（8类: A0-A7）。
 
 ## 工作习惯
 
@@ -84,9 +84,7 @@ ReferenceTrajectory(参考轨迹) → NMPC → u_cmd → WMRKinematics(RK4运动
                                  滑动窗口: [y_meas(3) + innov_anchored(3) + u_cmd(2)] = 8 通道
                                  MultiScaleDSConvBackbone (3块膨胀深度可分离卷积, 自适应K)
                                    → 运动学一致性偏置注意力 → 8 类 softmax (A0-A7)
-                                 恢复策略: A0/低置信度 → y_meas 直通; 攻击 → 解码器重建 (y_kin + delta_pred)
-                                        ↓
-                               y_rec → 直接作为位姿估计 (替代 EKF)
+                                 y_meas 直通 → 位姿估计
                                         ↓
                                compute_error(Upsilon_r, X_hat) → X_error(误差状态)
                                         ↓
@@ -103,12 +101,12 @@ ReferenceTrajectory(参考轨迹) → NMPC → u_cmd → WMRKinematics(RK4运动
 | `attack.py`                   | 7 种传感器攻击类型 (A1–A7) + 正常情况 (A0)；统一的`inject()` 注入接口                                                                     |
 | `simulate.py`                 | 统一闭环仿真：NN检测器 / 无检测器基线 / 五族轨迹对比                                                                                      |
 | `generate_dataset.py`         | 开环数据生成：5 种随机轨迹系列 × 8 种攻击                                                                                                 |
-| `backend.py`                  | DetectorBackend 推理包装器：滑动窗口缓冲 + 内部运动学 + 分类 + 恢复策略路由                                                             |
+| `backend.py`                  | DetectorBackend 推理包装器：滑动窗口缓冲 + 8 类攻击分类（纯检测，无恢复）                                              |
 | `detector/classifier.py`      | 检测模型定义：膨胀深度可分离卷积骨干 + 运动学一致性偏置注意力 + 物理引导解码器                              |
 | `detector/preprocess_data.py` | 128 步滑动窗口，物理锚点归一化 (RobustNormalizer)，防数据泄漏的文件级拆分                                                                  |
 | `detector/train.py`           | 检测模型训练脚本：L = L_cls + λ_recon*L_recon（联合训练，λ_recon=0.3，warmup=20 epoch，label smoothing 0.0），A0 每 epoch 随机降采样 |
 | `detector/evaluate.py`        | 测试集分类评估：混淆矩阵 + 逐类精度/召回/F1 + 置信度 + 汇总图 + Markdown 报告                                                              |
-| `detector/models/`            | 训练好的模型权重 (nn_cls_best.pt, nn_cls_config.npz)                                                                                     |
+| `detector/models/`            | 训练好的模型权重 (nn_cls_best.pt)                                                                                                        |
 
 | `app/interactive_app.py` | tkinter 交互式 GUI：轨迹/攻击自由组合 + 时间滑块回放 + 6面板实时显示 |
 
@@ -145,7 +143,7 @@ ReferenceTrajectory(参考轨迹) → NMPC → u_cmd → WMRKinematics(RK4运动
 - **物理锚点归一化 (Physical-Anchor Normalization)**：y_meas 用工作空间边界 [2.5m, 2.5m, π] 作为尺度锚点，创新通道用物理异常阈值 [0.5m, 0.5m, 0.3rad] 作为尺度。避免 IQR 归一化将常规攻击信号放大至 10³-10⁵ 导致梯度爆炸。物理含义清晰，论文可辩护。
 - **注意力池化分类头**：可学习的 attn_query 对特征序列加权求和，自适应地聚焦于攻击窗口最具判别力的时间步，替代简单的全局平均池化。
 - **联合训练**：L_cls + λ_recon * L_recon（λ_recon=0.3，warmup=20 epoch），label smoothing 0.0（关闭），无类别权重，通过每 epoch 随机降采样 50% A0 窗口平衡类别分布。
-- **恢复策略路由**：A0 正常或低置信度 (<0.5) → y_meas 直通；检测到攻击 (A1-A7) → 解码器重建 y_kin + delta_pred（物理引导：运动学递推 + 学习修正）。
+- **u_cmd 缓冲索引约定**：运行时 `_ucmd_buffer` slot j 存 `u_{j-1→j}`（simulate.py 中 detect 先于 set_control 调用），与训练数据 (y_k, u_{k→k+1}) 有一步错位。分类器输入保持现状（修正需重训）。
 - **防泄漏分层 IID 拆分**：按轨迹族分层抽样为 train/val/test (70/15/15)，同一 config 的所有窗口整体进入同一划分，保证各划分同分布且无信息泄漏。
 
 ### 物理常量（TurtleBot4 安全模式设定）
@@ -155,3 +153,4 @@ ReferenceTrajectory(参考轨迹) → NMPC → u_cmd → WMRKinematics(RK4运动
 - `Ts = 0.05 s` (20 Hz 控制频率), `T_sim = 50 s` (1000 步)
 - 空间安全边界：`±2.5 m` (x, y 位置硬限幅)
 - 传感器噪声：`σ_xy = 0.0 m`, `σ_θ = 0.0 rad`（关闭，简化问题）
+- 攻击协议（数据集生成与闭环仿真完全统一）：时长固定 `5.0s`（100 步），onset∈[10,40]s

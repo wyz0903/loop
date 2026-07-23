@@ -129,69 +129,6 @@ def load_dataset_configs(metadata_path: str) -> list[dict]:
 
 
 # ============================================================================
-# PerfectDetectorBackend — 理想检测器 (100% 检测, 运动学死推算恢复, 仅用于对比基线)
-# ============================================================================
-
-class PerfectDetectorBackend:
-    """理想检测器: 检测 100% 准确 (基于 ground truth)，恢复使用运动学死推算。
-
-    检测: 通过 set_ground_truth() 获知真实攻击状态 → detect() 返回 100% 正确的类别。
-    恢复: 攻击中完全开环运动学死推算 (不再使用 y_clean 作弊)，正常时信任传感器直通。
-    API 与 DetectorBackend 一致: detect(y_meas) → DetectionResult。
-    """
-
-    def __init__(self):
-        self._attack_type = 'A0'
-        self._attack_signal = np.zeros(3)
-        self._internal_state = np.zeros(3)    # [x, y, theta] 用于运动学死推算
-        self._u_cmd = np.zeros(2)             # [v, w] 控制指令缓存
-
-    def set_ground_truth(self, attack_type: str, attack_signal: np.ndarray):
-        """每步调用: 传入当前步的真实攻击信息 (由仿真循环提供)。"""
-        self._attack_type = attack_type
-        self._attack_signal = np.asarray(attack_signal, dtype=float).ravel()
-
-    def detect(self, y_meas: np.ndarray) -> 'DetectionResult':
-        """返回: 正确攻击类别 + 运动学死推算恢复 (不再使用 y_clean 作弊)。
-
-        检测仍为 100% 准确 (基于 ground truth attack_signal)。
-        恢复策略: 正常时信任传感器直通，攻击时完全开环运动学死推算。
-        """
-        from backend import DetectionResult
-        y_meas = np.asarray(y_meas, dtype=float).ravel()
-
-        # 根据真实攻击信号判断当前是否处于攻击中
-        is_under_attack = np.any(np.abs(self._attack_signal) > 1e-10)
-
-        if is_under_attack:
-            # 攻击中 → 完全开环运动学死推算, 不再相信传感器
-            X_pred = WMRKinematics.kinematic_predict(self._internal_state, self._u_cmd)
-            y_recovered = X_pred.copy()
-        else:
-            # 正常 → 信任传感器测量直通
-            y_recovered = y_meas.copy()
-
-        # 内部状态传播: 为下一步死推算做准备
-        self._internal_state = y_recovered.copy()
-
-        attack_class = self._attack_type if is_under_attack else 'A0'
-        attack_estimate = self._attack_signal.copy() if is_under_attack else np.zeros(3)
-
-        return DetectionResult(
-            attack_class=attack_class, confidence=1.0,
-            y_recovered=y_recovered,
-            attack_estimate=attack_estimate,
-            features={'detector': 'perfect'})
-
-    def set_control(self, u_cmd: np.ndarray) -> None:
-        self._u_cmd = np.asarray(u_cmd, dtype=float).ravel()
-
-    def reset(self) -> None:
-        self._internal_state = np.zeros(3)
-        self._u_cmd = np.zeros(2)
-
-
-# ============================================================================
 # SimulationWorker — 后台仿真线程
 # ============================================================================
 
@@ -217,7 +154,7 @@ class SimulationWorker(threading.Thread):
         self._attack_onset = attack_onset
         self._attack_duration = attack_duration
         self._sim_time = sim_time
-        self._detector_mode = detector_mode  # 'nn' | 'perfect' | 'none'
+        self._detector_mode = detector_mode  # 'nn' | 'none'
 
     def run(self):
         try:
@@ -280,8 +217,6 @@ class SimulationWorker(threading.Thread):
             else:
                 detector = DetectorBackend(model_path=nn_model, norm_path=norm_dir)
                 detector.reset()
-        elif detector_mode == 'perfect':
-            detector = PerfectDetectorBackend()
 
         # ---- 仿真循环 ----
         data = {
@@ -328,9 +263,6 @@ class SimulationWorker(threading.Thread):
                 det_conf = 0.0
                 det_attack_est = np.zeros(3)
             else:
-                # 理想检测器: 注入真实攻击信息
-                if isinstance(detector, PerfectDetectorBackend):
-                    detector.set_ground_truth(self._attack_type, attack_signal)
                 detector.set_control(u_cmd)
                 result = detector.detect(y_meas)
                 y_rec = result.y_recovered.copy()
@@ -516,12 +448,9 @@ class ControlPanel(ttk.Frame):
         ttk.Radiobutton(self._frame_attack, text='NN',
                         variable=self._detector_var, value='nn').grid(
             row=1, column=1, padx=2, pady=2, sticky='w')
-        ttk.Radiobutton(self._frame_attack, text='Perfect (理想)',
-                        variable=self._detector_var, value='perfect').grid(
-            row=1, column=2, padx=2, pady=2, sticky='w')
         ttk.Radiobutton(self._frame_attack, text='None',
                         variable=self._detector_var, value='none').grid(
-            row=1, column=3, padx=2, pady=2, sticky='w')
+            row=1, column=2, padx=2, pady=2, sticky='w')
 
         row += 1
 
@@ -772,7 +701,7 @@ class ControlPanel(ttk.Frame):
         return self._simtime_var.get()
 
     def get_detector_mode(self) -> str:
-        return self._detector_var.get()  # 'nn' | 'perfect' | 'none'
+        return self._detector_var.get()  # 'nn' | 'none'
 
     def set_progress(self, step: int, total: int, t: float, elapsed: float):
         self._progress['maximum'] = total
@@ -1005,7 +934,7 @@ class InteractiveApp(tk.Tk):
                     self._update_cursor(0)
                     atk = data.get('attack_type_label', 'A0')
                     det_mode = data.get('detector_mode', 'none')
-                    det_label = {'nn': 'NN', 'perfect': 'Perfect', 'none': 'None'}.get(det_mode, det_mode)
+                    det_label = {'nn': 'NN', 'none': 'None'}.get(det_mode, det_mode)
                     rmse = data.get('pos_rmse', 0)
                     self._detail_var.set(
                         f'仿真完成 | 攻击={atk} | 检测器={det_label} | RMSE={rmse:.4f}m | '
