@@ -89,21 +89,6 @@ class Detector(nn.Module):
         return cls_logits, features
 ```
 
-**升级2：`PhysicsGuidedDecoder` 输入通道适配**
-```python
-class PhysicsGuidedDecoder(nn.Module):
-    def __init__(self, d_model=96, class_emb_dim=16):
-        super().__init__()
-        ci = d_model + class_emb_dim  # 112
-        layers = []
-        for co in DECODER_CHANNELS:  # [64, 32, 16]
-            layers.extend([nn.ConvTranspose1d(ci, co, 4, 2, 1),
-                           nn.BatchNorm1d(co), nn.GELU()])
-            ci = co
-        layers.append(nn.Conv1d(ci, 3, 5, padding=2))
-        self.upsample = nn.Sequential(*layers)
-```
-
 ### 3.3 可选实现：类别条件注入方式
 
 | 方式 | 实现 | 优点 | 缺点 |
@@ -131,10 +116,12 @@ y_meas(被攻击) → Detector.detect()
 ```python
 # train.py 修改
 # 在 train_epoch 和 evaluate 中：
-cls_logits, _, y_pred, _ = model(x, return_recon=True, class_ids=cls_label)
+# 训练时用 predicted class（消除 train-test mismatch），detach 避免梯度回传分类头
+cls_logits, _, y_pred, _ = model(x, return_recon=True,
+                                  class_ids=cls_logits.argmax(dim=1).detach())
 loss_cls = F.cross_entropy(cls_logits, cls_label)
 loss_recon = F.mse_loss(y_pred, y_clean)
-# 可选：末步加权（强化当前步恢复精度）
+# 末步加权（强化当前步恢复精度）
 loss_recon_last = F.mse_loss(y_pred[:, -1, :], y_clean[:, -1, :])
 loss = loss_cls + RECON_LAMBDA * (0.7 * loss_recon + 0.3 * loss_recon_last)
 ```
@@ -186,11 +173,15 @@ class DetectorBackend:
                                y_recovered=y_recovered, attack_estimate=attack_estimate, ...)
 
     def _classify_and_recover(self, x_tensor):
+        """两阶段推理：先分类获取 pred_cls，再用其作为 class_ids 执行恢复"""
         with torch.no_grad():
-            cls_logits, _, y_pred, _ = self._model(x_tensor, return_recon=True)
-        probs = torch.softmax(cls_logits, dim=1).cpu().numpy()[0]
-        pred_cls = int(probs.argmax())
-        return ALL_ATTACK_TYPES[pred_cls], float(probs[pred_cls]), y_pred
+            cls_logits, features = self._model(x_tensor, return_recon=False)
+            probs = torch.softmax(cls_logits, dim=1)
+            pred_cls = probs.argmax(dim=1)
+            _, _, y_pred, _ = self._model(x_tensor, return_recon=True, class_ids=pred_cls)
+        probs_np = probs.cpu().numpy()[0]
+        pred_cls_int = int(pred_cls[0])
+        return ALL_ATTACK_TYPES[pred_cls_int], float(probs_np[pred_cls_int]), y_pred
 ```
 
 ### 5.2 simulate.py 无需改动
@@ -241,6 +232,9 @@ python simulate.py --all  # 批量8种攻击
 - 现有环境（torch, casadi, numpy, matplotlib）
 - 无需新增依赖
 
+### 7.4 权重兼容性
+架构改动后现有 `nn_cls_best.pt` 缺少 `class_emb` 和 decoder 新通道权重。**必须重训模型**。backend 加载时应检查必要 key 是否存在，缺失则报错（而非 `strict=False` 静默降级到随机初始化）。
+
 ## 8. 验证计划
 
 ### 8.1 开环验证（先做，30分钟）
@@ -272,40 +266,3 @@ python simulate.py --all
 - 无类别条件 vs 有类别条件：验证 class embedding 是否改善分化
 - 全用 y_pred vs A0 门控：验证门控是否减少正常段重构误差
 - 末步加权 vs 全窗 MSE：验证末步精度是否改善闭环收敛
-
-## 9. 审查修复（子智能体审查后必修）
-
-### 修复1 [严重]：删除 Upgrade 2，只保留 Upgrade 1
-Upgrade 1 和 Upgrade 2 对 `PhysicsGuidedDecoder` 输入通道的修改互相矛盾（双重叠加导致 128≠112 RuntimeError）。
-- **修复**：只保留 Upgrade 1（调用侧传 `PhysicsGuidedDecoder(d_model=96+16)`），**不改** `PhysicsGuidedDecoder.__init__`。现有 `ci = d_model` 已能正确接收 112 通道。
-
-### 修复2 [严重]：backend 改两阶段推理
-部署时 `_classify_and_recover` 未传 `class_ids`，decoder 期望 112 通道但收到 96 → RuntimeError。
-- **修复**：先分类获取 `pred_cls`，再用 `pred_cls` 作为 `class_ids` 执行恢复：
-```python
-def _classify_and_recover(self, x_tensor):
-    with torch.no_grad():
-        cls_logits, features = self._model(x_tensor, return_recon=False)
-        probs = torch.softmax(cls_logits, dim=1)
-        pred_cls = probs.argmax(dim=1)
-        _, _, y_pred, _ = self._model(x_tensor, return_recon=True, class_ids=pred_cls)
-    probs_np = probs.cpu().numpy()[0]
-    pred_cls_int = int(pred_cls[0])
-    return ALL_ATTACK_TYPES[pred_cls_int], float(probs_np[pred_cls_int]), y_pred
-```
-
-### 修复3 [中等]：训练时也用 predicted class（消除 train-test mismatch）
-训练用 ground truth label、部署用 predicted label，分类错误时 decoder 收到错误 embedding。
-- **修复**（推荐策略a）：训练时也用 predicted class + detach：
-```python
-cls_logits, _, y_pred, _ = model(x, return_recon=True,
-                                  class_ids=cls_logits.argmax(dim=1).detach())
-```
-
-### 修复4 [遗漏]：声明旧权重不兼容
-架构改动后 `nn_cls_best.pt` 缺少 `class_emb` 和 decoder 新通道权重，`strict=False` 会静默降级到随机初始化。
-- **修复**：方案明确"架构改动后必须重训"。backend 加载时检查必要 key 是否存在，缺失则报错。
-
-### 修复5 [遗漏]：eval-only 模式也需传 class_ids
-`train.py` 的 `evaluate()` 中 `model(x, return_recon=True)` 未传 `class_ids`，同样 RuntimeError。
-- **修复**：evaluate 函数加 `class_ids=cls_label` 参数。
