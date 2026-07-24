@@ -70,7 +70,8 @@ def run_simulation(attack_type: str = 'A1',
                    attack_onset: float = None,
                    model_path: str = None,
                    norm_path: str = None,
-                   show_progress: bool = True) -> dict:
+                   show_progress: bool = True,
+                   oracle: bool = False) -> dict:
     """运行单次闭环仿真
 
     Args:
@@ -156,7 +157,12 @@ def run_simulation(attack_type: str = 'A1',
             det_conf = 0.0
             det_attack_est = np.zeros(3)
         else:
-            result = detector.detect(y_meas)
+            if oracle:
+                true_class = (attack_type if (attack_onset <= t < attack_offset
+                              and attack_type != 'A0') else 'A0')
+                result = detector.detect(y_meas, oracle_class=true_class)
+            else:
+                result = detector.detect(y_meas)
             y_rec = result.y_recovered
             det_class = result.attack_class
             det_conf = result.confidence
@@ -309,7 +315,8 @@ def run_batch(attack_types: list = None,
               use_detector: bool = True,
               randomize_onset: bool = True,
               model_path: str = None,
-              norm_path: str = None):
+              norm_path: str = None,
+              oracle: bool = False):
     """批量运行所有攻击类型的仿真"""
     if attack_types is None:
         attack_types = ALL_ATTACK_TYPES
@@ -333,7 +340,8 @@ def run_batch(attack_types: list = None,
             attack_type=atk, use_detector=use_detector,
             trajectory_type=trajectory_type, seed=seed,
             attack_onset=attack_onset,
-            model_path=model_path, norm_path=norm_path
+            model_path=model_path, norm_path=norm_path,
+            oracle=oracle
         )
 
         # 保存 NPZ
@@ -393,6 +401,8 @@ def main():
                         help='Detector model weights path')
     parser.add_argument('--norm-path', type=str, default=None,
                         help='Normalizer params path')
+    parser.add_argument('--oracle', action='store_true',
+                        help='Oracle 分类：用 ground truth 类别（隔离恢复逻辑）')
 
     args = parser.parse_args()
 
@@ -413,7 +423,8 @@ def main():
         print(f"  Attack Onset: {'randomized [10,40]s' if randomize_onset else f'{ATTACK_ONSET_DEFAULT}s (fixed)'}")
         run_batch(trajectory_type=args.trajectory, seed=args.seed,
                   use_detector=use_detector, randomize_onset=randomize_onset,
-                  model_path=args.model_path, norm_path=args.norm_path)
+                  model_path=args.model_path, norm_path=args.norm_path,
+                  oracle=args.oracle)
         return
 
     # 单次模式
@@ -434,7 +445,8 @@ def main():
         attack_type=args.attack, use_detector=use_detector,
         trajectory_type=args.trajectory, seed=args.seed,
         attack_onset=attack_onset,
-        model_path=args.model_path, norm_path=args.norm_path
+        model_path=args.model_path, norm_path=args.norm_path,
+        oracle=args.oracle
     )
 
     # 指标
