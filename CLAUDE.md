@@ -54,7 +54,7 @@
 2. 数据集通过generate_dataset.py生成数据集。输出到 `dataset/YYYYMMDD_HHMMSS/` 时间戳子目录，内含 `.npz` 文件、`metadata.csv` 和 `README.md`
 3. 通过detector/preprocess_data.py对数据进行预处理。默认输入 `dataset/<ts>/`，输出自动推导为 `dataset_win/<ts>/`。输出 `X_*.npy`、`Y_*_cls.npy`、`Y_*_clean.npy`、`normalizer.npz` 等文件。默认按轨迹族分层 IID 划分为 train/val/test (70/15/15)
 4. 训练NN检测器，通过detector/train.py。保存模型至 `detector/models/nn_cls_best.pt`
-5. 运行检测器仿真，通过simulate.py。输出到 `simulate_results/` 目录（`.npz` 数据和 `.png` 图表）
+5. 运行检测器仿真，通过simulate.py。输出到 `results/simulations/` 目录（`.npz` 数据和 `.csv` 指标）
 6. 运行测试集评估，通过detector/evaluate.py。输出 `eval/{model_name}_{timestamp}/` 含混淆矩阵、分类指标、Markdown 报告
 7. 通过app/interactive_app.py启动交互式可视化GUI
 

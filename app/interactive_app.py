@@ -122,8 +122,9 @@ def load_dataset_configs(metadata_path: str) -> list[dict]:
             run['v_r'] = float(row.get('traj_v_r', 0.20))
         elif family == 'square':
             run['side'] = float(row.get('traj_side', 2.0))
-            run['v'] = float(row.get('traj_v', 0.25))
-            run['R'] = float(row.get('traj_R', 0.35))
+            run['v'] = float(row.get('traj_v', 0.22))
+            run['R'] = float(row.get('traj_R', 0.20))
+            run['direction'] = int(row.get('traj_direction', -1))
         runs.append(run)
     return runs
 
@@ -540,8 +541,8 @@ class ControlPanel(ttk.Frame):
             ],
             'square': [
                 ('边长', 2.0, 1.5, 3.0, 0.1, 'm'),
-                ('v_straight', 0.25, 0.20, 0.30, 0.01, 'm/s'),
-                ('w_turn', 1.0, 0.70, 1.60, 0.05, 'rad/s'),
+                ('R', 0.20, 0.10, 0.45, 0.01, 'm'),
+                ('v', 0.22, 0.15, 0.30, 0.01, 'm/s'),
             ],
         }
 
