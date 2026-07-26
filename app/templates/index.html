@@ -1,0 +1,644 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>WMR Sensor Attack — Web Explorer</title>
+<script src="https://cdn.plot.ly/plotly-3.1.0.min.js"></script>
+<style>
+/* ============================================================
+   Base
+   ============================================================ */
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+:root {
+    --bg:        #f0f2f5;
+    --surface:   #ffffff;
+    --border:    #d5d8dc;
+    --text:      #2c3e50;
+    --text-dim:  #7f8c8d;
+    --primary:   #2980b9;
+    --danger:    #e74c3c;
+    --success:   #27ae60;
+    --header-bg: #1a252f;
+    --shadow:    0 1px 3px rgba(0,0,0,.08);
+}
+
+body {
+    font-family: 'Times New Roman', 'Microsoft YaHei', serif;
+    font-size: 13px;
+    color: var(--text);
+    background: var(--bg);
+    height: 100vh;
+    display: flex; flex-direction: column;
+    overflow: hidden;
+}
+
+/* ---- Header ---- */
+.header {
+    background: var(--header-bg);
+    color: #ecf0f1;
+    padding: 6px 16px;
+    display: flex; align-items: center; gap: 16px;
+    flex-shrink: 0;
+}
+.header h1 { font-size: 15px; font-weight: 600; letter-spacing: .5px; }
+.header .subtitle { font-size: 11px; color: #95a5a6; font-family: 'Microsoft YaHei', sans-serif; }
+
+/* ---- Controls ---- */
+.controls {
+    background: var(--surface);
+    border-bottom: 1px solid var(--border);
+    padding: 10px 16px;
+    display: flex; flex-wrap: wrap; gap: 10px; align-items: flex-end;
+    flex-shrink: 0;
+    box-shadow: var(--shadow);
+}
+.control-group { display: flex; flex-direction: column; gap: 2px; }
+.control-group label { font-size: 11px; font-weight: 700; color: var(--text-dim);
+                       text-transform: uppercase; letter-spacing: .5px; }
+.control-group select, .control-group input {
+    padding: 5px 8px; border: 1px solid var(--border); border-radius: 4px;
+    font-size: 12px; background: #fff; min-width: 90px;
+    font-family: 'Times New Roman', serif;
+}
+.btn {
+    padding: 6px 18px; border: none; border-radius: 4px; cursor: pointer;
+    font-size: 12px; font-weight: 600; letter-spacing: .3px;
+    font-family: 'Times New Roman', serif;
+    transition: background .15s;
+}
+.btn-primary { background: var(--primary); color: #fff; }
+.btn-primary:hover { background: #2471a3; }
+.btn-primary:disabled { background: #bdc3c7; cursor: not-allowed; }
+.btn-danger { background: var(--danger); color: #fff; font-size: 11px; padding: 4px 10px; }
+.btn-sm { padding: 4px 10px; font-size: 11px; }
+
+.progress-bar { height: 4px; background: #ecf0f1; border-radius: 2px;
+                flex-basis: 100%; margin-top: 2px; overflow: hidden; }
+.progress-fill { height: 100%; background: var(--primary); width: 0%; transition: width .2s; }
+
+/* ---- Main Grid ---- */
+.main-grid {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+    grid-template-rows: repeat(5, 1fr);
+    gap: 6px;
+    padding: 6px;
+    flex: 1; min-height: 0;
+}
+.chart-panel {
+    background: var(--surface);
+    border-radius: 4px;
+    box-shadow: var(--shadow);
+    overflow: hidden;
+    min-height: 0;
+}
+
+/* ---- Playback ---- */
+.playback {
+    background: var(--surface);
+    border-top: 1px solid var(--border);
+    padding: 8px 16px;
+    display: flex; align-items: center; gap: 12px;
+    flex-shrink: 0;
+    box-shadow: 0 -1px 3px rgba(0,0,0,.05);
+    font-family: 'Times New Roman', serif;
+}
+.playback input[type=range] { flex: 1; }
+.playback .time-label { font-family: 'Consolas', monospace; font-size: 12px; min-width: 95px; text-align: center; }
+.playback .speed-group { display: flex; align-items: center; gap: 4px; font-size: 11px; }
+
+.status-bar {
+    background: var(--surface);
+    padding: 3px 16px;
+    font-size: 11px;
+    color: var(--text-dim);
+    border-top: 1px solid var(--border);
+    flex-shrink: 0;
+}
+
+@media (max-width: 900px) {
+    .main-grid { grid-template-columns: 1fr; grid-template-rows: auto; }
+    .chart-trajectory { aspect-ratio: 1; grid-row: auto; }
+}
+</style>
+</head>
+<body>
+
+<div class="header">
+    <h1>WMR Sensor Attack Explorer</h1>
+    <span class="subtitle">轮式移动机器人传感器攻击检测 — 交互式浏览器</span>
+</div>
+
+<div class="controls" id="controls">
+    <div class="control-group">
+        <label>Source</label>
+        <select id="modeSelect" onchange="onModeChange()">
+            <option value="dataset">📁 Dataset</option>
+            <option value="custom">⚙ Custom</option>
+        </select>
+    </div>
+
+    <div class="control-group" id="groupDsDir">
+        <label>Dataset Dir</label>
+        <select id="dsDirSelect" onchange="onDsDirChange()"></select>
+    </div>
+    <div class="control-group" id="groupDsRecord" style="flex:1; min-width:200px;">
+        <label>Record</label>
+        <select id="dsRecordSelect" onchange="onRecordChange()"></select>
+    </div>
+
+    <div class="control-group" id="groupFamily" style="display:none;">
+        <label>Family</label>
+        <select id="familySelect">
+            <option value="lissajous">Lissajous</option>
+            <option value="circular">Circular</option>
+            <option value="spiral">Spiral</option>
+            <option value="random_waypoint">R. Waypoint</option>
+            <option value="square">Square</option>
+        </select>
+    </div>
+    <div class="control-group" id="groupSeed" style="display:none;">
+        <label>Seed</label>
+        <input type="number" id="seedInput" value="42" min="0" max="99999" style="width:70px;">
+    </div>
+
+    <div class="control-group">
+        <label>Attack</label>
+        <select id="atkType">
+            <option value="A0">A0 Normal</option>
+            <option value="A1" selected>A1 Const. Bias</option>
+            <option value="A2">A2 Sinusoidal</option>
+            <option value="A3">A3 Drift</option>
+            <option value="A4">A4 Replay</option>
+            <option value="A5">A5 Dropout</option>
+            <option value="A6">A6 Scaling</option>
+            <option value="A7">A7 Freeze</option>
+        </select>
+    </div>
+    <div class="control-group">
+        <label>Onset [s]</label>
+        <input type="number" id="onsetInput" value="15.0" min="0" max="50" step="0.5" style="width:60px;">
+    </div>
+    <div class="control-group">
+        <label>Dur. [s]</label>
+        <input type="number" id="durInput" value="10.0" min="1" max="50" step="1" style="width:60px;">
+    </div>
+
+    <button class="btn btn-primary" id="btnRun" onclick="runSimulation()">▶ Run</button>
+    <button class="btn btn-danger" id="btnStop" onclick="stopAnimation()" style="display:none;">⏹ Stop</button>
+
+    <div class="progress-bar" id="progressBar">
+        <div class="progress-fill" id="progressFill"></div>
+    </div>
+</div>
+
+<div class="main-grid" id="mainGrid">
+    <div class="chart-panel" id="chartTrajectory" style="grid-row:1/-1; grid-column:1;"></div>
+    <div class="chart-panel" id="chartTrackError"></div>
+    <div class="chart-panel" id="chartControl"></div>
+    <div class="chart-panel" id="chartInnovation"></div>
+    <div class="chart-panel" id="chartAttack"></div>
+    <div class="chart-panel" id="chartMeasurement"></div>
+</div>
+
+<div class="playback" id="playbackBar">
+    <button class="btn btn-sm btn-primary" onclick="jumpToStart()" title="Home">⏮</button>
+    <button class="btn btn-sm btn-primary" onclick="stepBack()" title="←">◀</button>
+    <button class="btn btn-sm btn-primary" id="btnPlay" onclick="togglePlay()">▶</button>
+    <button class="btn btn-sm btn-primary" onclick="stepForward()" title="→">▶</button>
+    <button class="btn btn-sm btn-primary" onclick="jumpToEnd()" title="End">⏭</button>
+    <input type="range" id="timeSlider" min="0" max="999" value="0" step="1" oninput="onSliderChange()" style="flex:1;">
+    <span class="time-label" id="timeLabel">t = 0.00 s</span>
+    <div class="speed-group">
+        <label>Speed:</label>
+        <input type="range" id="speedSlider" min="0.5" max="20" value="5" step="0.5"
+               style="width:80px;" oninput="onSpeedChange()">
+        <span id="speedLabel">5×</span>
+    </div>
+</div>
+
+<div class="status-bar" id="statusBar">Ready — loading dataset...</div>
+
+<script>
+// ============================================================
+// State
+// ============================================================
+const Ts = 0.05;
+let state = {
+    mode: 'dataset', data: null, meta: null,
+    nSteps: 0, currentStep: 0,
+    playing: false, playSpeed: 5, playTimer: null,
+    dsRecords: [], simTaskId: null,
+};
+
+const C = {
+    ref:'#9e9e9e', normal:'#64B5F6', attack:'#E74C3C', postAtk:'#95a5a6',
+    start:'#2ecc71', end:'#e74c3c', cursor:'#f1c40f',
+    xErr:'#e74c3c', yErr:'#2ecc71', tErr:'#3498db',
+    vCmd:'#3498db', wCmd:'#e74c3c',
+    atkWin:'rgba(231,76,60,0.08)',
+    trueSt:'#2c3e50', meas:'#e74c3c', est:'#3498db',
+};
+
+// ---- Shared configs ----
+const FONT = {family:'Times New Roman', size:10, color:'#2c3e50'};
+const TITLE_FONT = {family:'Times New Roman', size:11, color:'#2c3e50'};
+const MC = {responsive:true, displayModeBar:true, displaylogo:false,
+            modeBarButtonsToRemove:['lasso2d','select2d']};
+
+// Identical margins for ALL time-series charts → plot areas perfectly align
+const TS_MARGIN = {l:60, r:20, t:36, b:36};
+
+// ============================================================
+// Init
+// ============================================================
+window.addEventListener('DOMContentLoaded', () => {
+    createEmptyCharts();
+    loadDsDirs();
+});
+
+// ============================================================
+// Mode
+// ============================================================
+function onModeChange() {
+    state.mode = document.getElementById('modeSelect').value;
+    const isDs = state.mode === 'dataset';
+    document.getElementById('groupDsDir').style.display = isDs ? '' : 'none';
+    document.getElementById('groupDsRecord').style.display = isDs ? '' : 'none';
+    document.getElementById('groupFamily').style.display = isDs ? 'none' : '';
+    document.getElementById('groupSeed').style.display = isDs ? 'none' : '';
+    if (isDs) onRecordChange();
+}
+
+// ============================================================
+// Dataset
+// ============================================================
+async function loadDsDirs() {
+    try {
+        const res = await fetch('/api/dataset_dirs');
+        const dirs = await res.json();
+        const sel = document.getElementById('dsDirSelect');
+        sel.innerHTML = dirs.map((d,i) =>
+            `<option value="${esc(d)}">${d.split(/[/\\]/).pop()}</option>`).join('');
+        if (dirs.length>0) { sel.value=dirs[0]; await onDsDirChange(); }
+    } catch(e) { setStatus('❌ ' + e.message); }
+}
+
+async function onDsDirChange() {
+    const dir = document.getElementById('dsDirSelect').value;
+    if (!dir) return;
+    try {
+        const res = await fetch('/api/dataset_records?dir='+encodeURIComponent(dir));
+        const records = await res.json();
+        state.dsRecords = records;
+        const sel = document.getElementById('dsRecordSelect');
+        sel.innerHTML = records.map((r,i) => {
+            const nm = {A0:'Normal',A1:'ConstBias',A2:'Sine',A3:'Drift',A4:'Replay',A5:'Drop',A6:'Scale',A7:'Freeze'}[r.attack_type]||r.attack_type;
+            return `<option value="${i}">cfg${String(r.config_id).padStart(2,'0')} | ${r.family} | ${r.attack_type} ${nm} | on=${r.attack_onset.toFixed(1)}s</option>`;
+        }).join('');
+        if (records.length>0) { sel.value='0'; onRecordChange(); }
+    } catch(e) { setStatus('❌ '+e.message); }
+}
+
+async function onRecordChange() {
+    if (state.mode !== 'dataset') return;
+    const idx = parseInt(document.getElementById('dsRecordSelect').value);
+    if (isNaN(idx) || idx >= state.dsRecords.length) return;
+    const rec = state.dsRecords[idx];
+    const dir = document.getElementById('dsDirSelect').value;
+
+    document.getElementById('atkType').value = rec.attack_type;
+    document.getElementById('onsetInput').value = rec.attack_onset;
+    document.getElementById('durInput').value = rec.attack_duration;
+
+    try {
+        const url = `/api/load_record?dir=${encodeURIComponent(dir)}&file=${encodeURIComponent(rec.filename)}`;
+        const res = await fetch(url);
+        if (!res.ok) { setStatus('❌ Load failed'); return; }
+        const raw = await res.json();
+        if (raw.error) { setStatus('❌ '+raw.error); return; }
+
+        const nSteps = raw.t.length;
+        state.data = raw;
+        state.meta = {
+            sim_time: raw.t[nSteps-1], attack_type: rec.attack_type,
+            attack_onset: rec.attack_onset,
+            attack_offset: rec.attack_onset + rec.attack_duration,
+            attack_duration: rec.attack_duration,
+            use_detector: false, detector_mode: 'none',
+            Ts: Ts, n_steps: nSteps,
+            family: rec.family, seed: rec.traj_seed, elapsed: 0,
+        };
+        state.nSteps = nSteps;
+        state.currentStep = 0;
+
+        renderAllCharts();
+        setupSlider();
+        updateCursor(0);
+
+        const nm = {A0:'Normal',A1:'ConstBias',A2:'Sine',A3:'Drift',A4:'Replay',A5:'Drop',A6:'Scale',A7:'Freeze'}[rec.attack_type]||rec.attack_type;
+        setStatus(`✅ Dataset | cfg${rec.config_id} | ${rec.family} | ${rec.attack_type} ${nm} | ${nSteps} steps`);
+    } catch(e) { setStatus('❌ '+e.message); }
+}
+
+// ============================================================
+// Simulation
+// ============================================================
+async function runSimulation() {
+    stopAnimation();
+    let params;
+    if (state.mode === 'dataset') {
+        const idx = parseInt(document.getElementById('dsRecordSelect').value);
+        if (isNaN(idx) || idx >= state.dsRecords.length) return;
+        const rec = state.dsRecords[idx];
+        params = { family:rec.family, seed:rec.traj_seed,
+                   attack_type:rec.attack_type, attack_onset:rec.attack_onset,
+                   attack_duration:rec.attack_duration, sim_time:50, detector_mode:'nn' };
+    } else {
+        params = {
+            family: document.getElementById('familySelect').value,
+            seed: parseInt(document.getElementById('seedInput').value)||42,
+            attack_type: document.getElementById('atkType').value,
+            attack_onset: parseFloat(document.getElementById('onsetInput').value)||15,
+            attack_duration: parseFloat(document.getElementById('durInput').value)||10,
+            sim_time:50, detector_mode:'nn',
+        };
+    }
+    setStatus('⏳ Simulating...');
+    document.getElementById('btnRun').disabled = true;
+    document.getElementById('progressFill').style.width = '0%';
+    try {
+        const res = await fetch('/api/simulate', {method:'POST',
+            headers:{'Content-Type':'application/json'}, body:JSON.stringify(params)});
+        const {task_id} = await res.json();
+        state.simTaskId = task_id;
+        pollSimulation(task_id);
+    } catch(e) { setStatus('❌ '+e.message); document.getElementById('btnRun').disabled=false; }
+}
+
+async function pollSimulation(taskId) {
+    try {
+        const res = await fetch('/api/simulate_status/'+taskId);
+        const task = await res.json();
+        document.getElementById('progressFill').style.width = (task.progress*100)+'%';
+        if (task.status==='done' && task.data) {
+            const d = task.data; const meta = d._meta; delete d._meta;
+            state.data = d; state.meta = meta;
+            state.nSteps = meta.n_steps; state.currentStep = 0;
+            renderAllCharts(); setupSlider(); updateCursor(0);
+            setStatus(`✅ Done | ${meta.attack_type} | det=${meta.detector_mode} | ${meta.elapsed}s | ${meta.n_steps} steps`);
+            document.getElementById('btnRun').disabled = false;
+            document.getElementById('progressFill').style.width = '100%';
+            setTimeout(()=>{document.getElementById('progressFill').style.width='0%';},1200);
+        } else if (task.status==='running') {
+            setTimeout(()=>pollSimulation(taskId),200);
+        } else if (task.status==='error') {
+            setStatus('❌ Error: '+(task.error||'unknown'));
+            document.getElementById('btnRun').disabled = false;
+        }
+    } catch(e) { setStatus('❌ '+e.message); document.getElementById('btnRun').disabled=false; }
+}
+
+// ============================================================
+// Charts
+// ============================================================
+function createEmptyCharts() {
+    // Trajectory
+    Plotly.newPlot('chartTrajectory', [], {
+        paper_bgcolor:'#fff', plot_bgcolor:'#fafafa',
+        margin:{l:52, r:20, t:36, b:42}, font:FONT,
+        title:{text:'2D Trajectory', font:{family:'Times New Roman', size:12}},
+        xaxis:{title:'x [m]', scaleanchor:'y', scaleratio:1},
+        yaxis:{title:'y [m]'},
+    }, MC);
+
+    // Time-series — all share identical margins & x-axis config for pixel-perfect alignment
+    const tsBase = (title, ytitle) => ({
+        paper_bgcolor:'#fff', plot_bgcolor:'#fafafa',
+        margin: TS_MARGIN, font:FONT,
+        title:{text:title, font:TITLE_FONT},
+        xaxis:{title:'', range:[0,50], autorange:false, showticklabels:true, dtick:10},
+        yaxis:{title:ytitle, automargin:false},
+        shapes:[{type:'line',xref:'x',yref:'paper',y0:0,y1:1,
+                 line:{color:'#2c3e50',width:1.2,dash:'dash'}}],
+    });
+
+    Plotly.newPlot('chartTrackError', [], tsBase('Tracking Error', 'Error [m, rad]'), MC);
+    Plotly.newPlot('chartControl', [], tsBase('Control Commands', 'v [m/s], ω [rad/s]'), MC);
+    Plotly.newPlot('chartInnovation', [], tsBase('Detected Attack', '||â_det||'), MC);
+    Plotly.newPlot('chartAttack', [], tsBase('Attack Signal', '||a|| [m, rad]'), MC);
+    Plotly.newPlot('chartMeasurement', [], tsBase('Measurement vs True (X)', 'x [m]'), MC);
+}
+
+function col(arr2d, idx) { return arr2d.map(r => r[idx]); }
+
+function renderAllCharts() {
+    const d = state.data, m = state.meta;
+    const onsetI = Math.round(m.attack_onset/Ts);
+    const offsetI = Math.round(m.attack_offset/Ts);
+    const tArr = d.t, xR = [0, m.sim_time];
+    const hasAtk = m.attack_type !== 'A0';
+    const tk = tArr[state.currentStep]||0;
+
+    // ======== Trajectory ========
+    const refX=col(d.Upsilon_r,0), refY=col(d.Upsilon_r,1);
+    const tx=col(d.true_state,0), ty=col(d.true_state,1);
+    let trajTrace = [
+        {x:refX, y:refY, mode:'lines', line:{color:C.ref, dash:'dash', width:.8}, name:'Reference'},
+    ];
+    if (!hasAtk || onsetI>=state.nSteps) {
+        trajTrace.push({x:tx, y:ty, mode:'lines', line:{color:C.normal, width:1.2}, name:'Measured'});
+    } else {
+        const endA = Math.min(offsetI+1, state.nSteps);
+        trajTrace.push({x:tx.slice(0,onsetI+1), y:ty.slice(0,onsetI+1), mode:'lines',
+                        line:{color:C.normal, width:1}, name:'Normal'});
+        trajTrace.push({x:tx.slice(onsetI,endA), y:ty.slice(onsetI,endA), mode:'lines',
+                        line:{color:C.attack, width:2}, name:'Attacked'});
+        if (offsetI<state.nSteps)
+            trajTrace.push({x:tx.slice(offsetI), y:ty.slice(offsetI), mode:'lines',
+                            line:{color:C.postAtk, width:.8}, name:'Post-attack'});
+    }
+    trajTrace.push(
+        {x:[tx[0]], y:[ty[0]], mode:'markers',
+         marker:{color:C.start,size:10,symbol:'circle',line:{color:'#fff',width:1}}, name:'Start'},
+        {x:[tx[state.nSteps-1]], y:[ty[state.nSteps-1]], mode:'markers',
+         marker:{color:C.end,size:12,symbol:'star',line:{color:'#fff',width:1}}, name:'End'},
+        {x:[tx[0]], y:[ty[0]], mode:'markers',
+         marker:{color:C.cursor,size:12,symbol:'circle',line:{color:'#000',width:1.5}}, name:'Now'},
+    );
+    Plotly.react('chartTrajectory', trajTrace, {
+        paper_bgcolor:'#fff', plot_bgcolor:'#fafafa',
+        margin:{l:52, r:20, t:36, b:42}, font:FONT,
+        title:{text:'2D Trajectory', font:{family:'Times New Roman', size:12}},
+        xaxis:{title:'x [m]', scaleanchor:'y', scaleratio:1},
+        yaxis:{title:'y [m]'},
+        legend:{font:FONT, x:1, y:1, xanchor:'right', yanchor:'top'},
+    }, MC);
+
+    // ======== Time Series — individually, with uniform margins for alignment ========
+    const detNorm = (d.det_attack_est||[]).length>0
+        ? d.det_attack_est.map(v=>Math.sqrt(v[0]**2+v[1]**2+v[2]**2))
+        : tArr.map(()=>0);
+    const atkNorm = d.attack_signal.map(v=>Math.sqrt(v[0]**2+v[1]**2+v[2]**2));
+
+    // Helper: render one time-series chart
+    function tsPlot(divId, title, ytitle, traces) {
+        const shapes = [];
+        if (hasAtk) {
+            shapes.push({type:'rect',xref:'x',yref:'paper',
+                         x0:m.attack_onset, x1:Math.min(m.attack_offset,m.sim_time),
+                         y0:0,y1:1, fillcolor:C.atkWin, line:{width:0}});
+        }
+        shapes.push({type:'line',xref:'x',yref:'paper', x0:tk,x1:tk,
+                     y0:0,y1:1, line:{color:'#2c3e50',width:1.2,dash:'dash'}});
+
+        Plotly.react(divId, traces, {
+            paper_bgcolor:'#fff', plot_bgcolor:'#fafafa',
+            margin: TS_MARGIN, font:FONT,
+            title:{text:title, font:TITLE_FONT},
+            xaxis:{title:'', range:xR, autorange:false, showticklabels:true, dtick:10},
+            yaxis:{title:ytitle, automargin:false},
+            shapes,
+            legend:{font:FONT, x:0, y:1.02, xanchor:'left', yanchor:'bottom',
+                    orientation:'h', bgcolor:'rgba(255,255,255,0.75)'},
+        }, MC);
+    }
+
+    // Row 1: Tracking Error
+    tsPlot('chartTrackError', 'Tracking Error', 'Error [m, rad]', [
+        {x:tArr, y:col(d.X_error,0), mode:'lines', line:{color:C.xErr,width:1}, name:'x_e [m]'},
+        {x:tArr, y:col(d.X_error,1), mode:'lines', line:{color:C.yErr,width:1}, name:'y_e [m]'},
+        {x:tArr, y:col(d.X_error,2), mode:'lines', line:{color:C.tErr,width:1}, name:'θ_e [rad]'},
+    ]);
+
+    // Row 2: Control
+    tsPlot('chartControl', 'Control Commands', 'v [m/s], ω [rad/s]', [
+        {x:tArr, y:col(d.u_cmd,0), mode:'lines', line:{color:C.vCmd,width:1}, name:'v_cmd [m/s]'},
+        {x:tArr, y:col(d.u_cmd,1), mode:'lines', line:{color:C.wCmd,width:1}, name:'ω_cmd [rad/s]'},
+    ]);
+
+    // Row 3: Innovation
+    tsPlot('chartInnovation', 'Detected Attack', '||â_det||', [
+        {x:tArr, y:detNorm, mode:'lines', line:{color:C.attack,width:1.2}, name:'||â_det||'},
+    ]);
+
+    // Row 4: Attack Signal
+    const atkTraces = [
+        {x:tArr, y:atkNorm, mode:'lines', line:{color:'#2c3e50',width:1.5}, name:'||a(k)||'},
+        {x:tArr, y:col(d.attack_signal,0), mode:'lines', line:{color:C.xErr,width:.6,dash:'dash'}, name:'a_x'},
+        {x:tArr, y:col(d.attack_signal,1), mode:'lines', line:{color:C.yErr,width:.6,dash:'dash'}, name:'a_y'},
+        {x:tArr, y:col(d.attack_signal,2), mode:'lines', line:{color:C.tErr,width:.6,dash:'dash'}, name:'a_θ'},
+    ];
+    if (m.use_detector) {
+        atkTraces.push({x:tArr, y:detNorm, mode:'lines',
+                        line:{color:'#00bcd4',width:1.2,dash:'dashdot'}, name:'||â_det||'});
+    }
+    tsPlot('chartAttack', 'Attack Signal', '||a|| [m, rad]', atkTraces);
+
+    // Row 5: Measurement
+    tsPlot('chartMeasurement', 'Measurement vs True (X)', 'x [m]', [
+        {x:tArr, y:col(d.true_state,0), mode:'lines', line:{color:C.trueSt,width:1}, name:'True x'},
+        {x:tArr, y:col(d.y_meas,0), mode:'lines', line:{color:C.meas,width:.8}, name:'Measured x'},
+        {x:tArr, y:col(d.Upsilon_r,0), mode:'lines',
+         line:{color:C.est,width:1,dash:'dash'}, name:'Ref. x'},
+    ]);
+}
+
+// ============================================================
+// Cursor
+// ============================================================
+function setupSlider() {
+    const sl = document.getElementById('timeSlider');
+    sl.max = state.nSteps-1; sl.value = 0;
+}
+
+function updateCursor(step) {
+    step = Math.max(0, Math.min(state.nSteps-1, step));
+    state.currentStep = step;
+    if (!state.data) return;
+
+    const tk = state.data.t[step];
+    document.getElementById('timeSlider').value = step;
+    document.getElementById('timeLabel').textContent = `t = ${tk.toFixed(2)} s`;
+
+    // Trajectory cursor (last trace)
+    const gdT = document.getElementById('chartTrajectory');
+    const ciT = gdT && gdT.data ? gdT.data.length-1 : 6;
+    const tx=col(state.data.true_state,0), ty=col(state.data.true_state,1);
+    Plotly.restyle('chartTrajectory', {x:[[tx[step]]], y:[[ty[step]]]}, [ciT]);
+
+    // Time-series cursor lines (shape[0]=attack_rect or shape[0]=cursor)
+    const tsCharts = ['chartTrackError','chartControl','chartInnovation','chartAttack','chartMeasurement'];
+    tsCharts.forEach(divId => {
+        Plotly.relayout(divId, {'shapes[-1].x0':tk, 'shapes[-1].x1':tk});
+    });
+
+    // Status
+    if (state.meta) {
+        const xs = state.data.true_state[step];
+        const xe = state.data.X_error[step];
+        const pe = Math.sqrt(xe[0]**2+xe[1]**2);
+        const an = Math.sqrt(
+            state.data.attack_signal[step][0]**2+
+            state.data.attack_signal[step][1]**2+
+            state.data.attack_signal[step][2]**2);
+        const isAtk = state.meta.attack_onset <= tk && tk <= state.meta.attack_offset;
+        setStatus(`k=${step} | t=${tk.toFixed(2)}s | x=${xs[0].toFixed(3)} y=${xs[1].toFixed(3)} θ=${xs[2].toFixed(3)} | |e_xy|=${pe.toFixed(3)}m | ${isAtk?'🔴':'🟢'} | ||a||=${an.toFixed(3)}`);
+    }
+}
+
+// ============================================================
+// Playback
+// ============================================================
+function onSliderChange() { updateCursor(parseInt(document.getElementById('timeSlider').value)); }
+function togglePlay() {
+    if (state.playing) { stopAnimation(); return; }
+    if (!state.data) return;
+    state.playing = true;
+    document.getElementById('btnPlay').textContent = '⏸';
+    playStep();
+}
+function playStep() {
+    if (!state.playing) return;
+    let step = state.currentStep + 1;
+    if (step >= state.nSteps) { stopAnimation(); return; }
+    updateCursor(step);
+    state.playTimer = setTimeout(playStep, Math.max(10, Math.round(50/state.playSpeed)));
+}
+function stopAnimation() {
+    state.playing = false;
+    if (state.playTimer) { clearTimeout(state.playTimer); state.playTimer = null; }
+    document.getElementById('btnPlay').textContent = '▶';
+}
+function jumpToStart()  { stopAnimation(); updateCursor(0); }
+function jumpToEnd()    { stopAnimation(); updateCursor(state.nSteps-1); }
+function stepBack()     { stopAnimation(); updateCursor(state.currentStep-1); }
+function stepForward()  { stopAnimation(); updateCursor(state.currentStep+1); }
+function onSpeedChange() {
+    state.playSpeed = parseFloat(document.getElementById('speedSlider').value);
+    document.getElementById('speedLabel').textContent = state.playSpeed.toFixed(1)+'×';
+}
+
+document.addEventListener('keydown', (e) => {
+    if (e.target.tagName==='INPUT' || e.target.tagName==='SELECT') return;
+    switch(e.key) {
+        case ' ': e.preventDefault(); togglePlay(); break;
+        case 'ArrowLeft': e.preventDefault(); stepBack(); break;
+        case 'ArrowRight': e.preventDefault(); stepForward(); break;
+        case 'Home': e.preventDefault(); jumpToStart(); break;
+        case 'End': e.preventDefault(); jumpToEnd(); break;
+        case 'F5': e.preventDefault(); runSimulation(); break;
+        case 'Escape': e.preventDefault(); stopAnimation(); break;
+    }
+});
+
+// ============================================================
+// Helpers
+// ============================================================
+function setStatus(msg) { document.getElementById('statusBar').textContent = msg; }
+function esc(s) { const e=document.createElement('div'); e.textContent=s; return e.innerHTML; }
+</script>
+</body>
+</html>

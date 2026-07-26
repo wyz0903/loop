@@ -105,6 +105,7 @@ def load_dataset_configs(metadata_path: str) -> list[dict]:
             'attack_type': str(row['attack_type']),
             'attack_onset': float(row['attack_onset']),
             'attack_duration': float(row.get('attack_duration', 0.0)),
+            'filename': str(row['filename']),
         }
         family = run['family']
         if family == 'lissajous':
@@ -669,6 +670,8 @@ class ControlPanel(ttk.Frame):
             self._status_var.set(
                 f'已选: config_{cfg["config_id"]:02d} | {cfg["family"]} | '
                 f'{atk} ({atk_name}) | onset={cfg["attack_onset"]:.1f}s')
+            # 自动加载并显示数据集记录
+            self.app._load_dataset_record()
 
     def get_selected_config(self) -> dict:
         """获取当前选择的数据集仿真记录"""
@@ -740,8 +743,14 @@ class InteractiveApp(tk.Tk):
         super().__init__()
 
         self.title('WMR Sensor Attack Research — Interactive Explorer')
-        self.geometry('1800x1080')
-        self.minsize(1280, 800)
+
+        # 自适应屏幕: 窗口占屏幕 90% 宽 × 85% 高, 居中显示
+        sw = self.winfo_screenwidth()
+        sh = self.winfo_screenheight()
+        win_w = min(int(sw * 0.90), 1920)
+        win_h = min(int(sh * 0.85), 1080)
+        self.geometry(f'{win_w}x{win_h}+{max(0, (sw - win_w) // 2)}+{max(0, (sh - win_h) // 2)}')
+        self.minsize(960, 640)
 
         # 状态
         self._sim_data = None       # 仿真结果 dict
@@ -757,6 +766,9 @@ class InteractiveApp(tk.Tk):
         self._build_control_panel()
         self._build_figure()
         self._build_status_bar()
+
+        # 绑定 canvas resize → 自适应 Figure 尺寸
+        self._canvas.get_tk_widget().bind('<Configure>', self._on_canvas_configure)
 
         # 绑定快捷键
         self.bind('<F5>', lambda e: self._on_run())
@@ -785,9 +797,8 @@ class InteractiveApp(tk.Tk):
         布局: 左侧大图 (2D轨迹, 占全部5行) + 右侧5行时间序列竖列
         每个子图均可单独保存为图片文件。
         """
-        self._fig = Figure(figsize=(18, 6.8), dpi=100)
-        gs = GridSpec(5, 2, figure=self._fig, hspace=0.78, wspace=0.22,
-                      left=0.05, right=0.98, top=0.97, bottom=0.05,
+        self._fig = Figure(figsize=(14, 5.8), dpi=100, constrained_layout=True)
+        gs = GridSpec(5, 2, figure=self._fig, hspace=0.45, wspace=0.28,
                       width_ratios=[1.5, 1.0])
 
         # 左侧: 2D 轨迹大图 (占据全部5行)
@@ -908,6 +919,91 @@ class InteractiveApp(tk.Tk):
         )
         self._worker.start()
         self.after(100, self._poll_worker)
+
+    def _load_dataset_record(self):
+        """从当前选中的数据集记录加载 npz 文件并立即显示所有图表"""
+        cfg = self._panel.get_selected_config()
+        if cfg is None:
+            return
+        ds_dir = self._panel._ds_dir_var.get()
+        npz_path = os.path.join(ds_dir, cfg['filename'])
+        if not os.path.exists(npz_path):
+            messagebox.showwarning('文件缺失', f'数据集文件不存在:\n{npz_path}')
+            return
+
+        self._stop_play()
+
+        try:
+            raw = np.load(npz_path, allow_pickle=True)
+        except Exception as e:
+            messagebox.showerror('加载失败', f'无法读取 npz 文件:\n{e}')
+            return
+
+        t_arr = raw['t']
+        n_steps = len(t_arr)
+        atk_type = cfg['attack_type']
+        atk_onset = cfg['attack_onset']
+        atk_duration = cfg.get('attack_duration', 0.0)
+        atk_offset = atk_onset + atk_duration
+        sim_time = float(t_arr[-1])
+        Ts = float(t_arr[1] - t_arr[0]) if n_steps > 1 else DEFAULT_TS
+
+        # 构建与 SimulationWorker 兼容的 sim_data 字典
+        self._sim_data = {
+            't': raw['t'],
+            'true_state': raw['true_state'],
+            'y_meas': raw['y_meas'],
+            'y_rec': raw['y_meas'].copy(),  # 无检测器: y_rec = y_meas
+            'attack_signal': raw['attack_signal'],
+            'sensor_noise': raw['sensor_noise'],
+            'Upsilon_r': raw['Upsilon_r'],
+            'u_r': raw['u_r'],
+            'Upsilon_hat': raw['Upsilon_hat'],
+            'X_error': raw['X_error'],
+            'u_cmd': raw['u_cmd'],
+            'u_a': raw['u_a'],
+            'attack_active': raw['attack_active'],
+            # 元信息
+            'Ts': Ts,
+            'attack_type_label': atk_type,
+            'attack_onset': atk_onset,
+            'attack_offset': atk_offset,
+            'attack_duration': atk_duration,
+            'sim_time': sim_time,
+            'traj_info': {},
+            'seed': cfg.get('traj_seed', 0),
+            'elapsed': 0.0,
+            'use_detector': False,
+            'detector_mode': 'none',
+            # 检测器占位 (数据集不含检测器输出)
+            'det_class': np.full(n_steps, 'A0', dtype=object),
+            'det_conf': np.zeros(n_steps, dtype=np.float32),
+            'det_attack_est': np.zeros((n_steps, 3), dtype=np.float32),
+        }
+
+        # 攻击期 pos_rmse
+        onset_idx = max(0, min(int(round(atk_onset / Ts)), n_steps))
+        offset_idx = max(onset_idx + 1, min(int(round(atk_offset / Ts)), n_steps))
+        pos_err = np.sqrt(raw['X_error'][onset_idx:offset_idx, 0]**2
+                         + raw['X_error'][onset_idx:offset_idx, 1]**2)
+        self._sim_data['pos_rmse'] = float(np.sqrt(np.mean(pos_err**2))) if len(pos_err) > 0 else 0.0
+
+        self._n_steps = n_steps
+
+        # 绘制全部图表
+        self._clear_all_axes()
+        self._draw_static_plots()
+        self._panel.enable_slider(self._n_steps)
+        self._update_cursor(0)
+
+        atk_name = ATTACK_NAMES.get(atk_type, atk_type)
+        rmse = self._sim_data['pos_rmse']
+        self._detail_var.set(
+            f'数据集记录 | 攻击={atk_type} {atk_name} | 检测器=无 | '
+            f'pos_rmse={rmse:.4f}m | 拖拽滑块回放 | {sim_time:.0f}s / {n_steps}步')
+        self._panel._status_var.set(
+            f'数据集: config_{cfg["config_id"]:02d} | {cfg["family"]} | '
+            f'{atk_type} ({atk_name}) | onset={atk_onset:.1f}s | pos_rmse={rmse:.4f}m')
 
     def _poll_worker(self):
         """轮询 worker 进度"""
@@ -1336,7 +1432,6 @@ class InteractiveApp(tk.Tk):
         ax.plot(t_arr, data['Upsilon_hat'][:, ch], 'b--', lw=1.0, alpha=0.8, label='State Est.')
         ax.legend(loc='upper right', fontsize=7)
 
-        self._fig.tight_layout()
         self._canvas.draw_idle()
 
     def _redraw_measurement_subplot(self):
@@ -1419,6 +1514,20 @@ class InteractiveApp(tk.Tk):
     # ==================================================================
     # 生命周期
     # ==================================================================
+
+    def _on_canvas_configure(self, event):
+        """Canvas 尺寸变化时等比缩放 Figure，使内容自适应可用空间"""
+        if event.width < 100 or event.height < 100:
+            return  # 忽略初始化时的极小/无效尺寸
+        dpi = self._fig.get_dpi()
+        new_w = event.width / dpi
+        new_h = event.height / dpi
+        cur_w, cur_h = self._fig.get_size_inches()
+        if abs(cur_w - new_w) < 0.15 and abs(cur_h - new_h) < 0.15:
+            return  # 变化太小，跳过避免频繁重绘
+        self._fig.set_size_inches(new_w, new_h, forward=True)
+        # constrained_layout 自动处理子图间距，无需手动 tight_layout
+        self._canvas.draw_idle()
 
     def _on_close(self):
         self._stop_play()
