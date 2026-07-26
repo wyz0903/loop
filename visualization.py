@@ -22,6 +22,7 @@ from pathlib import Path
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
+import matplotlib.lines as mlines
 
 # IEEE 论文标准字体
 plt.rcParams['font.sans-serif'] = ['Microsoft YaHei', 'SimHei']
@@ -262,14 +263,26 @@ def _build_dataset_filename(row: pd.Series) -> str:
     return f"cfg{cid:04d}_{base}"
 
 
-def _plot_one_config(dataset_dir: Path, config_rows: pd.DataFrame, output_dir: Path):
-    """为一个 config_id 生成 2×4 子图。"""
+def _plot_one_config(dataset_dir: Path, config_rows: pd.DataFrame, output_dir: Path,
+                     swap_axes: bool = False):
+    """为一个 config_id 生成 2×4 子图。
+
+    Args:
+        swap_axes: 若 True，横轴=y、纵轴=x（横版）；否则横轴=x、纵轴=y（竖版）
+    """
     sample_row = config_rows.iloc[0]
     title_label = _build_trajectory_label(sample_row)
     fname = _build_dataset_filename(sample_row)
 
-    fig, axes = plt.subplots(2, 4, figsize=(18, 9))
+    fig, axes = plt.subplots(2, 4, figsize=(18, 9), constrained_layout=True)
     axes = axes.flatten()
+
+    # 颜色定义
+    TRAJ_COLOR = '#64B5F6'   # 浅蓝色 — 正常轨迹段
+    ATK_COLOR  = '#E74C3C'   # 红色   — 攻击段
+    REF_COLOR  = 'gray'
+    START_COLOR = '#2ca02c'  # 起点绿色
+    END_COLOR   = '#d62728'  # 终点红色
 
     for idx, atk_type in enumerate(['A0', 'A1', 'A2', 'A3', 'A4', 'A5', 'A6', 'A7']):
         ax = axes[idx]
@@ -290,50 +303,79 @@ def _plot_one_config(dataset_dir: Path, config_rows: pd.DataFrame, output_dir: P
         onset_step = int(atk_row['attack_onset_step'])
         offset_step = int(atk_row['attack_offset_step'])
 
-        # 参考轨迹（虚线）
-        ax.plot(Upsilon_r[:, 0], Upsilon_r[:, 1],
-                color='gray', linestyle='--', linewidth=0.6, alpha=DS_REF_ALPHA,
-                label='Reference')
+        # 横版/竖版坐标索引与轴标签
+        xi, yi = (1, 0) if swap_axes else (0, 1)
+        xlabel, ylabel = ('y [m]', 'x [m]') if swap_axes else ('x [m]', 'y [m]')
+
+        # 参考轨迹（灰色虚线）
+        ax.plot(Upsilon_r[:, xi], Upsilon_r[:, yi],
+                color=REF_COLOR, linestyle='--', linewidth=0.6, alpha=DS_REF_ALPHA)
 
         if atk_type == 'A0' or onset_step >= len(t):
-            ax.plot(y_meas[:, 0], y_meas[:, 1],
-                    color='#4CAF50', linewidth=DS_LINE_WIDTH,
-                    alpha=DS_LINE_ALPHA_NORMAL, label='Measured')
+            ax.plot(y_meas[:, xi], y_meas[:, yi],
+                    color=TRAJ_COLOR, linewidth=DS_LINE_WIDTH,
+                    alpha=DS_LINE_ALPHA_NORMAL)
         else:
             # 攻击前段
-            ax.plot(y_meas[:onset_step + 1, 0], y_meas[:onset_step + 1, 1],
-                    color='#4CAF50', linewidth=DS_LINE_WIDTH,
+            ax.plot(y_meas[:onset_step + 1, xi], y_meas[:onset_step + 1, yi],
+                    color=TRAJ_COLOR, linewidth=DS_LINE_WIDTH,
                     alpha=DS_LINE_ALPHA_NORMAL)
 
             # 攻击段（高亮）
             end_atk = min(offset_step + 1, len(t))
-            ax.plot(y_meas[onset_step:end_atk, 0], y_meas[onset_step:end_atk, 1],
-                    color='#E91E63', linewidth=DS_LINE_WIDTH * DS_ATTACK_LW_MULT,
-                    alpha=DS_LINE_ALPHA_ATTACK, label='Attacked')
+            ax.plot(y_meas[onset_step:end_atk, xi], y_meas[onset_step:end_atk, yi],
+                    color=ATK_COLOR, linewidth=DS_LINE_WIDTH * DS_ATTACK_LW_MULT,
+                    alpha=DS_LINE_ALPHA_ATTACK)
 
             # 攻击后段
             if offset_step < len(t):
-                ax.plot(y_meas[offset_step:, 0], y_meas[offset_step:, 1],
-                        color='#4CAF50', linewidth=DS_LINE_WIDTH,
+                ax.plot(y_meas[offset_step:, xi], y_meas[offset_step:, yi],
+                        color=TRAJ_COLOR, linewidth=DS_LINE_WIDTH,
                         alpha=DS_LINE_ALPHA_NORMAL)
 
             # 攻击起止标记
-            ax.scatter(y_meas[onset_step, 0], y_meas[onset_step, 1],
+            ax.scatter(y_meas[onset_step, xi], y_meas[onset_step, yi],
                        color='red', s=20, zorder=5, marker='o',
-                       edgecolors='darkred', linewidths=0.5, label='Onset')
-            ax.scatter(y_meas[end_atk - 1, 0], y_meas[end_atk - 1, 1],
+                       edgecolors='darkred', linewidths=0.5)
+            ax.scatter(y_meas[end_atk - 1, xi], y_meas[end_atk - 1, yi],
                        color='darkred', s=20, zorder=5, marker='s',
-                       edgecolors='black', linewidths=0.5, label='Offset')
+                       edgecolors='black', linewidths=0.5)
+
+        # 起点和终点标记（所有子图）
+        ax.scatter(y_meas[0, xi], y_meas[0, yi],
+                   c=START_COLOR, s=30, marker='o', zorder=6,
+                   edgecolors='white', linewidths=0.5)
+        ax.scatter(y_meas[-1, xi], y_meas[-1, yi],
+                   c=END_COLOR, s=50, marker='*', zorder=6,
+                   edgecolors='white', linewidths=0.5)
 
         ax.set_title(f"{atk_type}: {ATK_NAMES[atk_type]}", fontsize=10, fontweight='bold')
-        ax.set_xlabel('x [m]')
-        ax.set_ylabel('y [m]')
+        ax.set_xlabel(xlabel)
+        ax.set_ylabel(ylabel)
         ax.set_aspect('equal')
         ax.grid(True, alpha=0.3, linewidth=0.4)
-        ax.legend(fontsize=7, loc='upper right', framealpha=0.85)
 
-    fig.suptitle(title_label, fontsize=13, fontweight='bold', y=1.01)
-    plt.tight_layout()
+    # 统一图例（代理艺术家，不依赖具体子图数据）
+    legend_handles = [
+        mlines.Line2D([], [], color=REF_COLOR, linestyle='--', linewidth=0.6,
+                      alpha=DS_REF_ALPHA, label='Reference'),
+        mlines.Line2D([], [], color=TRAJ_COLOR, linewidth=DS_LINE_WIDTH,
+                      label='Measured'),
+        mlines.Line2D([], [], color=ATK_COLOR, linewidth=DS_LINE_WIDTH * DS_ATTACK_LW_MULT,
+                      label='Attacked'),
+        mlines.Line2D([], [], color='red', marker='o', linestyle='None', markersize=6,
+                      markeredgecolor='darkred', markeredgewidth=0.5, label='Onset'),
+        mlines.Line2D([], [], color='darkred', marker='s', linestyle='None', markersize=6,
+                      markeredgecolor='black', markeredgewidth=0.5, label='Offset'),
+        mlines.Line2D([], [], color=START_COLOR, marker='o', linestyle='None', markersize=7,
+                      markeredgecolor='white', markeredgewidth=0.5, label='Start'),
+        mlines.Line2D([], [], color=END_COLOR, marker='*', linestyle='None', markersize=8,
+                      markeredgecolor='white', markeredgewidth=0.5, label='End'),
+    ]
+    fig.legend(handles=legend_handles, loc='lower center', ncol=7,
+               fontsize=8, framealpha=0.9, bbox_to_anchor=(0.5, 0))
+
+    fig.suptitle(title_label, fontsize=13, fontweight='bold', y=1.02)
 
     save_path = output_dir / f"{fname}.png"
     fig.savefig(save_path, dpi=DS_FIG_DPI, bbox_inches='tight', facecolor='white')
@@ -342,10 +384,11 @@ def _plot_one_config(dataset_dir: Path, config_rows: pd.DataFrame, output_dir: P
 
 
 def plot_dataset_trajectories(save: bool = True):
-    """对最新数据集所有轨迹配置，生成 2x4 子图展示 8 种攻击影响下的二维轨迹。
+    """对最新数据集所有轨迹配置，生成竖版 + 横版 2×4 子图。
 
-    每个 config_id 一张图，保存到 results/dataset/ 目录。
-    文件名包含轨迹族名称和参数。
+    竖版 (portrait):  横轴=x, 纵轴=y  →  results/dataset/portrait/
+    横版 (landscape): 横轴=y, 纵轴=x  →  results/dataset/landscape/
+    每个 config_id 两张图，文件名包含轨迹族名称和参数。
     """
     ds_dir = _find_latest_dataset()
     print(f"数据集: {ds_dir}")
@@ -354,17 +397,29 @@ def plot_dataset_trajectories(save: bool = True):
     config_ids = sorted(df['config_id'].unique())
     print(f"轨迹配置数: {len(config_ids)} (共 {len(df)} 个仿真文件)")
 
-    output_dir = Path(DATASET_RESULT_DIR)
-    output_dir.mkdir(parents=True, exist_ok=True)
+    # 竖版 / 横版输出子目录
+    portrait_dir = Path(DATASET_RESULT_DIR) / 'portrait'
+    landscape_dir = Path(DATASET_RESULT_DIR) / 'landscape'
+    portrait_dir.mkdir(parents=True, exist_ok=True)
+    landscape_dir.mkdir(parents=True, exist_ok=True)
 
     saved = []
     for cid in config_ids:
         config_rows = df[df['config_id'] == cid]
-        sp = _plot_one_config(ds_dir, config_rows, output_dir)
-        saved.append(sp)
-        print(f"  [{cid:3d}/{len(config_ids) - 1}] {sp.name}")
 
-    print(f"\n完成。共 {len(saved)} 张图，输出目录: {output_dir.resolve()}")
+        # 竖版：横轴=x, 纵轴=y
+        sp_p = _plot_one_config(ds_dir, config_rows, portrait_dir, swap_axes=False)
+        saved.append(sp_p)
+
+        # 横版：横轴=y, 纵轴=x
+        sp_l = _plot_one_config(ds_dir, config_rows, landscape_dir, swap_axes=True)
+        saved.append(sp_l)
+
+        print(f"  [{cid:3d}/{len(config_ids) - 1}] {sp_p.name}  |  {sp_l.name}")
+
+    print(f"\n完成。共 {len(saved)} 张图")
+    print(f"  竖版目录: {portrait_dir.resolve()}")
+    print(f"  横版目录: {landscape_dir.resolve()}")
     return saved
 
 
