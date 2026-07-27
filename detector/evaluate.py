@@ -288,7 +288,7 @@ def main():
     model = load_model(args.model_path, device)
 
     print("\n[2/5] 加载测试集...")
-    test_dataset = PreprocessedDataset(args.data_dir, split='test', load_clean=False)
+    test_dataset = PreprocessedDataset(args.data_dir, split='test')
     test_loader = DataLoader(test_dataset, batch_size=args.batch_size,
                              shuffle=False, num_workers=2, pin_memory=True)
     print(f"  测试窗口: {len(test_dataset):,}")

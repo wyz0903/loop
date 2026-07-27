@@ -1,11 +1,12 @@
 """
-detector/classifier.py — 攻击检测模型
-====================================
-8 通道输入: [y_meas(3) + innov_anchored(3) + u_cmd(2)]
-输出: cls_logits (B,8), y_pred (B,100,3)
+detector/classifier.py — 攻击检测模型 (U-Net 掩码重建 + 双尺度注意力分类)
+====================================================================
+5 通道输入: [y_meas(3) + u_cmd(2)]
+训练时: 随机掩码窗口最后 k% 时间步 → 膨胀DSConv U-Net 重建 + 双尺度注意力分类
+推理时: 完整序列 → 分类
 
-架构: MultiScaleDSConvBackbone → 运动学一致性偏置注意力池化 → 分类头
-      features → PhysicsGuidedDecoder → y_kin + delta_pred = y_pred
+架构: 膨胀深度可分离卷积 U-Net (Encoder-Bottleneck-Decoder + skip connections)
+      瓶颈(8步) + enc3(16步) 双尺度 → 注意力池化 → 分类头
 """
 
 import torch
@@ -13,130 +14,185 @@ import torch.nn as nn
 import torch.nn.functional as F
 from typing import Tuple, Optional
 
-TS = 0.05
-ALPHA = 0.17
-
-D_MODEL = 96
+D_MODEL = 128
 NUM_CLASSES = 8
-IN_CHANNELS = 8
+IN_CHANNELS = 5
 WINDOW_SIZE = 128
-CONV_CHANNELS = [32, 64, 96]
-CONV_KERNEL_SIZES = [7, 5, 3]
-CONV_DILATIONS = [1, 3, 9]
-POOL_SIZE = 2
-DECODER_CHANNELS = [64, 32, 16]
-KIN_BIAS_SIGMA = 0.5
+CLS_DIM = 96
+
+# 编码器通道: 5 → 16 → 32 → 64 → 128
+ENC_CHANNELS = [16, 32, 64, 128]
+ENC_KERNELS = [7, 5, 5, 3]
+DS_DILATIONS = [1, 3, 9]
+
+# 解码器通道 (反向): 128 → 64 → 32 → 16 → 8
+DEC_CHANNELS = [64, 32, 16, 8]
+DEC_KERNELS = [3, 5, 5, 7]
 
 
 # ============================================================================
-# 工具: 批量运动学 rollout
+# 多尺度膨胀深度可分离卷积编码器块
 # ============================================================================
 
-def batch_kinematic_rollout(y0, u_seq, Ts=TS, alpha=ALPHA):
-    """欧拉积分运动学递推。y0:(B,3), u_seq:(B,W,2) → y_kin:(B,W,3)"""
-    B, W, _ = u_seq.shape
-    y_kin = torch.zeros(B, W, 3, device=u_seq.device, dtype=u_seq.dtype)
-    y = y0.to(device=u_seq.device, dtype=u_seq.dtype)
-    y_kin[:, 0, :] = y
-    for k in range(W - 1):
-        v, w = u_seq[:, k, 0], u_seq[:, k, 1]
-        cos_t, sin_t = torch.cos(y[:, 2]), torch.sin(y[:, 2])
-        y = y + Ts * torch.stack([v * cos_t - alpha * w * sin_t,
-                                   v * sin_t + alpha * w * cos_t, w], dim=-1)
-        y_kin[:, k + 1, :] = y
-    return y_kin
+class MultiScaleEncoderBlock(nn.Module):
+    """3 并行膨胀深度卷积 (d=1,3,9) → Pointwise 混合 → BN → GELU → MaxPool(2)
 
+    不同膨胀率覆盖不同时间尺度:
+      d=1:  0.35s — 瞬时突变 (A5 dropout, A6 scaling)
+      d=3:  0.95s — 短时异常 (A4 replay)
+      d=9:  2.75s — 慢变漂移 (A3 drift, A2 sinusoidal)
+    """
 
-# ============================================================================
-# 多尺度膨胀深度可分离卷积骨干
-# ============================================================================
-
-class MultiScaleDSConvBlock(nn.Module):
-    """3 并行膨胀深度卷积 (d=1,3,9) → Pointwise 混合 → BN+GELU+Pool"""
-
-    def __init__(self, in_channels, out_channels, kernel_size=7,
-                 dilations=None, pool_size=POOL_SIZE):
+    def __init__(self, in_ch, out_ch, kernel_size, dilations=None):
         super().__init__()
-        dilations = dilations or CONV_DILATIONS
-        self.depthwise_convs = nn.ModuleList([
-            nn.Conv1d(in_channels, in_channels, kernel_size,
+        dilations = dilations or DS_DILATIONS
+        self.depthwise = nn.ModuleList([
+            nn.Conv1d(in_ch, in_ch, kernel_size,
                       padding=(kernel_size // 2) * d,
-                      dilation=d, groups=in_channels, bias=False)
+                      dilation=d, groups=in_ch, bias=False)
             for d in dilations
         ])
-        self.pointwise = nn.Conv1d(in_channels * 3, out_channels, 1, bias=False)
-        self.bn = nn.BatchNorm1d(out_channels)
-        self.pool = nn.MaxPool1d(pool_size)
+        self.pointwise = nn.Conv1d(in_ch * len(dilations), out_ch, 1, bias=False)
+        self.bn = nn.BatchNorm1d(out_ch)
+        self.pool = nn.MaxPool1d(2)
 
     def forward(self, x):
-        h = torch.cat([dw(x) for dw in self.depthwise_convs], dim=1)
+        h = torch.cat([dw(x) for dw in self.depthwise], dim=1)
         return self.pool(F.gelu(self.bn(self.pointwise(h))))
 
 
-class MultiScaleDSConvBackbone(nn.Module):
-    """3 块逐通道扩增 + 降采样: 8→32→64→96, 100→50→25→12"""
+# ============================================================================
+# 解码器块
+# ============================================================================
+
+class DecoderBlock(nn.Module):
+    """单级解码器: Upsample(×2) + Concat(skip) → Conv1d → BN → GELU"""
+
+    def __init__(self, in_ch, skip_ch, out_ch, kernel_size):
+        super().__init__()
+        self.conv = nn.Conv1d(in_ch + skip_ch, out_ch, kernel_size,
+                              padding=kernel_size // 2, bias=False)
+        self.bn = nn.BatchNorm1d(out_ch)
+
+    def forward(self, x, skip):
+        x = F.interpolate(x, scale_factor=2.0, mode='nearest')
+        if x.shape[-1] != skip.shape[-1]:
+            x = F.interpolate(x, size=skip.shape[-1], mode='nearest')
+        return F.gelu(self.bn(self.conv(torch.cat([x, skip], dim=1))))
+
+
+# ============================================================================
+# 双尺度注意力分类头
+# ============================================================================
+
+class DualScaleAttentionClassifier(nn.Module):
+    """瓶颈 (8 时间步) + enc3 (16 时间步, 池化到 8) → 注意力池化 → 分类
+
+    双尺度融合:
+      - 瓶颈: 最深层的抽象语义特征
+      - enc3: 较高时间分辨率的细节特征 (攻击边界、短时突变)
+    """
+
+    def __init__(self, bn_ch=ENC_CHANNELS[-1], enc3_ch=ENC_CHANNELS[-2],
+                 cls_dim=CLS_DIM, num_classes=NUM_CLASSES):
+        super().__init__()
+        self.proj_bn = nn.Conv1d(bn_ch, cls_dim, 1)       # 瓶颈 → cls_dim
+        self.proj_enc3 = nn.Conv1d(enc3_ch, cls_dim, 1)   # enc3 → cls_dim (pool to 8)
+        self.norm = nn.LayerNorm(cls_dim)
+        self.dropout = nn.Dropout(0.3)
+        self.head = nn.Linear(cls_dim, num_classes)
+
+        # 可学习注意力查询向量
+        self.attn_query = nn.Parameter(torch.randn(cls_dim) * 0.02)
+
+        nn.init.xavier_uniform_(self.head.weight)
+        nn.init.zeros_(self.head.bias)
+
+    def forward(self, bottleneck, enc3):
+        """
+        Args:
+            bottleneck: (B, bn_ch, 8)  瓶颈特征
+            enc3:       (B, enc3_ch, 16)  enc3 输出
+        Returns:
+            cls_logits: (B, num_classes)
+        """
+        f_bn = self.proj_bn(bottleneck)                       # (B, cls_dim, 8)
+        f_enc3 = F.adaptive_avg_pool1d(self.proj_enc3(enc3), 8)  # (B, cls_dim, 8)
+        f = f_bn + f_enc3                                     # 双尺度逐元素融合
+
+        f = f.permute(0, 2, 1)                                # (B, 8, cls_dim)
+        f = self.norm(f)
+
+        # 注意力池化
+        d = f.shape[-1]
+        scores = torch.matmul(f, self.attn_query) / (d ** 0.5)
+        attn = torch.softmax(scores, dim=1)
+        pooled = (f * attn.unsqueeze(-1)).sum(dim=1)          # (B, cls_dim)
+
+        return self.head(self.dropout(pooled))
+
+
+# ============================================================================
+# U-Net 骨干
+# ============================================================================
+
+class UNet1D(nn.Module):
+    """1D U-Net: 4 级膨胀 DSConv 编码器 → 瓶颈 → 4 级解码器 + skip connections
+
+    编码器使用多尺度膨胀深度可分离卷积 (d=1,3,9) 覆盖多时间尺度。
+    返回重建 + 瓶颈 + enc3 特征供双尺度分类头使用。
+    """
 
     def __init__(self, in_channels=IN_CHANNELS):
         super().__init__()
-        self.d_model = CONV_CHANNELS[-1]
-        blocks = []
         ci = in_channels
-        for i, co in enumerate(CONV_CHANNELS):
-            blocks.append(MultiScaleDSConvBlock(ci, co, CONV_KERNEL_SIZES[i]))
+        self.encoders = nn.ModuleList()
+        for i, co in enumerate(ENC_CHANNELS):
+            self.encoders.append(
+                MultiScaleEncoderBlock(ci, co, ENC_KERNELS[i]))
             ci = co
-        self.blocks = nn.Sequential(*blocks)
-        self.norm_out = nn.LayerNorm(self.d_model)
 
-    def forward(self, x):
-        h = x.permute(0, 2, 1)
-        h = self.blocks(h)
-        return self.norm_out(h.permute(0, 2, 1))
+        # 瓶颈: 标准卷积 (8 时间步分辨率下膨胀收益有限)
+        self.bottleneck = nn.Sequential(
+            nn.Conv1d(ENC_CHANNELS[-1], ENC_CHANNELS[-1], 3, padding=1, bias=False),
+            nn.BatchNorm1d(ENC_CHANNELS[-1]),
+            nn.GELU(),
+        )
 
+        # 解码器 (skip 来自对应编码器层, 逆向)
+        self.decoders = nn.ModuleList()
+        skip_channels = list(reversed(ENC_CHANNELS[:-1])) + [in_channels]
+        in_ch = ENC_CHANNELS[-1]
+        for out_ch, skip_ch in zip(DEC_CHANNELS, skip_channels):
+            self.decoders.append(DecoderBlock(in_ch, skip_ch, out_ch, DEC_KERNELS[len(self.decoders)]))
+            in_ch = out_ch
 
-# ============================================================================
-# 运动学一致性偏置 (零参数物理先验)
-# ============================================================================
+        self.out_conv = nn.Conv1d(DEC_CHANNELS[-1], in_channels, 1)
 
-class KinematicConsistencyBias(nn.Module):
-    """从 innov_anchored 的 L2 范数计算注意力偏置: bias = -‖innov‖/σ"""
+    @property
+    def d_model(self):
+        return ENC_CHANNELS[-1]
 
-    def __init__(self, sigma=KIN_BIAS_SIGMA):
-        super().__init__()
-        self.sigma = sigma
+    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """x: (B, C, T) → (x_recon, bottleneck, enc3_features)"""
+        skips = [x]
+        h = x
+        enc3_out = None
+        for i, enc in enumerate(self.encoders):
+            h = enc(h)
+            if i == 2:  # enc3 (索引: 0,1,2,3)
+                enc3_out = h
+            skips.append(h)
 
-    def forward(self, x_norm, feat_scale, feat_median):
-        with torch.no_grad():
-            innov_phys = (x_norm[:, :, 3:6] * feat_scale.view(1, 1, 3)
-                          + feat_median.view(1, 1, 3))
-            t_idx = list(range(4, WINDOW_SIZE, 8))
-            innov_l2 = torch.norm(innov_phys[:, t_idx, :], dim=-1)
-            bias = -innov_l2 / self.sigma
-            return bias - bias.mean(dim=-1, keepdim=True)
+        b = self.bottleneck(h)
 
+        h = b
+        for i, dec in enumerate(self.decoders):
+            skip = skips[-(i + 2)]
+            h = dec(h, skip)
 
-# ============================================================================
-# 物理引导解码器
-# ============================================================================
-
-class PhysicsGuidedDecoder(nn.Module):
-    """ConvTranspose1d 上采样: 12→24→48→96→100, 预测 delta = y_clean - y_kin"""
-
-    def __init__(self, d_model=D_MODEL):
-        super().__init__()
-        layers = []
-        ci = d_model
-        for co in DECODER_CHANNELS:
-            layers.extend([nn.ConvTranspose1d(ci, co, 4, 2, 1),
-                           nn.BatchNorm1d(co), nn.GELU()])
-            ci = co
-        layers.append(nn.Conv1d(ci, 3, 5, padding=2))
-        self.upsample = nn.Sequential(*layers)
-
-    def forward(self, features):
-        h = features.permute(0, 2, 1)
-        h = self.upsample(h)
-        return F.interpolate(h, size=WINDOW_SIZE,
-                             mode='linear', align_corners=False).permute(0, 2, 1)
+        x_recon = self.out_conv(h)
+        return x_recon, b, enc3_out
 
 
 # ============================================================================
@@ -144,72 +200,67 @@ class PhysicsGuidedDecoder(nn.Module):
 # ============================================================================
 
 class Detector(nn.Module):
-    """攻击检测模型: 编码器 + 运动学偏置注意力分类 + 物理引导解码"""
+    """掩码重建 + 双尺度注意力分类检测器
 
-    def __init__(self, use_decoder=True,
-                 ymeas_scale=None, ymeas_median=None, cmd_max=None,
-                 feat_scale=None, feat_median=None):
+    训练: 随机掩码窗口最后 k% 步 → U-Net 重建 + 双尺度注意力分类
+    推理: 完整序列 → 分类
+    """
+
+    def __init__(self, ymeas_scale=None, ymeas_median=None, cmd_max=None,
+                 mask_min: float = 0.1, mask_max: float = 0.5):
         super().__init__()
-        self.use_decoder = use_decoder
+        self.mask_min = mask_min
+        self.mask_max = mask_max
 
-        # 归一化参数 (buffer, 不参与梯度)
+        # 归一化参数 (buffer)
         self.register_buffer('ymeas_scale', torch.tensor(
             ymeas_scale or [2.5, 2.5, 3.141592653589793], dtype=torch.float32))
         self.register_buffer('ymeas_median', torch.tensor(
             ymeas_median or [0., 0., 0.], dtype=torch.float32))
         self.register_buffer('cmd_max', torch.tensor(
             cmd_max or [0.3, 1.76], dtype=torch.float32))
-        self.register_buffer('feat_scale', torch.tensor(
-            feat_scale or [0.5, 0.5, 0.3], dtype=torch.float32))
-        self.register_buffer('feat_median', torch.tensor(
-            feat_median or [0., 0., 0.], dtype=torch.float32))
 
-        self.backbone = MultiScaleDSConvBackbone()
-        self.kin_bias = KinematicConsistencyBias()
-        self.bias_alpha = nn.Parameter(torch.tensor(0.1))
+        self.unet = UNet1D(in_channels=IN_CHANNELS)
+        self.classifier = DualScaleAttentionClassifier()
 
-        self.cls_norm = nn.LayerNorm(D_MODEL)
-        self.cls_head = nn.Linear(D_MODEL, NUM_CLASSES)
-        self.cls_dropout = nn.Dropout(0.3)
-        self.attn_query = nn.Parameter(torch.randn(D_MODEL) * 0.02)
-
-        self.decoder = PhysicsGuidedDecoder() if use_decoder else None
-        nn.init.xavier_uniform_(self.cls_head.weight)
-        nn.init.zeros_(self.cls_head.bias)
-
-    def set_norm_params(self, ymeas_scale, ymeas_median, cmd_max, feat_median, feat_scale):
-        """从 normalizer 加载后更新归一化参数"""
+    def set_norm_params(self, ymeas_scale, ymeas_median, cmd_max):
         for name, val in [('ymeas_scale', ymeas_scale), ('ymeas_median', ymeas_median),
-                           ('cmd_max', cmd_max), ('feat_median', feat_median),
-                           ('feat_scale', feat_scale)]:
+                           ('cmd_max', cmd_max)]:
             getattr(self, name).copy_(torch.as_tensor(val, dtype=torch.float32))
 
-    def encode(self, x):
-        return self.backbone(x)
+    def _apply_mask(self, x: torch.Tensor, ratio: float) -> Tuple[torch.Tensor, torch.Tensor]:
+        """掩码序列最后 ratio 比例的时间步 (置零)"""
+        B, C, T = x.shape
+        mask_len = max(1, int(T * ratio))
+        mask = torch.ones(B, 1, T, device=x.device, dtype=x.dtype)
+        mask[:, :, -mask_len:] = 0.0
+        return x * mask, mask
 
-    def classify(self, features, x_norm=None):
-        d = features.shape[-1]
-        scores = torch.matmul(features, self.attn_query) / (d ** 0.5)
-        if x_norm is not None:
-            scores = scores + self.bias_alpha * self.kin_bias(
-                x_norm, self.feat_scale, self.feat_median)
-        attn = torch.softmax(scores, dim=1)
-        pooled = (features * attn.unsqueeze(-1)).sum(dim=1)
-        return self.cls_head(self.cls_dropout(self.cls_norm(pooled)))
+    def forward(self, x: torch.Tensor,
+                mask_ratio: Optional[float] = None,
+                return_recon: bool = False):
+        """
+        Args:
+            x: (B, T, C) 归一化后的输入
+            mask_ratio: 掩码比例 (None=不掩码/推理模式)
+            return_recon: 是否返回重建结果
 
-    def decode(self, features, x_norm):
-        """物理引导解码: y_pred = y_kin + delta_pred"""
-        y0_phys = x_norm[:, 0, :3] * self.ymeas_scale + self.ymeas_median
-        u_phys = x_norm[:, :, -2:] * self.cmd_max
-        with torch.no_grad():
-            y_kin = batch_kinematic_rollout(y0_phys, u_phys)
-        delta_pred = self.decoder(features)
-        return y_kin + delta_pred, delta_pred
+        Returns:
+            训练模式: cls_logits, x_recon, mask
+            推理模式: cls_logits, features
+        """
+        # (B, T, C) → (B, C, T)
+        x = x.permute(0, 2, 1)
 
-    def forward(self, x, return_recon=False):
-        features = self.encode(x)
-        cls_logits = self.classify(features, x)
-        if return_recon and self.decoder is not None:
-            y_pred, delta_pred = self.decode(features, x)
-            return cls_logits, features, y_pred, delta_pred
-        return cls_logits, features
+        mask = None
+        if mask_ratio is not None and mask_ratio > 0:
+            x_input, mask = self._apply_mask(x, mask_ratio)
+        else:
+            x_input = x
+
+        x_recon, bottleneck, enc3 = self.unet(x_input)
+        cls_logits = self.classifier(bottleneck, enc3)
+
+        if return_recon and mask is not None:
+            return cls_logits, x_recon.permute(0, 2, 1), mask.squeeze(1)
+        return cls_logits, bottleneck.permute(0, 2, 1)

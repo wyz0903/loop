@@ -2,6 +2,8 @@
 backend.py — 攻击检测器推理后端
 ================================
 推理: 滑动窗口 + 8 类攻击分类 (A0-A7)，纯检测，无恢复。
+
+5 通道输入: [y_meas(3) + u_cmd(2)]
 """
 
 import os
@@ -12,7 +14,6 @@ from typing import Dict
 
 import torch
 
-from model import WMRKinematics
 from attack import ALL_ATTACK_TYPES
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -36,7 +37,7 @@ class DetectionResult:
 class DetectorBackend:
     """攻击检测器推理后端 — 对控制系统透明。
 
-    8 通道输入: [y_meas(3) + innov(3) + u_cmd(2)]
+    5 通道输入: [y_meas(3) + u_cmd(2)]
     纯检测: 输出攻击类别与置信度，测量值直通。
     """
 
@@ -61,8 +62,7 @@ class DetectorBackend:
         self._load_normalizer(norm_path)
         self._model.set_norm_params(
             ymeas_scale=self._ymeas_scale, ymeas_median=self._ymeas_median,
-            cmd_max=self._cmd_max, feat_median=self._feat_median,
-            feat_scale=self._feat_scale)
+            cmd_max=self._cmd_max)
 
         self._u_cmd = np.zeros(2)
         self._step_count = 0
@@ -106,21 +106,8 @@ class DetectorBackend:
         self._ucmd_buffer.clear()
 
     # ------------------------------------------------------------------
-    # 内部: 运动学 + 窗口
+    # 内部: 窗口
     # ------------------------------------------------------------------
-
-    def _compute_innovation_window(self, ymeas: np.ndarray, ucmd: np.ndarray) -> np.ndarray:
-        """窗口锚定运动学新息: innov[t] = y_meas[t] - rollout(y_meas[0], u_cmd[0:t])[t]"""
-        W = len(ymeas)
-        y_kin = np.zeros((W, 3), dtype=np.float32)
-        y = ymeas[0].copy()
-        y_kin[0] = y
-        for k in range(W - 1):
-            y = WMRKinematics.kinematic_predict(y, ucmd[k])
-            y_kin[k + 1] = y
-        innov = ymeas - y_kin
-        innov[:, 2] = np.arctan2(np.sin(innov[:, 2]), np.cos(innov[:, 2]))
-        return innov
 
     def _is_window_ready(self) -> bool:
         return len(self._ymeas_buffer) >= self.window_size
@@ -141,25 +128,20 @@ class DetectorBackend:
         data = np.load(norm_path)
         self._ymeas_median = data['ymeas_median']
         self._ymeas_scale = data['ymeas_scale']
-        self._feat_median = data['feat_median']
-        self._feat_scale = data['feat_scale']
         self._cmd_max = data['cmd_max']
 
     # ------------------------------------------------------------------
     # 内部: 归一化
     # ------------------------------------------------------------------
 
-    def _normalize(self, ymeas_window: np.ndarray, innov_window: np.ndarray,
-                   ucmd_window: np.ndarray) -> np.ndarray:
+    def _normalize(self, ymeas_window: np.ndarray, ucmd_window: np.ndarray) -> np.ndarray:
         ymeas_norm = (ymeas_window - self._ymeas_median) / np.maximum(self._ymeas_scale, 1e-6)
-        innov_norm = (innov_window - self._feat_median) / np.maximum(self._feat_scale, 1e-6)
         ucmd_norm = ucmd_window / self._cmd_max
-        return np.concatenate([ymeas_norm, innov_norm, ucmd_norm], axis=1)
+        return np.concatenate([ymeas_norm, ucmd_norm], axis=1)
 
     def _build_input_tensor(self, ymeas_window: np.ndarray,
                             ucmd_window: np.ndarray) -> torch.Tensor:
-        innov_window = self._compute_innovation_window(ymeas_window, ucmd_window)
-        x_norm = self._normalize(ymeas_window, innov_window, ucmd_window)
+        x_norm = self._normalize(ymeas_window, ucmd_window)
         return torch.from_numpy(x_norm.astype(np.float32)).unsqueeze(0).to(self._device)
 
     # ------------------------------------------------------------------
@@ -168,8 +150,7 @@ class DetectorBackend:
 
     def _classify(self, x_tensor: torch.Tensor):
         with torch.no_grad():
-            cls_logits, _ = self._model(x_tensor, return_recon=False)
+            cls_logits, _ = self._model(x_tensor)
         probs = torch.softmax(cls_logits, dim=1).cpu().numpy()[0]
         pred_cls = int(probs.argmax())
         return ALL_ATTACK_TYPES[pred_cls], float(probs[pred_cls])
-
