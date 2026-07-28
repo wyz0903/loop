@@ -4,7 +4,7 @@
 
 ## 项目概要
 
-这是一个用于**轮式移动机器人（WMR）传感器攻击检测**的研究仿真系统。一个类似TurtleBot4的差速驱动机器人在NMPC控制下跟踪参考轨迹，同时其传感器测量数据可能在随机时刻受到攻击。一个基于 U-Net 掩码重建 + 分类的检测器用于分类攻击类型（8类: A0-A7）。训练时随机掩码窗口最后 k% 时间步，模型联合学习重建掩码区域和分类攻击类型。
+这是一个用于**轮式移动机器人（WMR）传感器攻击检测与恢复**的研究仿真系统。一个类似TurtleBot4的差速驱动机器人在NMPC控制下跟踪参考轨迹，同时其传感器测量数据可能在随机时刻受到攻击。一个基于运动学约束的状态估计网络同时完成攻击分类（8类: A0-A7）和干净传感器信号预测（供NMPC恢复）。
 
 ## 工作习惯
 
@@ -81,9 +81,10 @@ ReferenceTrajectory(参考轨迹) → NMPC → u_cmd → WMRKinematics(RK4运动
                                         ↓
                                检测器.detect(y_meas)(执行检测)
                                  滑动窗口: [y_meas(3) + u_cmd(2)] = 5 通道
-                                 训练: 随机掩码最后 k% 步 → UNet1D 重建 + 分类
-                                 推理: 完整序列 → UNet1D 编码 → GAP → 8 类 softmax (A0-A7)
-                                 y_meas 直通 → 位姿估计
+                                 Encoder → q (干净状态估计, 3ch)
+                                 攻击信号自然浮现: attack_res = y_meas - q
+                                 分类: 注意力池化(F) + ||y_meas - q|| → 8 类 softmax
+                                 恢复: q 替代被攻击量测 → 送入 NMPC
                                         ↓
                                compute_error(Upsilon_r, X_hat) → X_error(误差状态)
                                         ↓
@@ -101,9 +102,9 @@ ReferenceTrajectory(参考轨迹) → NMPC → u_cmd → WMRKinematics(RK4运动
 | `simulate.py`                 | 统一闭环仿真：NN检测器 / 无检测器基线 / 五族轨迹对比                                                                                      |
 | `generate_dataset.py`         | 开环数据生成：5 种随机轨迹系列 × 8 种攻击                                                                                                 |
 | `backend.py`                  | DetectorBackend 推理包装器：滑动窗口缓冲 + 8 类攻击分类（纯检测，无恢复）                                              |
-| `detector/classifier.py`      | 检测模型定义：UNet1D (编码器-瓶颈-解码器 + skip connections) + 分类头                              |
+| `detector/classifier.py`      | 检测模型定义：TemporalEncoder (Embedding + 4×DilatedResidualBlock) + StateHead (q) + AttackClassifier (注意力池化 + 攻击残差反馈) |
 | `detector/preprocess_data.py` | 128 步滑动窗口，物理锚点归一化 (RobustNormalizer)，防数据泄漏的文件级拆分                                                                  |
-| `detector/train.py`           | 检测模型训练脚本：随机掩码最后 k% 步，联合训练 L_recon (掩码区域MSE) + λ*L_cls (交叉熵)，A0 每 epoch 随机降采样 50% |
+| `detector/train.py`           | 训练脚本：L = L_recon(MSE q vs y_clean) + λ_kin·L_kin(运动学一致性) + λ_cls·L_cls(交叉熵)，随机位置块掩码，A0 降采样 50% |
 | `detector/evaluate.py`        | 测试集分类评估：混淆矩阵 + 逐类精度/召回/F1 + 置信度 + 汇总图 + Markdown 报告                                                              |
 | `detector/models/`            | 训练好的模型权重 (nn_cls_best.pt)                                                                                                        |
 
@@ -135,10 +136,14 @@ ReferenceTrajectory(参考轨迹) → NMPC → u_cmd → WMRKinematics(RK4运动
 
 ### 关键设计决策
 
-- **UNet1D 骨干**：4 级编码器-解码器 + skip connections。编码器 5→16→32→64→128 通道 (stride=2 降采样)，时序 128→64→32→16→8。瓶颈 128→128 (k=3)。解码器 128→64→32→16→8 通道，每级上采样 ×2 + skip 拼接。输出 Conv1d(8→5, k=1) 重建为 5 通道。参数量 ~147K。
-- **掩码重建训练**：训练时随机掩码窗口最后 k∈[10%, 50%] 步（置零），U-Net 通过 skip connections 自然拷贝未掩码部分、预测掩码部分。重建损失仅计算掩码区域 MSE，迫使模型学习从历史信号推断未来状态。
-- **联合训练**：L = L_recon (掩码区域 MSE) + λ * L_cls (交叉熵)，λ=0.5。分类头从瓶颈特征 GAP 池化后经 Linear(128→8) 输出。
-- **推理模式**：完整序列不经掩码，直接编码 → 瓶颈 GAP → 分类，无需重建解码。重建分支仅在训练时作为辅助任务提供正则化。
+- **状态估计而非手工特征**：编码器直接输出干净位姿估计 q (3ch)，运动学方程作为损失约束 (L_kin) 而非输入特征。网络受约束学习"什么状态服从物理"，而非被告知"看什么特征"。灵感来自 JEPA 的表示空间预测思想。
+- **运动学一致性损失 (L_kin)**：MSE(q[t], Euler_norm(q[t-1], u[t-1]))，在归一化空间中计算。约束编码器输出的 q 必须时间自洽。通过去归一化→物理 Euler 递推→再归一化实现，零可学习参数。这才是真正的 PINN——物理方程在损失中约束学习过程。
+- **攻击残差自然浮现**：`attack_res = y_meas - q`，网络学习分解 y_meas = q + attack。攻击残差的大小直接指示攻击强度，作为辅助信号输入分类器。
+- **TemporalEncoder 骨干**：Embedding (5→48, k=5) + 4×DilatedResidualBlock (48ch, d=1/3/9/27, 无降采样)。感受野覆盖 0.25s→8.25s。无降采样避免 U-Net 的信息瓶颈，无多尺度并行分支避免参数膨胀。参数量 ~58K。
+- **随机位置块掩码** vs 尾部掩码：掩码位置在窗口中随机选取，防止模型学"前面总是干净"的位置捷径。仅掩码 y_meas (u_cmd 始终可见以维持运动学递推)。
+- **q 的双重角色**：既是训练中的中间表示（受 L_recon+L_kin 约束），也是推理时的最终输出（反归一化后送入 NMPC 替代被攻击量测，实现传感器恢复）。
+- **物理锚点归一化**：y_meas / [2.5m, 2.5m, π]，u_cmd / [0.3, 1.76]。y_clean 使用相同参数归一化以匹配合并输出空间。
+- **防泄漏分层 IID 拆分**：按轨迹族分层抽样为 train/val/test (70/15/15)。
 - **物理锚点归一化 (Physical-Anchor Normalization)**：y_meas 用工作空间边界 [2.5m, 2.5m, π] 作为尺度锚点，u_cmd 用物理上限 [0.3, 1.76] 归一化。避免数据驱动归一化（IQR/Z-score）的梯度问题，物理含义清晰。
 - **u_cmd 缓冲索引约定**：运行时 `_ucmd_buffer` slot j 存 `u_{j-1→j}`（simulate.py 中 detect 先于 set_control 调用），与训练数据 (y_k, u_{k→k+1}) 有一步错位。分类器输入保持现状（修正需重训）。
 - **防泄漏分层 IID 拆分**：按轨迹族分层抽样为 train/val/test (70/15/15)，同一 config 的所有窗口整体进入同一划分，保证各划分同分布且无信息泄漏。

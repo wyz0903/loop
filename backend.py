@@ -1,9 +1,10 @@
 """
 backend.py — 攻击检测器推理后端
 ================================
-推理: 滑动窗口 + 8 类攻击分类 (A0-A7)，纯检测，无恢复。
+推理: 滑动窗口 + 8 类攻击分类 + 干净传感器估计 (q)
 
 5 通道输入: [y_meas(3) + u_cmd(2)]
+输出: 攻击类别 + 置信度 + 干净位姿估计 (供 NMPC 恢复)
 """
 
 import os
@@ -25,7 +26,7 @@ class DetectionResult:
     """单步检测输出"""
     attack_class: str
     confidence: float
-    y_recovered: np.ndarray
+    y_clean_pred: np.ndarray   # 干净位姿估计 q (供 NMPC 恢复)
     attack_estimate: np.ndarray
     features: Dict[str, float] = field(default_factory=dict)
 
@@ -38,7 +39,7 @@ class DetectorBackend:
     """攻击检测器推理后端 — 对控制系统透明。
 
     5 通道输入: [y_meas(3) + u_cmd(2)]
-    纯检测: 输出攻击类别与置信度，测量值直通。
+    输出: 攻击类别 + 干净位姿估计 q (替代被攻击测量值送入 NMPC)
     """
 
     def __init__(self, model_path: str = None, norm_path: str = None,
@@ -46,7 +47,6 @@ class DetectorBackend:
         if model_path is None:
             model_path = os.path.join(SCRIPT_DIR, 'detector', 'models', 'nn_cls_best.pt')
         if norm_path is None:
-            # 自动解析最新预处理批次 dataset_win/<ts>/normalizer.npz
             win_root = os.path.join(SCRIPT_DIR, 'dataset_win')
             batches = sorted(d for d in os.listdir(win_root)
                              if os.path.exists(os.path.join(win_root, d, 'normalizer.npz')))
@@ -83,17 +83,17 @@ class DetectorBackend:
         if not self._is_window_ready():
             return DetectionResult(
                 attack_class='A0', confidence=0.0,
-                y_recovered=y_meas.copy(), attack_estimate=np.zeros(3),
+                y_clean_pred=y_meas.copy(), attack_estimate=np.zeros(3),
                 features={'status': 'window_filling'})
 
         ymeas_window = np.array(list(self._ymeas_buffer))
         ucmd_window = np.array(list(self._ucmd_buffer))
         x_tensor = self._build_input_tensor(ymeas_window, ucmd_window)
-        attack_class, confidence = self._classify(x_tensor)
+        attack_class, confidence, q_last = self._classify(x_tensor)
 
         return DetectionResult(
             attack_class=attack_class, confidence=confidence,
-            y_recovered=y_meas.copy(), attack_estimate=np.zeros(3),
+            y_clean_pred=q_last, attack_estimate=np.zeros(3),
             features={'step': self._step_count})
 
     def set_control(self, u_cmd: np.ndarray) -> None:
@@ -150,7 +150,13 @@ class DetectorBackend:
 
     def _classify(self, x_tensor: torch.Tensor):
         with torch.no_grad():
-            cls_logits, _ = self._model(x_tensor)
+            cls_logits, q_norm = self._model(x_tensor)
         probs = torch.softmax(cls_logits, dim=1).cpu().numpy()[0]
         pred_cls = int(probs.argmax())
-        return ALL_ATTACK_TYPES[pred_cls], float(probs[pred_cls])
+
+        # q 是归一化空间, 反归一化到物理空间
+        q_full = q_norm.cpu().numpy()[0]  # (T, 3)
+        q_last = q_full[-1]               # 最后一步的干净估计
+        q_phys = q_last * self._ymeas_scale + self._ymeas_median  # 反归一化
+
+        return ALL_ATTACK_TYPES[pred_cls], float(probs[pred_cls]), q_phys
