@@ -118,6 +118,15 @@ body {
     flex-shrink: 0;
 }
 
+.switch { position:relative; display:inline-block; width:36px; height:20px; }
+.switch input { opacity:0; width:0; height:0; }
+.slider { position:absolute; cursor:pointer; top:0;left:0;right:0;bottom:0;
+    background:#555; border-radius:10px; transition:.3s; }
+.slider:before { position:absolute; content:''; height:14px; width:14px;
+    left:3px; bottom:3px; background:#fff; border-radius:50%; transition:.3s; }
+input:checked + .slider { background:#4caf50; }
+input:checked + .slider:before { transform:translateX(16px); }
+
 @media (max-width: 900px) {
     .main-grid { grid-template-columns: 1fr; grid-template-rows: auto; }
     .chart-trajectory { aspect-ratio: 1; grid-row: auto; }
@@ -184,6 +193,13 @@ body {
     <div class="control-group">
         <label>Dur. [s]</label>
         <input type="number" id="durInput" value="10.0" min="1" max="50" step="1" style="width:60px;">
+    </div>
+    <div class="control-group">
+        <label title="y_kin physics recovery replaces attacked sensor">Det</label>
+        <label class="switch">
+            <input type="checkbox" id="detToggle" checked>
+            <span class="slider"></span>
+        </label>
     </div>
 
     <button class="btn btn-primary" id="btnRun" onclick="runSimulation()">▶ Run</button>
@@ -353,17 +369,19 @@ async function runSimulation() {
         const idx = parseInt(document.getElementById('dsRecordSelect').value);
         if (isNaN(idx) || idx >= state.dsRecords.length) return;
         const rec = state.dsRecords[idx];
+        const detMode = document.getElementById('detToggle').checked ? 'nn' : 'none';
         params = { family:rec.family, seed:rec.traj_seed,
                    attack_type:rec.attack_type, attack_onset:rec.attack_onset,
-                   attack_duration:rec.attack_duration, sim_time:50, detector_mode:'nn' };
+                   attack_duration:rec.attack_duration, sim_time:50, detector_mode: detMode };
     } else {
+        const detMode = document.getElementById('detToggle').checked ? 'nn' : 'none';
         params = {
             family: document.getElementById('familySelect').value,
             seed: parseInt(document.getElementById('seedInput').value)||42,
             attack_type: document.getElementById('atkType').value,
             attack_onset: parseFloat(document.getElementById('onsetInput').value)||15,
             attack_duration: parseFloat(document.getElementById('durInput').value)||10,
-            sim_time:50, detector_mode:'nn',
+            sim_time:50, detector_mode: detMode,
         };
     }
     setStatus('⏳ Simulating...');

@@ -202,25 +202,11 @@ def _run_simulation(task_id, params):
         attacker.reset()
         np.random.seed(traj_seed)
 
-        # 检测器
+        # 检测器: model_path=None 让 backend 自动选 nn_recovery_best.pt > nn_cls_best.pt
         detector = None
         if detector_mode == 'nn':
-            model_dir = os.path.join(PROJECT_ROOT, 'detector', 'models')
-            nn_model = os.path.join(model_dir, 'nn_cls_best.pt')
-            if os.path.exists(nn_model):
-                win_base = os.path.join(PROJECT_ROOT, 'dataset_win')
-                win_ts = None
-                if os.path.exists(win_base):
-                    ds = sorted([d for d in os.listdir(win_base)
-                                if os.path.isdir(os.path.join(win_base, d))],
-                               key=lambda d: os.path.getctime(os.path.join(win_base, d)),
-                               reverse=True)
-                    if ds:
-                        win_ts = ds[0]
-                norm_path = os.path.join(win_base, win_ts, 'normalizer.npz') if win_ts else os.path.join(win_base, 'normalizer.npz')
-                if os.path.exists(norm_path):
-                    detector = DetectorBackend(model_path=nn_model, norm_path=norm_path)
-                    detector.reset()
+            detector = DetectorBackend(model_path=None, norm_path=None)
+            detector.reset()
 
         # 预分配
         ts = np.zeros(n_steps, dtype=np.float32)
