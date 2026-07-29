@@ -1,14 +1,17 @@
 """
-detector/classifier.py — 攻击检测模型 (PINN: 可微分运动学 + 膨胀深度可分离卷积 + 注意力池化)
-==================================================================================
+detector/classifier.py — 攻击检测与恢复模型 (PINN: 可微分运动学 + 多尺度卷积 + 注意力池化)
+====================================================================================
 5 通道外部输入: [y_meas(3) + u_cmd(2)]
 网络内部通过可微分运动学层扩展为 11 通道:
   [y_meas(3) + u_cmd(2) + y_kin(3) + innov(3)]
 其中 y_kin = RK4(y_meas[0], u_cmd), innov = y_meas - y_kin
 
-输出: cls_logits (B,8)
+输出:
+  cls_logits (B,8) — 攻击分类 (辅助任务)
+  y_pred (B, T, 3) — 恢复位姿 ŷ = y_kin + δ (主任务, 物理空间)
 
 架构: 可微分运动学层 → MultiScaleDSConvBackbone → 注意力池化 → 分类头
+                                              ↘ RecoveryDecoder → δ → ŷ
 """
 
 import torch
@@ -170,11 +173,46 @@ class MultiScaleDSConvBackbone(nn.Module):
 
 
 # ============================================================================
+# 恢复解码器 (主任务)
+# ============================================================================
+
+class RecoveryDecoder(nn.Module):
+    """轻量解码器: (B, T_feat, d_model) → (B, T_out, 3) δ 修正
+
+    设计原则:
+      δ 只修正 y_kin 的漂移, 幅度小、时域平滑。
+      先用 1×1 卷积降维, 再插值上采样 16→128, 最后平滑卷积 + 投影。
+      参数量 ~4K, 不引入过拟合风险。
+    """
+
+    def __init__(self, d_model: int = D_MODEL):
+        super().__init__()
+        self.reduce = nn.Conv1d(d_model, 16, 1)
+        self.smooth = nn.Conv1d(16, 3, 7, padding=3)
+        nn.init.zeros_(self.smooth.weight)
+        nn.init.zeros_(self.smooth.bias)
+
+    def forward(self, features: torch.Tensor) -> torch.Tensor:
+        """features: (B, 16, d_model) → delta: (B, 128, 3)"""
+        x = features.permute(0, 2, 1)              # (B, d_model, 16)
+        x = F.gelu(self.reduce(x))                  # (B, 16, 16)
+        x = F.interpolate(x, size=WINDOW_SIZE, mode='linear',
+                          align_corners=False)      # (B, 16, 128)
+        x = self.smooth(x)                          # (B, 3, 128)
+        return x.permute(0, 2, 1)                   # (B, 128, 3)
+
+
+# ============================================================================
 # 检测器
 # ============================================================================
 
 class Detector(nn.Module):
-    """PINN 攻击检测模型: 可微分运动学层 + 膨胀深度可分离卷积骨干 + 注意力池化"""
+    """PINN 攻击检测与恢复模型: 可微分运动学层 + 膨胀深度可分离卷积骨干 + 注意力池化 + 恢复解码器
+
+    恢复公式: ŷ = y_kin + δ(features)
+      主任务: 位姿恢复 ŷ (跟踪误差驱动)
+      辅助:   攻击分类 (判别探针)
+    """
 
     def __init__(self, ymeas_scale=None, ymeas_median=None, cmd_max=None):
         super().__init__()
@@ -193,6 +231,7 @@ class Detector(nn.Module):
 
         self.backbone = MultiScaleDSConvBackbone()
 
+        # 分类头 (辅助任务)
         self.cls_norm = nn.LayerNorm(D_MODEL)
         self.cls_head = nn.Linear(D_MODEL, NUM_CLASSES)
         self.cls_dropout = nn.Dropout(0.3)
@@ -200,6 +239,9 @@ class Detector(nn.Module):
 
         nn.init.xavier_uniform_(self.cls_head.weight)
         nn.init.zeros_(self.cls_head.bias)
+
+        # 恢复解码器 (主任务)
+        self.decoder = RecoveryDecoder(D_MODEL)
 
     def set_norm_params(self, ymeas_scale, ymeas_median, cmd_max):
         """从 normalizer 加载后更新归一化参数 (同步到运动学层)"""
@@ -218,15 +260,32 @@ class Detector(nn.Module):
         pooled = (features * attn.unsqueeze(-1)).sum(dim=1)
         return self.cls_head(self.cls_dropout(self.cls_norm(pooled)))
 
-    def forward(self, x):
+    def recover(self, x_norm_11ch, features):
+        """恢复: ŷ = y_kin + δ
+        Args:
+            x_norm_11ch: (B, 11, T) 运动学层输出 (含 y_kin_norm)
+            features:    (B, 16, d_model) 骨干特征
+        Returns:
+            y_pred: (B, T, 3) 物理空间恢复位姿
+        """
+        y_kin_norm = x_norm_11ch[:, 5:8, :]          # (B, 3, T)
+        delta = self.decoder(features)                 # (B, T, 3)
+        y_pred_norm = y_kin_norm.permute(0, 2, 1) + delta  # (B, T, 3)
+        # 反归一化到物理空间
+        scale = self.ymeas_scale.view(1, 1, 3)
+        median = self.ymeas_median.view(1, 1, 3)
+        return y_pred_norm * scale + median            # (B, T, 3)
+
+    def forward(self, x, return_recon=False):
         # x: (B, T, RAW_CHANNELS)  归一化后的原始输入
-        # 1. 置换 → (B, C, T) 供 Conv1d 使用
-        x = x.permute(0, 2, 1)
+        x = x.permute(0, 2, 1)                        # (B, C, T)
+        x = self.kinematic_layer(x)                    # (B, 11, T)
 
-        # 2. PINN: 可微分运动学特征注入
-        x = self.kinematic_layer(x)  # (B, 5, T) → (B, 11, T)
-
-        # 3. 骨干 + 分类
-        features = self.encode(x.permute(0, 2, 1))
+        features = self.encode(x.permute(0, 2, 1))    # (B, 16, d_model)
         cls_logits = self.classify(features)
+
+        if return_recon:
+            y_pred = self.recover(x, features)         # (B, T, 3), 物理空间
+            return cls_logits, features, y_pred
+
         return cls_logits, features

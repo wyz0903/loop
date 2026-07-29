@@ -1,9 +1,10 @@
 """
 backend.py — 攻击检测器推理后端
 ================================
-推理: 滑动窗口 + 8 类攻击分类 (A0-A7)，纯检测，无恢复。
+推理: 滑动窗口 + 8 类攻击分类 (A0-A7) + 位姿恢复。
 
 5 通道输入: [y_meas(3) + u_cmd(2)]
+恢复: y_recovered = y_kin + delta (物理空间)
 """
 
 import os
@@ -38,13 +39,17 @@ class DetectorBackend:
     """攻击检测器推理后端 — 对控制系统透明。
 
     5 通道输入: [y_meas(3) + u_cmd(2)]
-    纯检测: 输出攻击类别与置信度，测量值直通。
+    恢复输出: y_recovered = y_kin + delta (物理空间)
+    若模型无 decoder (旧版), y_recovered = y_meas (直通)
     """
 
     def __init__(self, model_path: str = None, norm_path: str = None,
                  window_size: int = WINDOW_SIZE, device: str = None):
         if model_path is None:
-            model_path = os.path.join(SCRIPT_DIR, 'detector', 'models', 'nn_cls_best.pt')
+            # 优先恢复模型, 回退到纯分类模型
+            recovery_path = os.path.join(SCRIPT_DIR, 'detector', 'models', 'nn_recovery_best.pt')
+            cls_path = os.path.join(SCRIPT_DIR, 'detector', 'models', 'nn_cls_best.pt')
+            model_path = recovery_path if os.path.exists(recovery_path) else cls_path
         if norm_path is None:
             # 自动解析最新预处理批次 dataset_win/<ts>/normalizer.npz
             win_root = os.path.join(SCRIPT_DIR, 'dataset_win')
@@ -89,11 +94,16 @@ class DetectorBackend:
         ymeas_window = np.array(list(self._ymeas_buffer))
         ucmd_window = np.array(list(self._ucmd_buffer))
         x_tensor = self._build_input_tensor(ymeas_window, ucmd_window)
-        attack_class, confidence = self._classify(x_tensor)
+        attack_class, confidence, y_recovered = self._classify_and_recover(x_tensor)
+
+        if y_recovered is None:
+            y_recovered = y_meas.copy()  # 旧模型 fallback: 直通
+
+        attack_estimate = y_meas.copy() - y_recovered if y_recovered is not None else np.zeros(3)
 
         return DetectionResult(
             attack_class=attack_class, confidence=confidence,
-            y_recovered=y_meas.copy(), attack_estimate=np.zeros(3),
+            y_recovered=y_recovered, attack_estimate=attack_estimate,
             features={'step': self._step_count})
 
     def set_control(self, u_cmd: np.ndarray) -> None:
@@ -145,12 +155,29 @@ class DetectorBackend:
         return torch.from_numpy(x_norm.astype(np.float32)).unsqueeze(0).to(self._device)
 
     # ------------------------------------------------------------------
-    # 内部: 分类
+    # 内部: 分类 + 恢复
     # ------------------------------------------------------------------
 
-    def _classify(self, x_tensor: torch.Tensor):
+    def _classify_and_recover(self, x_tensor: torch.Tensor):
+        """单次前向: 分类 + 恢复 (y_kin 直出, 不做 δ 修正)"""
         with torch.no_grad():
-            cls_logits, _ = self._model(x_tensor)
+            # 运行运动学层获取 y_kin
+            x_perm = x_tensor.permute(0, 2, 1)
+            x_11 = self._model.kinematic_layer(x_perm)      # (1, 11, 128)
+            y_kin_norm = x_11[:, 5:8, :]                     # (1, 3, 128)
+            scale = self._model.ymeas_scale.view(1, 3, 1)
+            median = self._model.ymeas_median.view(1, 3, 1)
+            y_kin = (y_kin_norm * scale + median).permute(0, 2, 1)  # (1, 128, 3)
+
+            # 分类 (仅作辅助指标)
+            features = self._model.backbone(x_11.permute(0, 2, 1))
+            cls_logits = self._model.classify(features)
+
+            # 恢复: 直接用 y_kin 末步 (物理前推, 不依赖当前脏测量)
+            y_recovered = y_kin[0, -1, :].cpu().numpy()
+            y_recovered[2] = np.arctan2(np.sin(y_recovered[2]),
+                                         np.cos(y_recovered[2]))
+
         probs = torch.softmax(cls_logits, dim=1).cpu().numpy()[0]
         pred_cls = int(probs.argmax())
-        return ALL_ATTACK_TYPES[pred_cls], float(probs[pred_cls])
+        return ALL_ATTACK_TYPES[pred_cls], float(probs[pred_cls]), y_recovered

@@ -4,7 +4,7 @@
 
 ## 项目概要
 
-这是一个用于**轮式移动机器人（WMR）传感器攻击检测**的研究仿真系统。一个类似TurtleBot4的差速驱动机器人在NMPC控制下跟踪参考轨迹，同时其传感器测量数据可能在随机时刻受到攻击。一个基于多尺度膨胀深度可分离卷积骨干 + 注意力池化的分类检测器用于分类攻击类型（8类: A0-A7）。
+这是一个用于**轮式移动机器人（WMR）传感器攻击检测**的研究仿真系统。一个类似TurtleBot4的差速驱动机器人在NMPC控制下跟踪参考轨迹，同时其传感器测量数据可能在随机时刻受到攻击。一个基于 PINN 可微分运动学层 + 多尺度膨胀深度可分离卷积骨干 + 注意力池化的分类检测器用于分类攻击类型（8类: A0-A7）。
 
 ## 工作习惯
 
@@ -81,6 +81,9 @@ ReferenceTrajectory(参考轨迹) → NMPC → u_cmd → WMRKinematics(RK4运动
                                         ↓
                                检测器.detect(y_meas)(执行检测)
                                  滑动窗口: [y_meas(3) + u_cmd(2)] = 5 通道
+                                 KinematicFeatureLayer (PINN 可微分运动学层, 零参数)
+                                   去归一化 → RK4 递推 → 再归一化
+                                   → [y_meas(3) + u_cmd(2) + y_kin(3) + innov(3)] = 11 通道
                                  MultiScaleDSConvBackbone (3块膨胀深度可分离卷积, 多时间尺度 d=1,3,9)
                                    → 注意力池化 → 8 类 softmax (A0-A7)
                                  y_meas 直通 → 位姿估计
@@ -101,7 +104,7 @@ ReferenceTrajectory(参考轨迹) → NMPC → u_cmd → WMRKinematics(RK4运动
 | `simulate.py`                 | 统一闭环仿真：NN检测器 / 无检测器基线 / 五族轨迹对比                                                                                      |
 | `generate_dataset.py`         | 开环数据生成：5 种随机轨迹系列 × 8 种攻击                                                                                                 |
 | `backend.py`                  | DetectorBackend 推理包装器：滑动窗口缓冲 + 8 类攻击分类（纯检测，无恢复）                                              |
-| `detector/classifier.py`      | 检测模型定义：MultiScaleDSConvBackbone (3块膨胀深度可分离卷积, d=1,3,9) + 注意力池化分类头                              |
+| `detector/classifier.py`      | 检测模型定义：KinematicFeatureLayer (PINN 可微分运动学层) + MultiScaleDSConvBackbone (3块膨胀深度可分离卷积, d=1,3,9) + 注意力池化分类头 |
 | `detector/preprocess_data.py` | 128 步滑动窗口，物理锚点归一化 (RobustNormalizer)，防数据泄漏的文件级拆分                                                                  |
 | `detector/train.py`           | 检测模型训练脚本：交叉熵分类，A0 每 epoch 随机降采样 50% |
 | `detector/evaluate.py`        | 测试集分类评估：混淆矩阵 + 逐类精度/召回/F1 + 置信度 + 汇总图 + Markdown 报告                                                              |
@@ -135,8 +138,9 @@ ReferenceTrajectory(参考轨迹) → NMPC → u_cmd → WMRKinematics(RK4运动
 
 ### 关键设计决策
 
-- **多尺度膨胀深度可分离卷积骨干 (MultiScaleDSConvBackbone)**：3 块膨胀深度可分离卷积 (d=1,3,9)，每块 3 个并行膨胀深度卷积 + Pointwise Conv 混合。不同膨胀率覆盖不同时间尺度: d=1 → 0.35s (瞬时突变: A5 dropout, A6 scaling), d=3 → 0.95s (短时异常: A4 replay), d=9 → 2.75s (慢变漂移: A3 drift, A2 sinusoidal)。通道 5→32→64→96，时序 128→64→32→16。骨干参数量 ~18K。
-- **总参数量 ~28K**：骨干18K + 分类头10K，极轻量适合嵌入式部署。
+- **可微分运动学层 (KinematicFeatureLayer, PINN)**：零可训练参数，将轮式机器人运动学方程嵌入网络前向传播。内部三步：去归一化 → 物理空间 RK4 递推 → 再归一化。从 5 通道外部输入 `[y_meas(3), u_cmd(2)]` 扩展为 11 通道 `[y_meas, u_cmd, y_kin, innov]`。y_kin 是控制指令预测的轨迹，innov = y_meas − y_kin 是测量-预测残差（角分量经 atan2 包裹）。innov 与 y_meas 共用归一化尺度，物理含义一致。
+- **多尺度膨胀深度可分离卷积骨干 (MultiScaleDSConvBackbone)**：3 块膨胀深度可分离卷积 (d=1,3,9)，每块 3 个并行膨胀深度卷积 + Pointwise Conv 混合。不同膨胀率覆盖不同时间尺度: d=1 → 0.35s (瞬时突变: A5 dropout, A6 scaling), d=3 → 0.95s (短时异常: A4 replay), d=9 → 2.75s (慢变漂移: A3 drift, A2 sinusoidal)。通道 11→32→64→96，时序 128→64→32→16。骨干参数量 ~18K。
+- **总参数量 ~28K**：运动学层0 + 骨干18K + 分类头10K，极轻量适合嵌入式部署。
 - **物理锚点归一化 (Physical-Anchor Normalization)**：y_meas 用工作空间边界 [2.5m, 2.5m, π] 作为尺度锚点，u_cmd 用物理上限 [0.3, 1.76] 归一化。避免数据驱动归一化的梯度问题，物理含义清晰。
 - **注意力池化分类头**：可学习的 attn_query 对 16 个时序特征加权求和，自适应聚焦攻击窗口最具判别力的时间步，替代简单的全局平均池化。
 - **交叉熵分类训练**：label smoothing 0.0，无类别权重，通过每 epoch 随机降采样 50% A0 窗口平衡类别分布。

@@ -58,6 +58,8 @@ GRAD_CLIP = 1.0
 LR_PATIENCE = 30
 LR_FACTOR = 0.8
 LR_MIN = 1e-6
+RECON_LAMBDA = 0.3       # 恢复 loss 权重
+LAST_STEP_WEIGHT = 0.3    # 末步加权 (强化当前步精度)
 DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
 
@@ -71,6 +73,12 @@ class PreprocessedDataset(Dataset):
         self.X = np.load(os.path.join(data_dir, f'X_{split}.npy'), mmap_mode='r')
         self.cls_labels = np.load(os.path.join(data_dir, f'Y_{split}_cls.npy'), mmap_mode='r')
 
+        clean_path = os.path.join(data_dir, f'Y_{split}_clean.npy')
+        if os.path.exists(clean_path):
+            self.y_clean = np.load(clean_path, mmap_mode='r')
+        else:
+            self.y_clean = None
+
         self._all_indices = np.arange(len(self.cls_labels))
         self._downsample_rate = downsample_a0
         self._active_indices = self._all_indices.copy()
@@ -80,7 +88,10 @@ class PreprocessedDataset(Dataset):
             a0_after = int(np.sum(self.cls_labels[self._active_indices] == 0))
             print(f"[Dataset] A0 降采样 {downsample_a0:.0%}: {a0_before}→{a0_after} 窗口")
 
-        print(f"[Dataset] {split}: {len(self):,} 窗口, X={self.X.shape}")
+        print(f"[Dataset] {split}: {len(self):,} 窗口, X={self.X.shape}", end='')
+        if self.y_clean is not None:
+            print(f", Y_clean={self.y_clean.shape}", end='')
+        print()
 
     def resample_a0(self):
         if self._downsample_rate <= 0 or self.split != 'train':
@@ -99,7 +110,8 @@ class PreprocessedDataset(Dataset):
         real_idx = self._active_indices[idx]
         x = torch.from_numpy(self.X[real_idx])
         cls_label = torch.tensor(self.cls_labels[real_idx], dtype=torch.long)
-        return x, cls_label
+        y_clean = torch.from_numpy(self.y_clean[real_idx]) if self.y_clean is not None else torch.zeros(1)
+        return x, cls_label, y_clean
 
 
 # ============================================================================
@@ -109,45 +121,67 @@ class PreprocessedDataset(Dataset):
 def train_epoch(model, dataloader, optimizer, device):
     model.train()
     total_loss = 0.0
+    total_cls = 0.0
+    total_recon = 0.0
     correct = total = 0
 
     for batch in dataloader:
-        x, cls_label = batch[0].to(device, non_blocking=True), batch[1].to(device, non_blocking=True)
+        x, cls_label, y_clean = (batch[0].to(device, non_blocking=True),
+                                  batch[1].to(device, non_blocking=True),
+                                  batch[2].to(device, non_blocking=True))
 
         optimizer.zero_grad(set_to_none=True)
-        cls_logits, _ = model(x)
+        cls_logits, _, y_pred = model(x, return_recon=True)
 
-        loss = F.cross_entropy(cls_logits, cls_label, label_smoothing=LABEL_SMOOTHING)
+        loss_cls = F.cross_entropy(cls_logits, cls_label, label_smoothing=LABEL_SMOOTHING)
+        loss_recon = F.mse_loss(y_pred, y_clean)
+        if LAST_STEP_WEIGHT > 0:
+            loss_recon = (1 - LAST_STEP_WEIGHT) * loss_recon \
+                       + LAST_STEP_WEIGHT * F.mse_loss(y_pred[:, -1, :], y_clean[:, -1, :])
+
+        loss = loss_cls + RECON_LAMBDA * loss_recon
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP)
         optimizer.step()
 
         bs = x.size(0)
         total_loss += loss.item() * bs
+        total_cls += loss_cls.item() * bs
+        total_recon += loss_recon.item() * bs
         correct += (cls_logits.argmax(1) == cls_label).sum().item()
         total += bs
 
     n = max(total, 1)
-    return {'loss': total_loss / n, 'acc': correct / n}
+    return {'loss': total_loss / n, 'acc': correct / n,
+            'cls': total_cls / n, 'recon': total_recon / n}
 
 
 @torch.no_grad()
 def evaluate(model, dataloader, device):
     model.eval()
     total_loss = 0.0
+    total_cls = 0.0
+    total_recon = 0.0
     correct = total = 0
     class_correct = defaultdict(int)
     class_total = defaultdict(int)
+    recon_by_class = defaultdict(lambda: [0.0, 0])  # [sum_rmse, count]
 
     for batch in dataloader:
-        x, cls_label = batch[0].to(device, non_blocking=True), batch[1].to(device, non_blocking=True)
+        x, cls_label, y_clean = (batch[0].to(device, non_blocking=True),
+                                  batch[1].to(device, non_blocking=True),
+                                  batch[2].to(device, non_blocking=True))
 
-        cls_logits, _ = model(x)
+        cls_logits, _, y_pred = model(x, return_recon=True)
 
-        loss = F.cross_entropy(cls_logits, cls_label)
+        loss_cls = F.cross_entropy(cls_logits, cls_label)
+        loss_recon = F.mse_loss(y_pred, y_clean)
+        loss = loss_cls + RECON_LAMBDA * loss_recon
 
         B = x.size(0)
         total_loss += loss.item() * B
+        total_cls += loss_cls.item() * B
+        total_recon += loss_recon.item() * B
         pred = cls_logits.argmax(1)
         correct += (pred == cls_label).sum().item()
         total += B
@@ -156,11 +190,18 @@ def evaluate(model, dataloader, device):
             class_total[gt] += 1
             if pred[i].item() == gt:
                 class_correct[gt] += 1
+            rmse = float(torch.sqrt(F.mse_loss(y_pred[i, -1, :], y_clean[i, -1, :])).item())
+            recon_by_class[gt][0] += rmse
+            recon_by_class[gt][1] += 1
 
     n = max(total, 1)
     per_class_acc = {ALL_ATTACK_TYPES[c]: class_correct[c] / max(class_total[c], 1)
                      for c in range(8) if class_total[c] > 0}
-    return {'loss': total_loss / n, 'acc': correct / n, 'per_class_acc': per_class_acc}
+    per_class_rmse = {ALL_ATTACK_TYPES[c]: recon_by_class[c][0] / max(recon_by_class[c][1], 1)
+                      for c in range(8) if recon_by_class[c][1] > 0}
+    return {'loss': total_loss / n, 'acc': correct / n, 'cls': total_cls / n,
+            'recon': total_recon / n, 'per_class_acc': per_class_acc,
+            'per_class_rmse': per_class_rmse}
 
 
 # ============================================================================
@@ -220,11 +261,18 @@ def main():
     # ---- 仅评估 ----
     if args.eval_only:
         print(f"\n加载权重: {args.eval_only}")
-        model.load_state_dict(torch.load(args.eval_only, map_location=DEVICE, weights_only=True), strict=False)
+        state = torch.load(args.eval_only, map_location=DEVICE, weights_only=True)
+        # 兼容旧模型 (无 decoder)
+        model.load_state_dict(state, strict=False)
         result = evaluate(model, test_loader, DEVICE)
-        print(f"\n测试集: Loss={result['loss']:.4f}, Acc={result['acc']:.4f}")
+        print(f"\n测试集: Loss={result['loss']:.4f}, Cls={result['cls']:.3f}, "
+              f"Rcn={result['recon']:.4f}, Acc={result['acc']:.4f}")
+        print(f"{'Attack':<6} {'Acc':>7} {'RMSE(m)':>8}")
+        print("-" * 23)
         for atk in ALL_ATTACK_TYPES:
-            print(f"  {atk} ({ATTACK_NAMES[atk]}): {result['per_class_acc'].get(atk, 0):.4f}")
+            acc = result['per_class_acc'].get(atk, 0)
+            rmse = result['per_class_rmse'].get(atk, 0)
+            print(f"  {atk:<4} {acc:>7.3f} {rmse:>8.4f}")
         return
 
     # ---- 训练 ----
@@ -250,8 +298,8 @@ def main():
 
         lr_now = optimizer.param_groups[0]['lr']
         print(f"E {epoch:3d} | LR={lr_now:.1e} | "
-              f"T Loss={train_m['loss']:.4f} Acc={train_m['acc']:.4f} | "
-              f"V Loss={val_m['loss']:.4f} Acc={val_m['acc']:.4f}",
+              f"T Loss={train_m['loss']:.4f} Cls={train_m['cls']:.3f} Rcn={train_m['recon']:.4f} Acc={train_m['acc']:.3f} | "
+              f"V Loss={val_m['loss']:.4f} Cls={val_m['cls']:.3f} Rcn={val_m['recon']:.4f} Acc={val_m['acc']:.3f}",
               end='')
 
         if val_m['acc'] > best_val_acc:
@@ -259,6 +307,8 @@ def main():
             best_epoch = epoch
             patience_counter = 0
             torch.save(model.state_dict(), os.path.join(MODEL_DIR, 'nn_cls_best.pt'))
+            # 同时保存恢复模型
+            torch.save(model.state_dict(), os.path.join(MODEL_DIR, 'nn_recovery_best.pt'))
             print("  *", end='')
         else:
             patience_counter += 1
@@ -270,14 +320,18 @@ def main():
 
     # ---- 最终测试 ----
     print(f"\n加载最佳模型 (epoch {best_epoch}, Val Acc={best_val_acc:.4f})")
-    model.load_state_dict(torch.load(os.path.join(MODEL_DIR, 'nn_cls_best.pt'),
-                                     map_location=DEVICE, weights_only=True))
+    best_path = os.path.join(MODEL_DIR, 'nn_cls_best.pt')
+    model.load_state_dict(torch.load(best_path, map_location=DEVICE, weights_only=True))
     test_m = evaluate(model, test_loader, DEVICE)
     print(f"\n{'='*60}")
-    print(f"训练完成！ 最佳 epoch: {best_epoch}")
-    print(f"  测试 Loss: {test_m['loss']:.4f}, Acc: {test_m['acc']:.4f}")
+    print(f"训练完成! 最佳 epoch: {best_epoch}")
+    print(f"  测试 Loss: {test_m['loss']:.4f}, Cls: {test_m['cls']:.3f}, "
+          f"Rcn: {test_m['recon']:.4f}, Acc: {test_m['acc']:.4f}")
+    print(f"  {'Attack':<6} {'Acc':>7} {'RMSE(m)':>8}")
     for atk in ALL_ATTACK_TYPES:
-        print(f"    {atk} ({ATTACK_NAMES[atk]}): {test_m['per_class_acc'].get(atk, 0):.4f}")
+        acc = test_m['per_class_acc'].get(atk, 0)
+        rmse = test_m['per_class_rmse'].get(atk, 0)
+        print(f"    {atk} {'(' + ATTACK_NAMES[atk] + ')':<24} {acc:>7.3f} {rmse:>8.4f}")
     print(f"{'='*60}")
 
     # ---- 训练曲线 ----
